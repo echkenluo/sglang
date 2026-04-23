@@ -39,7 +39,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -578,12 +578,18 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        return hidden_states
+    
     def forward_prepare_native(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        hidden_states = get_attn_tp_context().fetch_qkv_latent()
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
@@ -653,7 +659,11 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        if (
+                not get_attn_tp_context().input_scattered
+                and hidden_states.shape[0] == 0
+            ):
+        # if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         if (
             not _is_npu
@@ -792,6 +802,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
     def forward(
@@ -967,6 +978,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.attn_cp_size == self.moe_dp_size
         ), "Attention context parallel size must be equal to MoE context parallel size"
 
+
+        get_attn_tp_context().init_context(True, False)
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -987,14 +1001,14 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.attn_cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

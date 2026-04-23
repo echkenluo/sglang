@@ -25,6 +25,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -508,6 +509,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1244,6 +1246,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1269,6 +1272,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            forward_batch=forward_batch,
         )
 
     def update_sliding_window(
@@ -1284,6 +1288,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1318,6 +1323,7 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch,
             )
 
     def update_cross_attention(
@@ -1333,6 +1339,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1360,6 +1367,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch,
             )
 
     def call_begin_forward(
@@ -1379,6 +1387,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1440,6 +1449,28 @@ class FlashInferIndicesUpdaterPrefill:
                     [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
                 )
                 bs_eff = bs + 1
+
+            if get_attn_tp_context().allow_input_scattered and forward_batch is not None:
+                num_tokens = forward_batch.extend_num_tokens
+                padded_tokens = forward_batch.input_ids.shape[0]
+                if (
+                padded_tokens is not None
+                and num_tokens is not None
+                and padded_tokens > num_tokens
+                ):
+                    pad_tokens = padded_tokens - num_tokens
+                    num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
+                    kv_start = (
+                        paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
+                    )
+                    kv_indices[kv_start : kv_start + num_dummy_pages] = 0
+                    qo_indptr = torch.cat(
+                        [qo_indptr, qo_indptr.new_tensor([padded_tokens])]
+                    )
+                    kv_indptr = torch.cat(
+                        [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+                    )
+                    bs_eff = bs + 1
 
             custom_mask = None
         else:
