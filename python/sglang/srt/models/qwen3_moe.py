@@ -283,6 +283,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
+        self.config = config
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -311,12 +313,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         ]
 
+    def prepare_mlp_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        return hidden_states
+    
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        last_layer = (self.layer_id == self.config.num_hidden_layers - 1)
+        hidden_states = get_attn_tp_context().fetch_mlp_latent(last_layer=last_layer)
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -803,6 +813,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            mlp_latent_func=self.mlp.prepare_mlp_latent,
         )
 
     def forward(

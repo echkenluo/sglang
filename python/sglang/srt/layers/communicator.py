@@ -188,6 +188,50 @@ class AttentionInputs:
                 self.hidden_states_, self.forward_batch
             )
         return self.hidden_states_
+    
+
+class MLPInputs:
+
+    def __init__(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        mlp_latent_func: Callable,
+    ):
+        self.hidden_states_local = hidden_states
+        self.forward_batch = forward_batch
+        self.mlp_latent_func = mlp_latent_func
+        self.hidden_states_ = None
+        self.mlp_latent_ = None
+
+    def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
+        total_tokens = forward_batch.input_ids.shape[0]
+        output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+        get_tp_group().all_gather_into_tensor(output, hidden_states)
+        return output
+
+    def fetch_mlp_latent(self, last_layer=False):
+        if self.mlp_latent_ is not None:
+            return self.mlp_latent_
+        assert self.mlp_latent_func is not None
+        self.mlp_latent_ = self.mlp_latent_func(
+            self.hidden_states_local, self.forward_batch
+        )
+        if get_attn_tp_context().input_scattered and not last_layer:
+            self.mlp_latent_ = self.tp_all_gather_hidden_states(
+                self.mlp_latent_, self.forward_batch
+            )
+        return self.mlp_latent_
+
+    def fetch_hidden_states(self):
+        if self.hidden_states_ is not None:
+            return self.hidden_states_
+        self.hidden_states_ = self.hidden_states_local
+        if get_attn_tp_context().input_scattered:
+            self.hidden_states_ = self.tp_all_gather_hidden_states(
+                self.hidden_states_, self.forward_batch
+            )
+        return self.hidden_states_
 
 
 class AttnTpContext:
@@ -195,6 +239,7 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
+        self.mlp_inputs_: Optional[MLPInputs] = None
 
     def init_context(self, q_lora_rank, is_nsa):
         self.allow_input_scattered = (
@@ -234,9 +279,16 @@ class AttnTpContext:
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
         self.attn_inputs_ = attn_inputs
 
+    def set_mlp_inputs(self, mlp_inputs: MLPInputs):
+        self.mlp_inputs_ = mlp_inputs
+
     def fetch_qkv_latent(self):
         assert self.attn_inputs_ is not None
         return self.attn_inputs_.fetch_qkv_latent()
+    
+    def fetch_mlp_latent(self, last_layer=False):
+        assert self.mlp_inputs_ is not None
+        return self.mlp_inputs_.fetch_mlp_latent(last_layer=last_layer)
 
     def fetch_hidden_states(self):
         assert self.attn_inputs_ is not None
@@ -250,6 +302,7 @@ class AttnTpContext:
         yield
         self.input_scattered_ = old_flag
         self.attn_inputs_ = None
+        self.mlp_inputs_ = None
 
 
 ATTN_TP_CONTEXT = AttnTpContext()
@@ -369,6 +422,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        mlp_latent_func: Optional[Callable] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -376,6 +430,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.mlp_latent_func = mlp_latent_func
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -560,10 +615,10 @@ class LayerCommunicator:
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
-        if residual is not None:
-            residual = residual.tensor_split(self._context.tp_size)[
-                self._context.tp_rank
-            ]
+        # if residual is not None:
+        #     residual = residual.tensor_split(self._context.tp_size)[
+        #         self._context.tp_rank
+        #     ]
         return output, residual
 
     def prepare_mlp(
@@ -575,14 +630,29 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
-
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
-            context=self._context,
-        )
+        if get_attn_tp_context().input_scattered and not self.is_last_layer:
+            hidden_states, residual = self._tp_reduce_scatter(
+                hidden_states,
+                residual,
+            )
+            if hidden_states.shape[0] == 0:
+                residual = hidden_states
+            else:
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        else:
+            hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                layernorm=self.post_attention_layernorm,
+                context=self._context,
+            )
+        if self.mlp_latent_func is not None:
+            mlp_inputs = MLPInputs(
+                hidden_states, forward_batch, self.mlp_latent_func
+            )
+            get_attn_tp_context().set_mlp_inputs(mlp_inputs)
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
