@@ -27,6 +27,8 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: Optional[int] = None
     cache_read_input_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[dict[str, Any]] = None
+    sglang_cached_tokens_details: Optional[dict[str, Any]] = None
 
 
 class AnthropicContentBlock(BaseModel):
@@ -119,6 +121,10 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    return_cached_tokens_details: Optional[bool] = None
+    rid: Optional[str | list[str]] = None
+    extra_key: Optional[str | list[str]] = None
+    cache_salt: Optional[str | list[str]] = None
 
     @field_validator("model")
     @classmethod
@@ -168,6 +174,7 @@ class AnthropicStreamEvent(BaseModel):
     index: Optional[int] = None
     error: Optional[AnthropicError] = None
     usage: Optional[AnthropicUsage] = None
+    sglext: Optional[dict[str, Any]] = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -183,3 +190,4 @@ class AnthropicMessagesResponse(BaseModel):
     ] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
+    sglext: Optional[dict[str, Any]] = None

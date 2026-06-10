@@ -251,9 +251,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
-                cached_tokens_details[index] = content["meta_info"].get(
+                cached_tokens_details_value = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if cached_tokens_details_value is not None:
+                    cached_tokens_details[index] = cached_tokens_details_value
+                else:
+                    cached_tokens_details.setdefault(index, None)
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)

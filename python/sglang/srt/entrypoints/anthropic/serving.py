@@ -10,7 +10,7 @@ import json
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -65,6 +65,76 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
+
+    @staticmethod
+    def _model_dump_optional(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return value.model_dump(exclude_none=True)
+        if isinstance(value, dict):
+            return {k: v for k, v in value.items() if v is not None}
+        return None
+
+    @staticmethod
+    def _to_int_optional(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _cached_token_usage_parts(
+        self,
+        usage: Any,
+        sglext: Any = None,
+    ) -> tuple[dict[str, Any] | None, int | None, dict[str, Any] | None]:
+        prompt_details = None
+        cached_tokens = None
+        if usage is not None:
+            prompt_details = self._model_dump_optional(
+                getattr(usage, "prompt_tokens_details", None)
+            )
+            if prompt_details:
+                cached_tokens = self._to_int_optional(
+                    prompt_details.get("cached_tokens")
+                )
+
+        sglext_dict = self._model_dump_optional(sglext)
+        cached_tokens_details = None
+        if sglext_dict:
+            details = sglext_dict.get("cached_tokens_details")
+            if isinstance(details, dict):
+                cached_tokens_details = details
+        return prompt_details, cached_tokens, cached_tokens_details
+
+    def _anthropic_usage_from_openai(
+        self,
+        usage: Any,
+        sglext: Any = None,
+    ) -> AnthropicUsage:
+        prompt_details, cached_tokens, cached_tokens_details = (
+            self._cached_token_usage_parts(usage, sglext)
+        )
+        return AnthropicUsage(
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            cache_read_input_tokens=cached_tokens,
+            prompt_tokens_details=prompt_details,
+            sglang_cached_tokens_details=cached_tokens_details,
+        )
+
+    def _should_return_cached_tokens_details(
+        self,
+        anthropic_request: AnthropicMessagesRequest,
+    ) -> bool:
+        if anthropic_request.return_cached_tokens_details is not None:
+            return bool(anthropic_request.return_cached_tokens_details)
+        server_args = getattr(
+            self.openai_serving_chat.tokenizer_manager, "server_args", None
+        )
+        return bool(getattr(server_args, "enable_cache_report", False))
 
     async def handle_messages(
         self,
@@ -272,6 +342,14 @@ class AnthropicServing:
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
 
+        request_data["return_cached_tokens_details"] = (
+            self._should_return_cached_tokens_details(anthropic_request)
+        )
+        for key in ("rid", "extra_key", "cache_salt"):
+            value = getattr(anthropic_request, key, None)
+            if value is not None:
+                request_data[key] = value
+
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
             request_data["stream_options"] = StreamOptions(include_usage=True)
@@ -441,6 +519,7 @@ class AnthropicServing:
         content_block_open = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
+        sglext_info: Optional[dict[str, Any]] = None
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
 
@@ -474,7 +553,23 @@ class AnthropicServing:
                         output_tokens=(
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
+                        cache_read_input_tokens=(
+                            usage_info.get("cache_read_input_tokens")
+                            if usage_info
+                            else None
+                        ),
+                        prompt_tokens_details=(
+                            usage_info.get("prompt_tokens_details")
+                            if usage_info
+                            else None
+                        ),
+                        sglang_cached_tokens_details=(
+                            usage_info.get("sglang_cached_tokens_details")
+                            if usage_info
+                            else None
+                        ),
                     ),
+                    sglext=sglext_info,
                 )
                 yield _wrap_sse_event(
                     delta_event.model_dump_json(exclude_none=True),
@@ -505,6 +600,10 @@ class AnthropicServing:
                 )
                 continue
 
+            if chunk.sglext:
+                sglext_info = self._model_dump_optional(chunk.sglext)
+                continue
+
             # First chunk: emit message_start
             if first_chunk:
                 first_chunk = False
@@ -533,9 +632,15 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
+                prompt_details, cached_tokens, cached_tokens_details = (
+                    self._cached_token_usage_parts(chunk.usage, sglext_info)
+                )
                 usage_info = {
                     "input_tokens": chunk.usage.prompt_tokens,
                     "output_tokens": chunk.usage.completion_tokens or 0,
+                    "cache_read_input_tokens": cached_tokens,
+                    "prompt_tokens_details": prompt_details,
+                    "sglang_cached_tokens_details": cached_tokens_details,
                 }
                 continue
 
@@ -658,6 +763,7 @@ class AnthropicServing:
                 model=response.model,
                 stop_reason="end_turn",
                 usage=AnthropicUsage(input_tokens=0, output_tokens=0),
+                sglext=self._model_dump_optional(response.sglext),
             )
 
         choice = response.choices[0]
@@ -694,10 +800,8 @@ class AnthropicServing:
             content=content,
             model=response.model,
             stop_reason=stop_reason,
-            usage=AnthropicUsage(
-                input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                output_tokens=response.usage.completion_tokens if response.usage else 0,
-            ),
+            usage=self._anthropic_usage_from_openai(response.usage, response.sglext),
+            sglext=self._model_dump_optional(response.sglext),
         )
 
     def _error_response(
