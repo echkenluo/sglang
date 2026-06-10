@@ -254,12 +254,19 @@ class AnthropicServing:
 
         # Convert messages
         for msg in anthropic_request.messages:
+            role = msg.role
+            # Chat templates (e.g. Qwen) require system messages at the very
+            # beginning; mid-conversation system turns (Claude Code 2.1.x via
+            # the mid-conversation-system beta) are demoted to user instead of
+            # failing template rendering.
+            if role == "system" and openai_messages:
+                role = "user"
             if isinstance(msg.content, str):
-                openai_messages.append({"role": msg.role, "content": msg.content})
+                openai_messages.append({"role": role, "content": msg.content})
                 continue
 
             # Complex content with blocks
-            openai_msg = {"role": msg.role}
+            openai_msg = {"role": role}
             content_parts = []
             tool_calls = []
 
