@@ -61,7 +61,10 @@ class AnthropicContentBlock(BaseModel):
 class AnthropicMessage(BaseModel):
     """Message structure"""
 
-    role: Literal["user", "assistant"]
+    # "system" is sent by Claude Code >= 2.1.x mid-conversation
+    # (anthropic-beta: mid-conversation-system-2026-04-07); the chat
+    # conversion passes the role through to an OpenAI system message.
+    role: Literal["user", "assistant", "system"]
     content: str | list[AnthropicContentBlock]
 
 
