@@ -524,6 +524,11 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        # Anthropic deltas are typed per block; Qwen interleaves text and tool
+        # calls in one turn, so track the open block's type to close it before
+        # switching kinds (Claude Code >= 2.1.x rejects text_delta on a
+        # tool_use block with "Content block is not a text block").
+        content_block_type = None
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         sglext_info: Optional[dict[str, Any]] = None
@@ -699,6 +704,7 @@ class AnthropicServing:
                             "content_block_start",
                         )
                         content_block_open = True
+                        content_block_type = "tool_use"
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -733,6 +739,18 @@ class AnthropicServing:
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                # Close an open non-text block before emitting text.
+                if content_block_open and content_block_type != "text":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
                 # Start a text content block if needed
                 if not content_block_open:
                     start_event = AnthropicStreamEvent(
@@ -745,6 +763,7 @@ class AnthropicServing:
                         "content_block_start",
                     )
                     content_block_open = True
+                    content_block_type = "text"
 
                 # Emit text delta
                 delta_event = AnthropicStreamEvent(
