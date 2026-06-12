@@ -323,6 +323,15 @@ class GroupCoordinator:
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
+        # Initialize pynvshmem
+        if (
+            os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+            and torch.distributed.get_world_size(self.device_group) > 1
+        ):
+            import flux
+
+            flux.init_flux_shm(self.device_group)
+
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,

@@ -9,6 +9,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -64,6 +65,7 @@ if _is_npu:
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
+        first_layer: bool,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -126,6 +128,7 @@ class Qwen3Attention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+            fuse_ag_gemm=(not first_layer),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -136,6 +139,7 @@ class Qwen3Attention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
+            fuse_gemm_rs=True,
         )
 
         self.rotary_emb = get_rope(
@@ -168,8 +172,8 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_native(self, positions, hidden_states, useFlux: bool = False):
+        qkv, _ = self.qkv_proj(hidden_states, useFlux=useFlux)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -295,6 +299,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                useFlux=forward_batch.useFlux,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -308,7 +313,7 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, useFlux=forward_batch.useFlux)
         return output
 
     def prepare_qkv_latent(
@@ -320,6 +325,8 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
+        first_layer: bool,
+        last_layer: bool,
         config: Qwen3Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
@@ -333,6 +340,7 @@ class Qwen3DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(
+            first_layer=first_layer,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -353,7 +361,10 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            last_layer=last_layer,
         )
+        self.first_layer = first_layer
+        self.last_layer = last_layer
 
         norm_kwargs = (
             dict(
@@ -412,10 +423,17 @@ class Qwen3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        if self.first_layer and forward_batch.useFlux:
+            n_slices = get_tensor_model_parallel_world_size()
+            residual_slices = torch.chunk(residual, n_slices, dim=0)
+            my_residual = residual_slices[get_tensor_model_parallel_rank()]
+        else:
+            my_residual = residual
+
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, my_residual = self.layer_communicator.prepare_mlp(
             hidden_states,
-            residual,
+            my_residual,
             forward_batch,
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
@@ -436,7 +454,16 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states = get_attn_tp_context().fetch_mlp_latent(
                 last_layer=self.is_last_layer
             )
-        hidden_states = self.mlp(hidden_states, use_reduce_scatter)
+        hidden_states = self.mlp(
+            hidden_states, use_reduce_scatter, useFlux=forward_batch.useFlux
+        )
+
+        if self.last_layer and forward_batch.useFlux:
+            residual = tensor_model_parallel_all_gather(my_residual, 0)
+        else:
+            residual = my_residual
+
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(

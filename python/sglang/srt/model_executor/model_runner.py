@@ -2846,6 +2846,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            forward_batch.useFluxFunc()
             ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

@@ -1099,9 +1099,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                if not forward_batch.useFlux:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

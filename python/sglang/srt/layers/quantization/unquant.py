@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from sglang.srt.distributed import get_tp_group
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -679,3 +680,130 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu
+
+MAX_M = 65536
+class GemmRS(LinearMethodBase):
+    #Fused Gemm-ReduceScatter without quantization.
+    glo_rs_gemm_ctx_cache = {}
+
+    def __init__(self, separate_bias_add: bool = False):
+        self.separate_bias_add = separate_bias_add
+
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
+                       **extra_weight_attrs):
+        import flux
+
+        weight = Parameter(torch.empty(sum(output_partition_sizes),
+                                       input_size_per_partition,
+                                       dtype=params_dtype),
+                           requires_grad=False)
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+        key = (output_size)
+        if key not in GemmRS.glo_rs_gemm_ctx_cache:
+            GemmRS.glo_rs_gemm_ctx_cache[key]  = flux.GemmRS(
+                get_tp_group().device_group,
+                1,  # One node
+                MAX_M,  # Max M. TODO: Pass in correctly.
+                output_size,  # N
+                # TODO: Pass in input dtype correctly.
+                # TODO: It would be nicer to modify flux to dispatch based on dtype
+                # at run time, but I don't know what the downside would be.
+                # Similar comment for max m.
+                params_dtype,
+                params_dtype,
+                # Note: transpose_weight=False means that B is transposed
+                transpose_weight=False,
+                # Note: bfloat16 requires fuse_reduction=False.
+                fuse_reduction=False,
+            )
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None,
+              useFlux: bool = False) -> torch.Tensor:
+        if useFlux:
+            assert bias is None
+
+            key = (layer.weight.shape[0])
+            if key not in GemmRS.glo_rs_gemm_ctx_cache:
+                # print(f"GemmRS key {key} not found in cache, creating new AGCook context.")
+                rs_gemm_op = GemmRS.glo_rs_gemm_ctx_cache[(MAX_M,layer.weight.shape[0])]
+            else:
+                rs_gemm_op = GemmRS.glo_rs_gemm_ctx_cache[key]
+
+            output = rs_gemm_op.forward(x, layer.weight)
+            if bias is not None:
+                output = output + bias
+            return output
+        else:
+            return F.linear(x, layer.weight, bias)
+
+
+class AGCook(LinearMethodBase):
+    #Fused AllGather-Gemm without quantization.
+    glo_ag_gemm_ctx_cache = {}
+
+    def __init__(self, separate_bias_add: bool = False):
+        self.separate_bias_add = separate_bias_add
+
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
+                       **extra_weight_attrs):
+        import flux
+
+        weight = Parameter(torch.empty(sum(output_partition_sizes),
+                                       input_size_per_partition,
+                                       dtype=params_dtype),
+                           requires_grad=False)
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+
+        key = (weight.shape[0], weight.shape[1])
+        if key not in AGCook.glo_ag_gemm_ctx_cache:
+            AGCook.glo_ag_gemm_ctx_cache[key] = flux.AGKernel(
+                get_tp_group().device_group,
+                1,  # One node
+                MAX_M,  # Max M. TODO: Pass in correctly.
+                weight.shape[0],  # N
+                weight.shape[1],  # K
+                # TODO: Pass in input dtype correctly.
+                # TODO: It would be nicer to modify flux to dispatch based on dtype
+                # at run time, but I don't know what the downside would be.
+                # Similar comment for max m.
+                params_dtype,
+                params_dtype,
+                use_pdl=False,
+            )
+
+    def apply(self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+            useFlux: bool = False) -> torch.Tensor:
+        if useFlux:
+            # assert bias is None
+
+            key = (layer.weight.shape[0], layer.weight.shape[1])
+            if key not in AGCook.glo_ag_gemm_ctx_cache:
+                # print(f"AGCOOK key {key} not found in cache, creating new AGCook context.")
+                ag_gemm_op = AGCook.glo_ag_gemm_ctx_cache[(MAX_M,layer.weight.shape[0])]
+            else:
+                ag_gemm_op = AGCook.glo_ag_gemm_ctx_cache[key]
+
+            output = ag_gemm_op.forward(x, layer.weight )
+            if bias is not None:
+                output = output + bias
+            return output
+        else:
+            return F.linear(x, layer.weight, bias)

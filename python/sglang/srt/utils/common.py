@@ -625,6 +625,8 @@ def make_layers(
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circular imports
+    import inspect
+
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -639,11 +641,24 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
+
+    sig = inspect.signature(layer_fn)
+    has_firstlast_args = ('first_layer'
+                          in sig.parameters) and ('last_layer'
+                                                  in sig.parameters)
+    def make_one_layer(idx, start_layer, end_layer):
+        if has_firstlast_args:
+            return layer_fn(idx=idx, prefix=f"{prefix}.{idx}",
+                         first_layer=(idx == start_layer),
+                         last_layer=(idx == end_layer - 1))
+        else:
+            return layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + get_offloader().wrap_modules(
             (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                make_one_layer(idx, start_layer, end_layer)
                 for idx in range(start_layer, end_layer)
             ),
             **(offloader_kwargs or {}),
