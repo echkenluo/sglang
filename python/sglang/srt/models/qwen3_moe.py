@@ -717,6 +717,11 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
+        from sglang.srt.layers import fo_overlap
+
+        fo_out = fo_overlap.maybe_o_proj(attn_output, self.o_proj.weight)
+        if fo_out is not None:
+            return fo_out
         output, _ = self.o_proj(attn_output)
         return output
 

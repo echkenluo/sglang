@@ -200,7 +200,11 @@ def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
 
 def _tp_all_gather_hidden_states_fp8_packed(hidden_states, total_tokens):
     """Single-collective variant: fp8 payload and fp32 scales are packed into
-    one byte row per token, gathered once, then dequantized by a fused kernel."""
+    one byte row per token, gathered once, then dequantized by a fused kernel.
+
+    Note: a fused quant-into-packed-layout triton kernel was benchmarked and
+    showed no gain over quant + slice copies (the copies are not a bottleneck);
+    keeping the simpler form."""
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
@@ -748,6 +752,20 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
+        from sglang.srt.layers import fo_overlap
+
+        if fo_overlap.pending():
+            # FlashOverlap already all-reduced o_proj inside the GEMM; restore
+            # tile order fused with the residual-add + rmsnorm.
+            hidden_states, residual = fo_overlap.consume(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            if self.mlp_latent_func is not None:
+                mlp_inputs = MLPInputs(
+                    hidden_states, forward_batch, self.mlp_latent_func
+                )
+                get_attn_tp_context().set_mlp_inputs(mlp_inputs)
+            return hidden_states, residual
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
