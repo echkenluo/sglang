@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -19,6 +20,8 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
@@ -149,20 +152,94 @@ class ScatterMode(Enum):
 # FP8-quantized all-gather for the input-scattered (RS+AG) path.
 # AG transfers final values (not partial sums), so quantize-transfer-dequant
 # is numerically safe; wire bytes for the hidden states are halved.
+# SGLANG_FP8_AG=1        enable (packed single-collective path)
+# SGLANG_FP8_AG_V1=1     legacy two-collective path (payload + scale gathered
+#                        separately) for A/B comparison
+# SGLANG_FP8_AG_SIDE     all (default) | mlp | attn — quantize only that AG site
 _ENABLE_FP8_AG = get_bool_env_var("SGLANG_FP8_AG")
+_FP8_AG_V1 = get_bool_env_var("SGLANG_FP8_AG_V1")
+_FP8_AG_SIDE = os.environ.get("SGLANG_FP8_AG_SIDE", "all").lower()
 _FP8_AG_GROUP_SIZE = 128
 
 
-def _tp_all_gather_hidden_states(hidden_states, forward_batch):
+@triton.jit
+def _fp8_ag_dequant_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    q_row_stride,
+    s_row_stride,
+    out_row_stride,
+    GROUP: tl.constexpr,
+):
+    t = tl.program_id(0)
+    g = tl.program_id(1)
+    offs = g * GROUP + tl.arange(0, GROUP)
+    q = tl.load(q_ptr + t * q_row_stride + offs).to(tl.float32)
+    s = tl.load(s_ptr + t * s_row_stride + g)
+    tl.store(out_ptr + t * out_row_stride + offs, q * s)
+
+
+def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
     total_tokens = forward_batch.input_ids.shape[0]
     if (
         _ENABLE_FP8_AG
+        and (_FP8_AG_SIDE == "all" or _FP8_AG_SIDE == side)
         and hidden_states.shape[0] > 0
         and hidden_states.shape[-1] % _FP8_AG_GROUP_SIZE == 0
     ):
-        return _tp_all_gather_hidden_states_fp8(hidden_states, total_tokens)
+        # Packing overhead beats the saved collective launch only at larger
+        # gathers (L1: v2 wins >=4k total tokens, loses at ~1k).
+        if _FP8_AG_V1 or total_tokens < 4096:
+            return _tp_all_gather_hidden_states_fp8(hidden_states, total_tokens)
+        return _tp_all_gather_hidden_states_fp8_packed(hidden_states, total_tokens)
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
     get_tp_group().all_gather_into_tensor(output, hidden_states)
+    return output
+
+
+def _tp_all_gather_hidden_states_fp8_packed(hidden_states, total_tokens):
+    """Single-collective variant: fp8 payload and fp32 scales are packed into
+    one byte row per token, gathered once, then dequantized by a fused kernel."""
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    hidden = hidden_states.shape[-1]
+    scale_bytes = (hidden // _FP8_AG_GROUP_SIZE) * 4
+    row_bytes = hidden + scale_bytes
+    x_q, x_s = sglang_per_token_group_quant_fp8(
+        hidden_states.contiguous(), _FP8_AG_GROUP_SIZE
+    )
+    local_tokens = x_q.shape[0]
+    packed = torch.empty(
+        (local_tokens, row_bytes), dtype=torch.uint8, device=x_q.device
+    )
+    packed[:, :hidden] = x_q.view(torch.uint8)
+    packed[:, hidden:] = x_s.view(torch.uint8)
+    packed_full = torch.empty(
+        (total_tokens, row_bytes), dtype=torch.uint8, device=x_q.device
+    )
+    get_tp_group().all_gather_into_tensor(packed_full, packed)
+    q_full = packed_full.view(torch.float8_e4m3fn)[:, :hidden]
+    s_full = (
+        packed_full[:, hidden:]
+        .contiguous()
+        .view(torch.float32)
+        .view(total_tokens, hidden // _FP8_AG_GROUP_SIZE)
+    )
+    output = torch.empty(
+        (total_tokens, hidden), dtype=hidden_states.dtype, device=x_q.device
+    )
+    _fp8_ag_dequant_kernel[(total_tokens, hidden // _FP8_AG_GROUP_SIZE)](
+        q_full,
+        s_full,
+        output,
+        packed_full.stride(0),
+        s_full.stride(0),
+        output.stride(0),
+        GROUP=_FP8_AG_GROUP_SIZE,
+    )
     return output
 
 
@@ -208,7 +285,7 @@ class AttentionInputs:
         self.qkv_latent_ = None
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        return _tp_all_gather_hidden_states(hidden_states, forward_batch)
+        return _tp_all_gather_hidden_states(hidden_states, forward_batch, side="attn")
 
     def fetch_qkv_latent(self):
         if self.qkv_latent_ is not None:
@@ -249,7 +326,7 @@ class MLPInputs:
         self.mlp_latent_ = None
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        return _tp_all_gather_hidden_states(hidden_states, forward_batch)
+        return _tp_all_gather_hidden_states(hidden_states, forward_batch, side="mlp")
 
     def fetch_mlp_latent(self, last_layer=False):
         if self.mlp_latent_ is not None:
