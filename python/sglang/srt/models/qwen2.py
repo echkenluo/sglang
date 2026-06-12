@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -68,6 +69,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        last_layer: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -75,6 +77,7 @@ class Qwen2MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            fuse_ag_gemm=True,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -82,6 +85,7 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            fuse_gemm_rs=(not last_layer),
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -91,19 +95,20 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, useFlux: bool = False):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.gate_up_proj(x, useFlux=useFlux)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, useFlux=useFlux)
         return x
 
 
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        first_layer: bool,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -150,6 +155,7 @@ class Qwen2Attention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            fuse_ag_gemm=(not first_layer),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -157,6 +163,7 @@ class Qwen2Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            fuse_gemm_rs=True,
         )
 
         self.rotary_emb = get_rope(
@@ -183,17 +190,19 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, useFlux=forward_batch.useFlux)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, useFlux=forward_batch.useFlux)
         return output
 
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
+        first_layer: bool,
+        last_layer: bool,
         config: Qwen2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
@@ -209,6 +218,7 @@ class Qwen2DecoderLayer(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.self_attn = Qwen2Attention(
+            first_layer=first_layer,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -227,11 +237,14 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            last_layer=last_layer,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.first_layer = first_layer
+        self.last_layer = last_layer
 
     def forward(
         self,
@@ -252,9 +265,21 @@ class Qwen2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+        if self.first_layer and forward_batch.useFlux:
+            n_slices = get_tensor_model_parallel_world_size()
+            residual_slices = torch.chunk(residual, n_slices, dim=0)
+            my_residual = residual_slices[get_tensor_model_parallel_rank()]
+        else:
+            my_residual = residual
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, my_residual = self.post_attention_layernorm(hidden_states, my_residual)
+        hidden_states = self.mlp(hidden_states, useFlux=forward_batch.useFlux)
+
+        if self.last_layer and forward_batch.useFlux:
+            residual = tensor_model_parallel_all_gather(my_residual, 0)
+        else:
+            residual = my_residual
+
         return hidden_states, residual
 
 
@@ -293,11 +318,13 @@ class Qwen2Model(nn.Module):
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: decoder_layer_type(
+            lambda idx, prefix, first_layer, last_layer: decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                first_layer=first_layer,
+                last_layer=last_layer,
                 alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
