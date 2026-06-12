@@ -146,6 +146,53 @@ class ScatterMode(Enum):
         return ScatterMode.TP_ATTN_FULL
 
 
+# FP8-quantized all-gather for the input-scattered (RS+AG) path.
+# AG transfers final values (not partial sums), so quantize-transfer-dequant
+# is numerically safe; wire bytes for the hidden states are halved.
+_ENABLE_FP8_AG = get_bool_env_var("SGLANG_FP8_AG")
+_FP8_AG_GROUP_SIZE = 128
+
+
+def _tp_all_gather_hidden_states(hidden_states, forward_batch):
+    total_tokens = forward_batch.input_ids.shape[0]
+    if (
+        _ENABLE_FP8_AG
+        and hidden_states.shape[0] > 0
+        and hidden_states.shape[-1] % _FP8_AG_GROUP_SIZE == 0
+    ):
+        return _tp_all_gather_hidden_states_fp8(hidden_states, total_tokens)
+    output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+    get_tp_group().all_gather_into_tensor(output, hidden_states)
+    return output
+
+
+def _tp_all_gather_hidden_states_fp8(hidden_states, total_tokens):
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    x_q, x_s = sglang_per_token_group_quant_fp8(
+        hidden_states.contiguous(), _FP8_AG_GROUP_SIZE
+    )
+    tp_group = get_tp_group()
+    q_full = torch.empty(
+        (total_tokens, x_q.shape[-1]), dtype=x_q.dtype, device=x_q.device
+    )
+    s_full = torch.empty(
+        (total_tokens, x_s.shape[-1]), dtype=x_s.dtype, device=x_s.device
+    )
+    # NCCL has no fp8 dtype; gather the quantized payload as raw bytes.
+    tp_group.all_gather_into_tensor(q_full.view(torch.uint8), x_q.view(torch.uint8))
+    tp_group.all_gather_into_tensor(s_full, x_s)
+    output = (
+        q_full.to(hidden_states.dtype)
+        .view(total_tokens, -1, _FP8_AG_GROUP_SIZE)
+        .mul_(s_full.unsqueeze(-1).to(hidden_states.dtype))
+        .view(total_tokens, x_q.shape[-1])
+    )
+    return output
+
+
 class AttentionInputs:
 
     def __init__(
@@ -161,10 +208,7 @@ class AttentionInputs:
         self.qkv_latent_ = None
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        total_tokens = forward_batch.input_ids.shape[0]
-        output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_tp_group().all_gather_into_tensor(output, hidden_states)
-        return output
+        return _tp_all_gather_hidden_states(hidden_states, forward_batch)
 
     def fetch_qkv_latent(self):
         if self.qkv_latent_ is not None:
@@ -205,10 +249,7 @@ class MLPInputs:
         self.mlp_latent_ = None
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        total_tokens = forward_batch.input_ids.shape[0]
-        output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_tp_group().all_gather_into_tensor(output, hidden_states)
-        return output
+        return _tp_all_gather_hidden_states(hidden_states, forward_batch)
 
     def fetch_mlp_latent(self, last_layer=False):
         if self.mlp_latent_ is not None:
