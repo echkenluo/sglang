@@ -669,7 +669,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Periodic engagement-rate evidence: quantifies how much extend
             # traffic the opportunistic policy actually covers.
             total = _FLUX_ENGAGED_BATCHES + _FLUX_SKIPPED_BATCHES
-            if total % 500 == 0:
+            if total % 100 == 0:
                 tok_total = _FLUX_ENGAGED_TOKENS + _FLUX_SKIPPED_TOKENS
                 logging.info(
                     f"[FLUX] engagement: batches {_FLUX_ENGAGED_BATCHES}/{total} "
