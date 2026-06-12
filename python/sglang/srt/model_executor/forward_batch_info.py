@@ -640,14 +640,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def useFluxFunc(self):
         if get_int_env_var("SGLANG_USE_FUSED_OVERLAP", 0) == 1:
-            self.useFlux = True
-            self.tp_align()
-            global _FLUX_ENGAGED_LOGGED
-            if not _FLUX_ENGAGED_LOGGED:
-                _FLUX_ENGAGED_LOGGED = True
-                logging.info(
-                    f"[FLUX] useFlux engaged: tokens={self.input_ids.shape[0]}"
-                )
+            # Opportunistic engagement: flux GemmRS/AG-GEMM needs the token
+            # count to be a TP multiple. The 0.5.5 patch padded the batch
+            # (tp_align), but the padded rows break flashinfer's ragged
+            # qo_indptr validation and pollute KV slot 0. Large prefill
+            # chunks (where flux pays off) are virtually always divisible;
+            # odd batches just take the standard unfused path.
+            if (
+                self.input_ids is not None
+                and self.input_ids.shape[0] > 0
+                and self.input_ids.shape[0] % get_tensor_model_parallel_world_size()
+                == 0
+            ):
+                self.useFlux = True
+                global _FLUX_ENGAGED_LOGGED
+                if not _FLUX_ENGAGED_LOGGED:
+                    _FLUX_ENGAGED_LOGGED = True
+                    logging.info(
+                        f"[FLUX] useFlux engaged: tokens={self.input_ids.shape[0]}"
+                    )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
