@@ -335,7 +335,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.ep_size > 1 and not should_allreduce_fusion:
+        # Under the input-scattered (RS+AG) path, the next layer's
+        # reduce-scatter over the attn-tp group already reduces the EP
+        # partial sums; an all-reduce here would double-count them.
+        if (
+            self.ep_size > 1
+            and not should_allreduce_fusion
+            and not (use_reduce_scatter and get_attn_tp_context().input_scattered)
+        ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if (
