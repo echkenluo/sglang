@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -78,6 +79,8 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+
+_FLUX_ENGAGED_LOGGED = False
 
 
 class ForwardMode(IntEnum):
@@ -639,7 +642,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if get_int_env_var("SGLANG_USE_FUSED_OVERLAP", 0) == 1:
             self.useFlux = True
             self.tp_align()
-            # print("useFluxFunc")
+            global _FLUX_ENGAGED_LOGGED
+            if not _FLUX_ENGAGED_LOGGED:
+                _FLUX_ENGAGED_LOGGED = True
+                logging.info(
+                    f"[FLUX] useFlux engaged: tokens={self.input_ids.shape[0]}"
+                )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
