@@ -270,6 +270,9 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if get_attn_tp_context().input_scattered:
+            hidden_states = get_attn_tp_context().fetch_qkv_latent()
+
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
@@ -376,12 +379,13 @@ class Qwen3DecoderLayer(nn.Module):
             is_previous_layer_sparse=False,
             is_next_layer_sparse=False,
         )
+        self.is_last_layer = layer_id == config.num_hidden_layers - 1
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            is_last_layer=self.is_last_layer,
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
             mlp_latent_func=self.mlp.prepare_mlp_latent,
         )
@@ -428,6 +432,10 @@ class Qwen3DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+        if get_attn_tp_context().input_scattered:
+            hidden_states = get_attn_tp_context().fetch_mlp_latent(
+                last_layer=self.is_last_layer
+            )
         hidden_states = self.mlp(hidden_states, use_reduce_scatter)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
@@ -525,13 +533,14 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

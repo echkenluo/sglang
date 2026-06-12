@@ -180,6 +180,9 @@ def _fp8_ag_dequant_kernel(
     tl.store(out_ptr + t * out_row_stride + offs, q * s)
 
 
+_FP8_AG_ENGAGED_LOGGED = False
+
+
 def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
     total_tokens = forward_batch.input_ids.shape[0]
     if (
@@ -188,6 +191,13 @@ def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
         and hidden_states.shape[0] > 0
         and hidden_states.shape[-1] % _FP8_AG_GROUP_SIZE == 0
     ):
+        global _FP8_AG_ENGAGED_LOGGED
+        if not _FP8_AG_ENGAGED_LOGGED:
+            _FP8_AG_ENGAGED_LOGGED = True
+            logging.info(
+                f"[FP8-AG] engaged: side={side} tokens={total_tokens} "
+                f"hidden={hidden_states.shape[-1]}"
+            )
         # Packing overhead beats the saved collective launch only at larger
         # gathers (L1: v2 wins >=4k total tokens, loses at ~1k).
         if _FP8_AG_V1 or total_tokens < 4096:
