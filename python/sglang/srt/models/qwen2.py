@@ -91,13 +91,18 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def prepare_mlp_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        return hidden_states
+
+    def forward(self, x, use_reduce_scatter: bool = False):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
         return x
 
 

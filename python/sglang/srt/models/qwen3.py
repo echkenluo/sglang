@@ -10,7 +10,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -304,6 +308,11 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        return hidden_states
+
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
@@ -371,6 +380,10 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            mlp_latent_func=self.mlp.prepare_mlp_latent,
         )
 
     def forward(
@@ -411,7 +424,11 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states)
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(hidden_states, use_reduce_scatter)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -492,6 +509,8 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+        get_attn_tp_context().init_context(True, False)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
