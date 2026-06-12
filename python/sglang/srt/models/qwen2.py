@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -60,6 +61,10 @@ Qwen2Config = None
 
 logger = logging.getLogger(__name__)
 
+# Flux fused GemmRS/AG-GEMM contexts are only built when explicitly enabled,
+# so the patch can stay resident without a flux install or extra VRAM.
+_FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -77,7 +82,7 @@ class Qwen2MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            fuse_ag_gemm=True,
+            fuse_ag_gemm=_FLUX_FUSE,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -85,7 +90,7 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            fuse_gemm_rs=(not last_layer),
+            fuse_gemm_rs=(_FLUX_FUSE and not last_layer),
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -113,7 +118,6 @@ class Qwen2MLP(nn.Module):
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
-        first_layer: bool,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -125,6 +129,7 @@ class Qwen2Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
+        first_layer: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -160,7 +165,7 @@ class Qwen2Attention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            fuse_ag_gemm=(not first_layer),
+            fuse_ag_gemm=(_FLUX_FUSE and not first_layer),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -168,7 +173,7 @@ class Qwen2Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            fuse_gemm_rs=True,
+            fuse_gemm_rs=_FLUX_FUSE,
         )
 
         self.rotary_emb = get_rope(
@@ -206,13 +211,13 @@ class Qwen2Attention(nn.Module):
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
-        first_layer: bool,
-        last_layer: bool,
         config: Qwen2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        first_layer: bool = True,
+        last_layer: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size

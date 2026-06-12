@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -41,6 +42,10 @@ from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_n
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
+
+# Flux fused GemmRS/AG-GEMM contexts are only built when explicitly enabled,
+# so the patch can stay resident without a flux install or extra VRAM.
+_FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -65,7 +70,6 @@ if _is_npu:
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
-        first_layer: bool,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -79,6 +83,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        first_layer: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -128,7 +133,7 @@ class Qwen3Attention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
-            fuse_ag_gemm=(not first_layer),
+            fuse_ag_gemm=(_FLUX_FUSE and not first_layer),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -139,7 +144,7 @@ class Qwen3Attention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            fuse_gemm_rs=True,
+            fuse_gemm_rs=_FLUX_FUSE,
         )
 
         self.rotary_emb = get_rope(
@@ -325,13 +330,13 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
-        first_layer: bool,
-        last_layer: bool,
         config: Qwen3Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        first_layer: bool = True,
+        last_layer: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
