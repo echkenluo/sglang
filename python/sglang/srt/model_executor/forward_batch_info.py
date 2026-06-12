@@ -35,6 +35,7 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -57,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_int_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -439,6 +441,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For flux
+    _original_input_size: int = -1
+    _pad_size: int = -1
+    useFlux: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -608,6 +615,42 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def tp_align(self):
+        # 对输入向量进行TP对齐，确保第一维尺寸为TP的整数倍，会同时修改input_ids和positions等张量。
+        world_size = get_tensor_model_parallel_world_size()
+        if world_size <= 1:
+            return False  # 不需要对齐
+
+        input_size = self.input_ids.shape[0]
+        # 保存原始信息
+        self._original_input_size = input_size
+        cache_size = self.out_cache_loc.shape[0]
+        if input_size % world_size != 0:
+            # 计算需要填充的大小
+            pad_size = world_size - (input_size % world_size)
+            # 对input_ids进行填充
+            padded_input_ids = F.pad(self.input_ids, (0, pad_size), mode='constant', value=0)
+            self.input_ids = padded_input_ids
+
+        if cache_size % world_size != 0:
+            pad_size = self.input_ids.shape[0] - self.out_cache_loc.shape[0]
+            self._pad_size = pad_size
+            # 对positions进行填充
+            if self.positions is not None:
+                pad_pos = torch.zeros((pad_size, *self.positions.shape[1:]), dtype=self.positions.dtype, device=self.positions.device)
+                self.positions = torch.cat([self.positions, pad_pos], dim=0)
+            # NOTE: pads out_cache_loc with slot 0; known wart inherited from the 0.5.5 patch
+            padded_out_cache_loc = F.pad(self.out_cache_loc, (0, pad_size), mode='constant', value=0)
+            self.out_cache_loc = padded_out_cache_loc
+
+        return True
+
+    def useFluxFunc(self):
+        if get_int_env_var("SGLANG_USE_FUSED_OVERLAP", 0) == 1:
+            self.useFlux = True
+            self.tp_align()
+            # print("useFluxFunc")
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""

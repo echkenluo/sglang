@@ -154,6 +154,9 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    fuse_gemm_rs: bool = False
+    fuse_ag_gemm: bool = False
+
     def __init__(
         self,
         input_size: int,
@@ -162,6 +165,8 @@ class LinearBase(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fuse_gemm_rs: bool = False,
+        fuse_ag_gemm: bool = False,
     ):
         super().__init__()
 
@@ -173,7 +178,19 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
-        if quant_config is None:
+        if fuse_gemm_rs:
+            assert (quant_config is None)
+            from sglang.srt.layers.quantization.unquant import GemmRS
+
+            self.quant_method: Optional[QuantizeMethodBase] = GemmRS()
+            self.fuse_gemm_rs = True
+        elif fuse_ag_gemm:
+            assert (quant_config is None)
+            from sglang.srt.layers.quantization.unquant import AGCook
+
+            self.quant_method = AGCook()
+            self.fuse_ag_gemm = True
+        elif quant_config is None:
             from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
@@ -321,13 +338,20 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
+        fuse_ag_gemm: bool = False,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
     ):
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            fuse_ag_gemm=fuse_ag_gemm,
         )
 
         self.gather_output = gather_output
@@ -455,12 +479,15 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, useFlux: bool = False):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if useFlux and self.fuse_ag_gemm:
+            output_parallel = self.quant_method.apply(self, input_, bias, useFlux)
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -511,6 +538,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fuse_ag_gemm: bool = False,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
@@ -532,6 +560,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
+            fuse_ag_gemm=fuse_ag_gemm,
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_presharded_weights=use_presharded_weights,
@@ -903,6 +932,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fuse_ag_gemm: bool = False,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
@@ -955,6 +985,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
+            fuse_ag_gemm=fuse_ag_gemm,
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
@@ -1349,6 +1380,7 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fuse_gemm_rs: bool = False,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
@@ -1356,7 +1388,13 @@ class RowParallelLinear(LinearBase):
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            fuse_gemm_rs=fuse_gemm_rs,
         )
 
         self.input_is_parallel = input_is_parallel
@@ -1492,7 +1530,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, useFlux=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1513,9 +1551,16 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if useFlux and self.fuse_gemm_rs:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_, useFlux=useFlux
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        if self.reduce_results and not useFlux and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
