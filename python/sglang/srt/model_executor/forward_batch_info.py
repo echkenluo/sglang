@@ -81,6 +81,10 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 _FLUX_ENGAGED_LOGGED = False
+_FLUX_ENGAGED_BATCHES = 0
+_FLUX_SKIPPED_BATCHES = 0
+_FLUX_ENGAGED_TOKENS = 0
+_FLUX_SKIPPED_TOKENS = 0
 
 
 class ForwardMode(IntEnum):
@@ -646,19 +650,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # qo_indptr validation and pollute KV slot 0. Large prefill
             # chunks (where flux pays off) are virtually always divisible;
             # odd batches just take the standard unfused path.
+            global _FLUX_ENGAGED_BATCHES, _FLUX_SKIPPED_BATCHES, _FLUX_ENGAGED_TOKENS, _FLUX_SKIPPED_TOKENS
+            tokens = 0 if self.input_ids is None else self.input_ids.shape[0]
             if (
-                self.input_ids is not None
-                and self.input_ids.shape[0] > 0
-                and self.input_ids.shape[0] % get_tensor_model_parallel_world_size()
-                == 0
+                tokens > 0
+                and tokens % get_tensor_model_parallel_world_size() == 0
             ):
                 self.useFlux = True
+                _FLUX_ENGAGED_BATCHES += 1
+                _FLUX_ENGAGED_TOKENS += tokens
                 global _FLUX_ENGAGED_LOGGED
                 if not _FLUX_ENGAGED_LOGGED:
                     _FLUX_ENGAGED_LOGGED = True
-                    logging.info(
-                        f"[FLUX] useFlux engaged: tokens={self.input_ids.shape[0]}"
-                    )
+                    logging.info(f"[FLUX] useFlux engaged: tokens={tokens}")
+            else:
+                _FLUX_SKIPPED_BATCHES += 1
+                _FLUX_SKIPPED_TOKENS += tokens
+            # Periodic engagement-rate evidence: quantifies how much extend
+            # traffic the opportunistic policy actually covers.
+            total = _FLUX_ENGAGED_BATCHES + _FLUX_SKIPPED_BATCHES
+            if total % 500 == 0:
+                tok_total = _FLUX_ENGAGED_TOKENS + _FLUX_SKIPPED_TOKENS
+                logging.info(
+                    f"[FLUX] engagement: batches {_FLUX_ENGAGED_BATCHES}/{total} "
+                    f"({100.0 * _FLUX_ENGAGED_BATCHES / max(total, 1):.1f}%), "
+                    f"tokens {_FLUX_ENGAGED_TOKENS}/{tok_total} "
+                    f"({100.0 * _FLUX_ENGAGED_TOKENS / max(tok_total, 1):.1f}%)"
+                )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
