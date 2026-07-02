@@ -29,6 +29,14 @@ Stages reported (max_abs / mean_abs / cosine, worst across ranks):
   (iv)  flux final           vs bf16 reference final (serving-mirror)
   (v)   _moe_tail fed the REFERENCE GEMM1 outputs vs fp32 reference final
         (isolates the sglang-side tail: silu*mul, GEMM2 loop, unsort+combine)
+  (vi)  slice-2 end-to-end (flux GEMM1 + fused GatherRS tail: GEMM2 + topk
+        gather + fp32 weight scaling + reduce + cross-rank ReduceScatter)
+        vs the fp32 reference SCATTERED rows
+  (vii) same slice-2 output vs the bf16 reference SCATTERED rows
+Both ranks hold IDENTICAL weight shards, so GatherRS's cross-rank reduction
+doubles the single-shard partial: the scattered references are
+(2 * reference).chunk(TP)[rank]. A missing or rank-misordered reduction is
+still visible (1x values / swapped rank blocks).
 plus a metadata oracle check (direct per-expert accumulation from topk_ids,
 independent of the sort machinery) and, if GEMM1 deviates grossly, an
 explicit gather-ORDERING hypothesis test (original rank-contiguous order vs
@@ -36,11 +44,15 @@ rank-rotated order) to catch a flux-internal all-gather layout mismatch.
 
 Verdict: the first stage exceeding 3x the bf16 noise floor, mapped to
   (a) AGScatter GEMM1 + scatter metadata
-  (b) the sglang-side tail
+  (b) the sglang-side torch tail / (b/gather_rs) the fused GatherRS tail
   (c) neither: genuine mixed-precision accumulation difference (quantified)
 Exit code is nonzero iff any stage exceeds its threshold (or the metadata
 oracle fails), so a wrapper can sentinel it. Rank 0 prints; metrics are
 all-reduced so the exit code is rank-consistent.
+
+SGLANG_FLUX_MOE_MAX_NTOKENS (default 8192) also applies here; it sizes both
+flux workspaces (GatherRS max_m = max_ntokens * topk) and must be set before
+launch if the nvshmem heap is tight.
 """
 
 import os
@@ -49,6 +61,9 @@ import sys
 # Must be set before sglang.srt.layers.moe.flux_moe is imported (module-level
 # read). Default to the validated serving config; env still overrides.
 os.environ.setdefault("SGLANG_FLUX_MOE_CONTIG_W", "1")
+# Path B must be the torch-tail pipeline (full-row output) regardless of the
+# launcher's env; the gather_rs tail is exercised explicitly as Path C.
+os.environ["SGLANG_FLUX_MOE_TAIL"] = "torch"
 
 import torch
 import torch.distributed as dist
@@ -103,6 +118,7 @@ def main() -> int:
     from sglang.srt.layers.moe import flux_moe
     from sglang.srt.layers.moe.flux_moe import (
         FluxMoeAGScatter,
+        _gather_rs_tail,
         _moe_tail,
         _scatter_metadata,
         flux_moe_compute,
@@ -225,12 +241,28 @@ def main() -> int:
         w2,
     )
 
+    # ---- Path C: slice-2 end-to-end (flux GEMM1 + fused GatherRS tail) -----
+    # The serving gather_rs code path (collective; both ranks construct the
+    # GatherRS op through the same builder). Output: (N_TOKENS/TP, HIDDEN)
+    # scattered REDUCED rows. Raises on failure (strict: no silent fallback
+    # to the torch tail here, unlike serving).
+    grs_out = _gather_rs_tail(
+        op, cap["gate_out"], cap["up_out"], splits_gpu, scatter_index,
+        topk_weights, w2,
+    )
+    # Identical weight shards on both ranks => cross-rank sum = 2x the
+    # single-shard partial (see module docstring).
+    ref_rs32 = (2.0 * ref_out32).chunk(TP, dim=0)[rank]
+    ref_rs16 = (2.0 * ref_out16.float()).to(DTYPE).chunk(TP, dim=0)[rank]
+
     # ---- stage metrics (worst across ranks) ---------------------------------
     m_gate = reduce_worst(metrics(cap["gate_out"], ref_gate32))
     m_up = reduce_worst(metrics(cap["up_out"], ref_up32))
     m_fin32 = reduce_worst(metrics(flux_out, ref_out32))
     m_fin16 = reduce_worst(metrics(flux_out, ref_out16))
     m_tail = reduce_worst(metrics(tail_out, ref_out32))
+    m_grs32 = reduce_worst(metrics(grs_out, ref_rs32))
+    m_grs16 = reduce_worst(metrics(grs_out, ref_rs16))
     fg = metrics(ref_gate16, ref_gate32)
     fu = metrics(ref_up16, ref_up32)
     floor_g1 = reduce_worst(
@@ -241,13 +273,16 @@ def main() -> int:
         )
     )
     floor_fin = reduce_worst(metrics(ref_out16, ref_out32))
+    floor_rs = reduce_worst(metrics(ref_rs16, ref_rs32))
 
     thr_g1 = THRESH_MULT * floor_g1["mean_abs"] + EPS
     thr_fin = THRESH_MULT * floor_fin["mean_abs"] + EPS
+    thr_rs = THRESH_MULT * floor_rs["mean_abs"] + EPS
     g1_mean = max(m_gate["mean_abs"], m_up["mean_abs"])
     oracle_fail = m_oracle["mean_abs"] > 1e-3 or m_oracle["max_abs"] > 1e-2
     exceed_g1 = g1_mean > thr_g1
     exceed_tail = m_tail["mean_abs"] > thr_fin
+    exceed_grs = m_grs32["mean_abs"] > thr_rs
     exceed_fin = m_fin32["mean_abs"] > thr_fin
 
     # ---- ordering hypothesis (only meaningful if GEMM1 is grossly off):
@@ -297,16 +332,20 @@ def main() -> int:
         f"seed={SEED} CONTIG_W={flux_moe._CONTIG_W}"
     )
     p0(f"flux op: {op.ctor_desc}")
+    p0(f"flux gather_rs op: {op._gather_rs.ctor_desc}")
     p0("-" * 100)
     p0(fmt("metadata oracle (sorted-ref vs direct, fp32)", m_oracle))
     p0(fmt("noise floor GEMM1 (bf16 ref vs fp32 ref)", floor_g1))
     p0(fmt("noise floor final (bf16 ref vs fp32 ref)", floor_fin))
+    p0(fmt("noise floor scattered (bf16 rs-ref vs fp32 rs-ref)", floor_rs))
     p0("-" * 100)
     p0(fmt("(i)   flux gate_out vs fp32 ref", m_gate))
     p0(fmt("(ii)  flux up_out   vs fp32 ref", m_up))
     p0(fmt("(iii) flux final    vs fp32 ref", m_fin32))
     p0(fmt("(iv)  flux final    vs bf16 ref (serving mirror)", m_fin16))
     p0(fmt("(v)   serving tail(ref GEMM1) vs fp32 ref", m_tail))
+    p0(fmt("(vi)  gather_rs slice-2 vs fp32 scattered ref", m_grs32))
+    p0(fmt("(vii) gather_rs slice-2 vs bf16 scattered ref", m_grs16))
     p0("-" * 100)
 
     if oracle_fail:
@@ -329,6 +368,14 @@ def main() -> int:
             f"bf16 topk-weight combine and bf16 silu*mul (reference keeps both "
             f"in fp32)."
         )
+    elif exceed_grs:
+        verdict = (
+            f"VERDICT: (b/gather_rs) fused GatherRS tail deviates (GEMM1 and "
+            f"torch tail pass) — mean_abs={m_grs32['mean_abs']:.3e} > 3x "
+            f"scattered bf16 floor ({floor_rs['mean_abs']:.3e}, "
+            f"thr={thr_rs:.3e}); suspects: vec_scale/routing_idx mapping, "
+            f"reduce-scatter layout, GatherRS accumulation."
+        )
     elif exceed_fin:
         verdict = (
             f"VERDICT: (a+b) compounded — GEMM1 and tail each pass 3x floor but "
@@ -337,17 +384,20 @@ def main() -> int:
         )
     else:
         ratio = m_fin32["mean_abs"] / (floor_fin["mean_abs"] + EPS)
+        ratio_rs = m_grs32["mean_abs"] / (floor_rs["mean_abs"] + EPS)
         verdict = (
             f"VERDICT: (c) within 3x bf16 noise floor — genuine mixed-precision "
             f"accumulation difference. flux-vs-fp32 mean_abs="
             f"{m_fin32['mean_abs']:.3e} = {ratio:.2f}x floor "
             f"({floor_fin['mean_abs']:.3e}); flux vs serving-mirror bf16 "
-            f"mean_abs={m_fin16['mean_abs']:.3e}."
+            f"mean_abs={m_fin16['mean_abs']:.3e}; gather_rs slice-2 vs fp32 "
+            f"scattered mean_abs={m_grs32['mean_abs']:.3e} = {ratio_rs:.2f}x "
+            f"scattered floor ({floor_rs['mean_abs']:.3e})."
         )
     p0(verdict)
     p0("=" * 100)
 
-    failed = oracle_fail or exceed_g1 or exceed_tail or exceed_fin
+    failed = oracle_fail or exceed_g1 or exceed_tail or exceed_grs or exceed_fin
     dist.barrier()
     dist.destroy_process_group()
     return 1 if failed else 0

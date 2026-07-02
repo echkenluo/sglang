@@ -344,13 +344,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         final_hidden_states = None
         if _FLUX_MOE and not last_layer:
-            # M3 slice 1: GEMM1 consumes the pre-gather scattered shard via
-            # flux AGScatter (token all-gather fused into the grouped GEMM).
+            # M3: GEMM1 consumes the pre-gather scattered shard via flux
+            # AGScatter (token all-gather fused into the grouped GEMM).
             # NOTE: the gate above still ran on the gathered tokens from
-            # fetch_mlp_latent, so that AG still happens in slice 1; removing
-            # it (all-gather only topk metadata) is a later micro-opt.
-            # Returns (num_tokens, hidden) TP-partial sums with the exact
-            # contract of self.experts' output here, or None to fall back.
+            # fetch_mlp_latent, so that AG still happens; removing it
+            # (all-gather only topk metadata) is a later micro-opt.
+            # Returns (num_tokens, hidden) TP-partial sums (torch tail) or
+            # (num_tokens/tp, hidden) scattered-reduced rows (gather_rs
+            # tail), or None to fall back to the normal experts path.
             final_hidden_states = try_flux_moe_forward(
                 self, hidden_states, topk_output
             )
@@ -377,6 +378,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 final_hidden_states
             )
 
+        if final_hidden_states.shape[0] != num_tokens:
+            # Fused GatherRS MoE tail (SGLANG_FLUX_MOE_TAIL=gather_rs):
+            # already the scattered-reduced rows; the next layer's
+            # prepare_attn detects the row match against the scattered
+            # residual and skips its reduce-scatter.
+            return final_hidden_states
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(

@@ -629,10 +629,21 @@ class LayerCommunicator:
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
-            hidden_states, residual = self._tp_reduce_scatter(
-                hidden_states,
-                residual,
-            )
+            if (
+                residual is not None
+                and hidden_states.shape[0] == residual.shape[0]
+                and hidden_states.shape[0] > 0
+            ):
+                # A fused GatherRS MoE tail already produced the
+                # scattered-reduced shard (rows match the scattered
+                # residual); skip the RS. Mirrors the prepare_mlp skip for
+                # the fused GemmRS o_proj.
+                pass
+            else:
+                hidden_states, residual = self._tp_reduce_scatter(
+                    hidden_states,
+                    residual,
+                )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
