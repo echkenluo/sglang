@@ -33,6 +33,11 @@ Stages reported (max_abs / mean_abs / cosine, worst across ranks):
         gather + fp32 weight scaling + reduce + cross-rank ReduceScatter)
         vs the fp32 reference SCATTERED rows
   (vii) same slice-2 output vs the bf16 reference SCATTERED rows
+  (viii-x) slice-1 batched GEMM2 recovery (torch tail, SGLANG_FLUX_MOE_GEMM2):
+        (viii) grouped GEMM2 (torch._grouped_mm) vs the per-expert loop, GEMM2
+        stage only -- must match to rounding (same FLOPs); (ix)/(x) grouped-
+        and loop-GEMM2 tails vs fp32 ref -- both at the final noise floor.
+        Skipped if torch._grouped_mm is unavailable.
 Both ranks hold IDENTICAL weight shards, so GatherRS's cross-rank reduction
 doubles the single-shard partial: the scattered references are
 (2 * reference).chunk(TP)[rank]. A missing or rank-misordered reduction is
@@ -46,6 +51,7 @@ Verdict: the first stage exceeding 3x the bf16 noise floor, mapped to
   (a) AGScatter GEMM1 + scatter metadata
   (b) the sglang-side torch tail / (b/gather_rs) the fused GatherRS tail
   (c) neither: genuine mixed-precision accumulation difference (quantified)
+  (d) batched grouped GEMM2 diverges from the loop (perf path unsafe)
 Exit code is nonzero iff any stage exceeds its threshold (or the metadata
 oracle fails), so a wrapper can sentinel it. Rank 0 prints; metrics are
 all-reduced so the exit code is rank-consistent.
@@ -144,10 +150,20 @@ def main() -> int:
     from sglang.srt.layers.moe.flux_moe import (
         FluxMoeAGScatter,
         _gather_rs_tail,
+        _gemm2_grouped,
+        _gemm2_loop,
         _moe_tail,
         _scatter_metadata,
         flux_moe_compute,
     )
+
+    def _combine(down, scatter_index, topk_weights_global):
+        # The tail's vectorized unsort + topk-weighted combine (shared by both
+        # GEMM2 backends; mirrors _moe_tail's tail so Path D isolates GEMM2).
+        nt, tk = scatter_index.shape
+        gathered = down[scatter_index.view(-1).long()].view(nt, tk, -1)
+        w = topk_weights_global.to(gathered.dtype).reshape(nt, tk, 1)
+        return (gathered * w).sum(dim=1)
 
     def p0(*args):
         if rank == 0:
@@ -231,7 +247,7 @@ def main() -> int:
                 tw = (tw / tw.sum(-1, keepdim=True)).contiguous()
                 tids = tids.to(torch.int32).contiguous()
             loc = xs.chunk(TP, dim=0)[rank].contiguous()
-            sp, si = _scatter_metadata(tids, N_EXPERTS)
+            sp, si, _ = _scatter_metadata(tids, N_EXPERTS)
             nz = int((sp > 0).sum().item())
             gate_out, up_out = sweep_op._run_gemm1(
                 loc, [w13_s[:, :INTER_SHARD, :], w13_s[:, INTER_SHARD:, :]], sp, si
@@ -290,7 +306,7 @@ def main() -> int:
         tw = (tw / tw.sum(-1, keepdim=True)).contiguous()
         tids = tids.to(torch.int32).contiguous()
         loc = xs.chunk(TP, dim=0)[rank].contiguous()
-        sp, si = _scatter_metadata(tids, N_EXPERTS)
+        sp, si, _ = _scatter_metadata(tids, N_EXPERTS)
         w13_groups = [w13_l[:, :INTER_SHARD, :], w13_l[:, INTER_SHARD:, :]]
         for it in range(probe_layers):
             dist.barrier()
@@ -335,7 +351,7 @@ def main() -> int:
     local = x_full.chunk(TP, dim=0)[rank].contiguous()
 
     # ---- shared expert-sort metadata (the serving function) ----------------
-    splits_gpu, scatter_index = _scatter_metadata(topk_ids, N_EXPERTS)
+    splits_gpu, scatter_index, seg_indptr = _scatter_metadata(topk_ids, N_EXPERTS)
     splits_list = splits_gpu.tolist()
     flat_s2d = scatter_index.view(-1).long()  # (t*topk+k) -> sorted row
     total = flat_s2d.numel()
@@ -430,6 +446,30 @@ def main() -> int:
     ref_rs32 = (2.0 * ref_out32).chunk(TP, dim=0)[rank]
     ref_rs16 = (2.0 * ref_out16.float()).to(DTYPE).chunk(TP, dim=0)[rank]
 
+    # ---- Path D: batched grouped GEMM2 torch tail (slice-1 perf recovery) --
+    # Runs BOTH GEMM2 backends explicitly on the SAME silu*mul activation (fed
+    # the exact fp32 reference GEMM1, like Path B) so the comparison isolates
+    # GEMM2: grouped (torch._grouped_mm, GPU offsets) MUST match the loop to
+    # rounding, and both must sit at the bf16 final noise floor vs fp32. If
+    # torch._grouped_mm is unavailable this path is skipped (reported).
+    act_ref = (F.silu(ref_gate32) * ref_up32).to(DTYPE)
+    have_grouped = hasattr(torch, "_grouped_mm")
+    grouped_err = None
+    if have_grouped:
+        down_loop = _gemm2_loop(act_ref, w2, splits_gpu)
+        try:
+            down_grp = _gemm2_grouped(act_ref, w2, seg_indptr)
+        except Exception as exc:  # noqa: BLE001 -- report a layout rejection
+            # cleanly instead of crashing the whole probe.
+            grouped_err = f"{type(exc).__name__}: {exc}"
+            have_grouped = False
+        else:
+            grp_out = _combine(down_grp, scatter_index, topk_weights)
+            loop_out = _combine(down_loop, scatter_index, topk_weights)
+            m_grp_vs_loop = reduce_worst(metrics(down_grp, down_loop))  # GEMM2
+            m_grp_fin = reduce_worst(metrics(grp_out, ref_out32))
+            m_loop_fin = reduce_worst(metrics(loop_out, ref_out32))
+
     # ---- stage metrics (worst across ranks) ---------------------------------
     m_gate = reduce_worst(metrics(cap["gate_out"], ref_gate32))
     m_up = reduce_worst(metrics(cap["up_out"], ref_up32))
@@ -459,6 +499,14 @@ def main() -> int:
     exceed_tail = m_tail["mean_abs"] > thr_fin
     exceed_grs = m_grs32["mean_abs"] > thr_rs
     exceed_fin = m_fin32["mean_abs"] > thr_fin
+    # Path D thresholds: grouped GEMM2 must equal the loop essentially exactly
+    # (same FLOPs, both bf16 cublas) and sit at the final noise floor vs fp32.
+    exceed_grp = False
+    if have_grouped:
+        exceed_grp = (
+            m_grp_vs_loop["mean_abs"] > thr_fin  # grouped vs loop divergence
+            or m_grp_fin["mean_abs"] > thr_fin  # grouped vs fp32 ref
+        )
 
     # ---- ordering hypothesis (only meaningful if GEMM1 is grossly off):
     # does flux's internal gather use rank-contiguous [shard0;shard1] order
@@ -505,7 +553,9 @@ def main() -> int:
         f"probe config: n={N_TOKENS} hidden={HIDDEN} E={N_EXPERTS} "
         f"inter_shard={INTER_SHARD} topk={TOPK} tp={TP} dtype={DTYPE} "
         f"seed={SEED} CONTIG_W={flux_moe._CONTIG_W} "
-        f"gather_rs_min_tokens={flux_moe._GATHER_RS_MIN_TOKENS}"
+        f"gather_rs_min_tokens={flux_moe._GATHER_RS_MIN_TOKENS} "
+        f"gemm2_mode={flux_moe._GEMM2_MODE} "
+        f"has_grouped_mm={flux_moe._HAS_GROUPED_MM}"
     )
     p0(f"flux op: {op.ctor_desc}")
     p0(f"flux gather_rs op: {op._gather_rs.ctor_desc}")
@@ -522,6 +572,14 @@ def main() -> int:
     p0(fmt("(v)   serving tail(ref GEMM1) vs fp32 ref", m_tail))
     p0(fmt("(vi)  gather_rs slice-2 vs fp32 scattered ref", m_grs32))
     p0(fmt("(vii) gather_rs slice-2 vs bf16 scattered ref", m_grs16))
+    if have_grouped:
+        p0(fmt("(viii) grouped GEMM2 vs loop GEMM2 (GEMM2 only)", m_grp_vs_loop))
+        p0(fmt("(ix)  grouped-GEMM2 tail vs fp32 ref", m_grp_fin))
+        p0(fmt("(x)   loop-GEMM2 tail   vs fp32 ref", m_loop_fin))
+    else:
+        why = grouped_err or "torch._grouped_mm unavailable"
+        p0(f"(viii-x) grouped GEMM2: SKIPPED ({why}) -- serving auto mode "
+           "would use the loop backend")
     p0("-" * 100)
 
     if oracle_fail:
@@ -558,9 +616,24 @@ def main() -> int:
             f"end-to-end exceeds it (mean_abs={m_fin32['mean_abs']:.3e} > "
             f"thr={thr_fin:.3e})."
         )
+    elif exceed_grp:
+        verdict = (
+            f"VERDICT: (d) batched grouped GEMM2 DIVERGES — grouped-vs-loop "
+            f"mean_abs={m_grp_vs_loop['mean_abs']:.3e}, grouped-vs-fp32="
+            f"{m_grp_fin['mean_abs']:.3e} (thr={thr_fin:.3e}); "
+            f"torch._grouped_mm offsets/layout wrong. Serving must use "
+            f"SGLANG_FLUX_MOE_GEMM2=loop until fixed."
+        )
     else:
         ratio = m_fin32["mean_abs"] / (floor_fin["mean_abs"] + EPS)
         ratio_rs = m_grs32["mean_abs"] / (floor_rs["mean_abs"] + EPS)
+        grp_note = ""
+        if have_grouped:
+            grp_note = (
+                f"; grouped GEMM2 == loop (mean_abs={m_grp_vs_loop['mean_abs']:.3e}"
+                f", grouped-vs-fp32={m_grp_fin['mean_abs']:.3e} vs loop "
+                f"{m_loop_fin['mean_abs']:.3e}) -- perf path numerically safe"
+            )
         verdict = (
             f"VERDICT: (c) within 3x bf16 noise floor — genuine mixed-precision "
             f"accumulation difference. flux-vs-fp32 mean_abs="
@@ -568,12 +641,19 @@ def main() -> int:
             f"({floor_fin['mean_abs']:.3e}); flux vs serving-mirror bf16 "
             f"mean_abs={m_fin16['mean_abs']:.3e}; gather_rs slice-2 vs fp32 "
             f"scattered mean_abs={m_grs32['mean_abs']:.3e} = {ratio_rs:.2f}x "
-            f"scattered floor ({floor_rs['mean_abs']:.3e})."
+            f"scattered floor ({floor_rs['mean_abs']:.3e})" + grp_note + "."
         )
     p0(verdict)
     p0("=" * 100)
 
-    failed = oracle_fail or exceed_g1 or exceed_tail or exceed_grs or exceed_fin
+    failed = (
+        oracle_fail
+        or exceed_g1
+        or exceed_tail
+        or exceed_grs
+        or exceed_fin
+        or exceed_grp
+    )
     dist.barrier()
     dist.destroy_process_group()
     return 1 if failed else 0

@@ -25,14 +25,20 @@ falling back to the torch tail below that. The threshold is compared against
 the gathered global count, identical on all ranks, so the choice is
 rank-uniform and never desyncs the collective.
 
-Known remaining costs (documented, addressed later):
+torch-tail GEMM2 backend (SGLANG_FLUX_MOE_GEMM2, default auto): the GEMM2
+stage runs as a SINGLE batched ``torch._grouped_mm`` over the expert-sorted
+rows (GPU per-group offsets from seg_indptr, no D2H sync) when available,
+else the original python per-expert ``torch.mm`` loop. This recovers the
+slice-1 throughput regression, which was the loop's per-expert kernel
+launches + the ``splits.tolist()`` sync -- NOT GEMM2 FLOPs -- so numerics are
+identical to the loop and the reduction path (sglang reduce-scatter of the
+(ntokens, hidden) TP-partial sums) is unchanged.
+
+Known remaining cost:
 - The router gate still runs on the gathered tokens from ``fetch_mlp_latent``,
   so that all-gather still happens. The big win here is fusing the
   GEMM1-feeding gather; removing the gate-AG (all-gather only topk metadata)
   is a later micro-opt.
-- The torch tail's GEMM2 is a python loop of per-expert ``torch.mm`` over the
-  expert-sorted segments, including one GPU->CPU sync for the segment sizes
-  (both gone under gather_rs).
 
 NOTE (first GPU validation will resolve): flux's MoeArguments/DistEnvTPWithEP
 ffn sharding semantics cannot be verified without a GPU run. Both
@@ -87,6 +93,22 @@ _MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 #   isolation (probe Path C: 0.87x noise floor) but deadlocks the 48-layer
 #   serving interleave. Do NOT enable in production.
 _TAIL_MODE = os.environ.get("SGLANG_FLUX_MOE_TAIL", "torch")
+# torch-tail GEMM2 backend selector (only relevant when the torch tail runs):
+# - "auto" (default): try torch._grouped_mm (single batched grouped GEMM over
+#   the expert-sorted rows, GPU offsets, no D2H sync) and fall back to the
+#   python per-expert loop if unavailable/unsupported.
+# - "grouped": force torch._grouped_mm (errors surface instead of falling
+#   back -- for A/B isolation).
+# - "loop": force today's python per-expert torch.mm loop (the proven
+#   slice-1 baseline, incl. its splits.tolist() sync).
+# There is no in-tree bf16 grouped-GEMM entry to use as a middle rung: the
+# fused_moe triton kernel uses a block-padded moe_align_block_size layout (not
+# our seg_indptr), and cutlass/deep_gemm grouped paths are fp8-only. So the
+# ladder is torch._grouped_mm -> loop. The GEMM2 FLOPs and numerics are
+# identical either way; only the launch/sync overhead differs.
+_GEMM2_MODE = os.environ.get("SGLANG_FLUX_MOE_GEMM2", "auto")
+_HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
+_GEMM2_GROUPED_UNAVAIL_LOGGED = False
 # Minimum GLOBAL token count to engage the gather_rs tail; below it, fall back
 # to the (correct, slower) torch tail. flux GatherRS runs an UNCONDITIONAL
 # cross-rank GroupBarrier + nvshmem ring reduce-scatter inside every
@@ -223,7 +245,7 @@ def _make_moe_args(flux_mod, max_ntokens, hidden, ffn_hidden, nexperts, topk, dt
 
 def _scatter_metadata(
     topk_ids: torch.Tensor, num_experts: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expert-sort metadata in flux's format.
 
     Reuses sglang's existing MoE preprocess (stable sort by expert id).
@@ -232,13 +254,19 @@ def _scatter_metadata(
     on this path emits only valid expert ids (no -1 entries to drop):
     - src2dst reshaped (ntokens, topk), int32  == flux scatter_index
     - diff(seg_indptr), int32                  == flux splits (GLOBAL counts)
+
+    Returns (splits_gpu, scatter_index, seg_indptr). ``seg_indptr`` is the
+    (num_experts+1,) int64 cumulative row-offset vector on GPU
+    (seg_indptr[0]==0, seg_indptr[-1]==total_rows); the grouped GEMM2 path
+    feeds seg_indptr[1:] directly as its per-group offsets, so no D2H sync of
+    the splits is needed for GEMM2.
     """
     from sglang.srt.layers.moe.ep_moe.kernels import deepep_run_moe_deep_preprocess
 
     _, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(topk_ids, num_experts)
     splits_gpu = torch.diff(seg_indptr).to(torch.int32)
     scatter_index = src2dst.view(topk_ids.shape).to(torch.int32)
-    return splits_gpu, scatter_index
+    return splits_gpu, scatter_index, seg_indptr
 
 
 class FluxMoeAGScatter:
@@ -333,34 +361,35 @@ class FluxMoeAGScatter:
         )
 
 
-def _moe_tail(
-    gate_out: torch.Tensor,
-    up_out: torch.Tensor,
-    splits_gpu: torch.Tensor,
-    scatter_index: torch.Tensor,
-    topk_weights_global: torch.Tensor,
-    w2_weight: torch.Tensor,
+def _gemm2_grouped(
+    act: torch.Tensor, w2_weight: torch.Tensor, seg_indptr: torch.Tensor
 ) -> torch.Tensor:
-    """Post-GEMM1 tail: silu*mul -> per-expert GEMM2 -> unsort + weighted sum.
+    """Single batched grouped GEMM2 over expert-sorted rows via
+    ``torch._grouped_mm``: down[s:e] = act[s:e] @ w2[e].T for each expert
+    segment [s,e) given by seg_indptr, in one kernel launch, NO D2H sync.
 
-    Pure function of tensors so the numeric probe can feed it reference GEMM1
-    outputs; the serving path goes through here too (via flux_moe_compute).
+    torch._grouped_mm(a (M,K) bf16, b (E,K,N) bf16, offs (E,) int32) computes
+    grouped matmul where offs are the CUMULATIVE END row-offsets per group
+    (offs[-1] == M). w2_weight is (E, hidden, inter_shard); we need act @ w2.T
+    per expert (contract inter_shard, produce hidden), so pass
+    w2.transpose(-1,-2) -> (E, inter_shard, hidden) as b, giving out (M, hidden).
+    seg_indptr[1:] is exactly those end offsets, already on GPU.
     """
-    ntokens, topk = scatter_index.shape
-    total_rows = scatter_index.numel()
-    assert gate_out.shape[0] == total_rows and up_out.shape[0] == total_rows
+    # torch._grouped_mm wants contiguous int32 offsets; seg_indptr is int64.
+    offs = seg_indptr[1:].to(torch.int32)
+    b = w2_weight.transpose(-1, -2)  # (E, inter_shard, hidden), a view
+    return torch._grouped_mm(act, b, offs=offs)
 
-    # sglang's SiluAndMul expects a concatenated tensor; flux returns the
-    # groups separately, so apply silu*mul directly.
-    act = F.silu(gate_out) * up_out
 
-    # GEMM2: plain matmul per expert segment of the expert-sorted rows
-    # (seg boundaries = splits cumsum). Unfused on purpose in slice 1;
-    # GatherRS takes over in slice 2. The .tolist() is a GPU->CPU sync.
+def _gemm2_loop(
+    act: torch.Tensor, w2_weight: torch.Tensor, splits_gpu: torch.Tensor
+) -> torch.Tensor:
+    """Baseline per-expert GEMM2 loop (proven slice-1 numerics). The
+    splits_gpu.tolist() is a GPU->CPU sync and each expert is a separate
+    torch.mm launch -- this is the -36% overhead the grouped path removes."""
+    total_rows = act.shape[0]
     down = torch.empty(
-        (total_rows, w2_weight.shape[1]),
-        dtype=act.dtype,
-        device=act.device,
+        (total_rows, w2_weight.shape[1]), dtype=act.dtype, device=act.device
     )
     start = 0
     for expert_id, count in enumerate(splits_gpu.tolist()):
@@ -369,10 +398,83 @@ def _moe_tail(
         end = start + count
         torch.mm(act[start:end], w2_weight[expert_id].t(), out=down[start:end])
         start = end
+    return down
+
+
+def _moe_tail(
+    gate_out: torch.Tensor,
+    up_out: torch.Tensor,
+    splits_gpu: torch.Tensor,
+    scatter_index: torch.Tensor,
+    topk_weights_global: torch.Tensor,
+    w2_weight: torch.Tensor,
+    seg_indptr: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Post-GEMM1 tail: silu*mul -> GEMM2 -> unsort + weighted sum.
+
+    Pure function of tensors so the numeric probe can feed it reference GEMM1
+    outputs; the serving path goes through here too (via flux_moe_compute).
+    GEMM2 backend chosen by SGLANG_FLUX_MOE_GEMM2 (auto/grouped/loop). Numerics
+    and FLOPs are backend-independent (same per-expert matmuls); only the
+    kernel-launch and D2H-sync overhead differs. ``seg_indptr`` (GPU cumulative
+    offsets) is required for the grouped backend; when absent, the grouped path
+    degrades to the loop.
+    """
+    global _GEMM2_GROUPED_UNAVAIL_LOGGED
+    ntokens, topk = scatter_index.shape
+    total_rows = scatter_index.numel()
+    assert gate_out.shape[0] == total_rows and up_out.shape[0] == total_rows
+
+    # sglang's SiluAndMul expects a concatenated tensor; flux returns the
+    # groups separately, so apply silu*mul directly.
+    act = F.silu(gate_out) * up_out
+
+    # GEMM2 over the expert-sorted rows (seg boundaries = splits cumsum).
+    want_grouped = _GEMM2_MODE in ("auto", "grouped")
+    can_grouped = _HAS_GROUPED_MM and seg_indptr is not None
+    if _GEMM2_MODE == "grouped" and not can_grouped:
+        raise RuntimeError(
+            "SGLANG_FLUX_MOE_GEMM2=grouped but torch._grouped_mm "
+            f"{'unavailable' if not _HAS_GROUPED_MM else 'missing seg_indptr'}"
+        )
+    down = None
+    if want_grouped and can_grouped:
+        try:
+            down = _gemm2_grouped(act, w2_weight, seg_indptr)
+        except Exception as exc:  # noqa: BLE001
+            if _GEMM2_MODE == "grouped":
+                # Strict A/B mode: surface the failure, don't mask it.
+                raise
+            # auto mode: torch._grouped_mm may reject the transposed-weight
+            # layout on this build; fall back to the loop (rank-uniform: the
+            # failure is shape/dtype-driven, identical on all ranks). No
+            # collective in this path, so a fallback is always safe.
+            if not _GEMM2_GROUPED_UNAVAIL_LOGGED:
+                _GEMM2_GROUPED_UNAVAIL_LOGGED = True
+                logger.info(
+                    "[FLUX-MOE] GEMM2 grouped (torch._grouped_mm) failed (%s); "
+                    "falling back to the per-expert loop.",
+                    exc,
+                )
+    if down is None:
+        if (
+            want_grouped
+            and not can_grouped
+            and not _GEMM2_GROUPED_UNAVAIL_LOGGED
+        ):
+            _GEMM2_GROUPED_UNAVAIL_LOGGED = True
+            logger.info(
+                "[FLUX-MOE] GEMM2 grouped unavailable (torch._grouped_mm=%s, "
+                "seg_indptr=%s); using the per-expert loop.",
+                _HAS_GROUPED_MM,
+                seg_indptr is not None,
+            )
+        down = _gemm2_loop(act, w2_weight, splits_gpu)
 
     # Unsort back to token order and apply the routing weights: for token
-    # t, out[t] = sum_k w[t,k] * down[scatter_index[t,k]]. bf16 accumulate
-    # over topk matches the existing post_reorder kernel's numerics.
+    # t, out[t] = sum_k w[t,k] * down[scatter_index[t,k]]. Vectorized gather +
+    # weighted sum (no per-expert sync). bf16 accumulate over topk matches the
+    # existing post_reorder kernel's numerics.
     gathered = down[scatter_index.view(-1).long()].view(ntokens, topk, -1)
     weights = topk_weights_global.to(gathered.dtype).reshape(ntokens, topk, 1)
     return (gathered * weights).sum(dim=1)
@@ -611,7 +713,9 @@ def flux_moe_compute(
             _GATHER_RS_MIN_TOKENS,
         )
 
-    splits_gpu, scatter_index = _scatter_metadata(topk_ids_global, num_experts)
+    splits_gpu, scatter_index, seg_indptr = _scatter_metadata(
+        topk_ids_global, num_experts
+    )
 
     # w13 stacks [gate; up] along dim 1; dim-1 slices are non-contiguous
     # views (per-expert 2D blocks are contiguous). See module NOTE.
@@ -641,6 +745,7 @@ def flux_moe_compute(
             up_out=up_out,
             splits_gpu=splits_gpu,
             scatter_index=scatter_index,
+            seg_indptr=seg_indptr,
         )
 
     if use_gather_rs:
@@ -679,7 +784,13 @@ def flux_moe_compute(
             return out
 
     return _moe_tail(
-        gate_out, up_out, splits_gpu, scatter_index, topk_weights_global, w2_weight
+        gate_out,
+        up_out,
+        splits_gpu,
+        scatter_index,
+        topk_weights_global,
+        w2_weight,
+        seg_indptr=seg_indptr,
     )
 
 
@@ -793,12 +904,22 @@ def try_flux_moe_forward(
     global _ENGAGED_LOGGED
     if not _ENGAGED_LOGGED:
         _ENGAGED_LOGGED = True
+        gemm2 = (
+            "grouped"
+            if _TAIL_MODE == "torch"
+            and _GEMM2_MODE in ("auto", "grouped")
+            and _HAS_GROUPED_MM
+            else _GEMM2_MODE if _TAIL_MODE == "torch" else "n/a(gather_rs)"
+        )
         logger.info(
-            "[FLUX-MOE] engaged: layer=%s tokens=%d experts=%d topk=%d %s",
+            "[FLUX-MOE] engaged: layer=%s tokens=%d experts=%d topk=%d "
+            "tail=%s gemm2=%s %s",
             getattr(moe_block, "layer_id", "?"),
             hidden_states.shape[0],
             w13_weight.shape[0],
             topk_ids.shape[1],
+            _TAIL_MODE,
+            gemm2,
             op.ctor_desc,
         )
     return out
