@@ -54,6 +54,7 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.flux_moe import try_flux_moe_forward
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -108,6 +109,9 @@ logger = logging.getLogger(__name__)
 
 # Flux fused AG-GEMM/GemmRS on the attention projections (MoE FFN untouched).
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+# Flux fused AG + grouped GEMM1 on the MoE FFN (M3 slice 1; scattered flow,
+# TP-only, bf16). Orthogonal to _FLUX_FUSE. See layers/moe/flux_moe.py.
+_FLUX_MOE = os.environ.get("SGLANG_FLUX_MOE", "0") == "1"
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -337,7 +341,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        final_hidden_states = None
+        if _FLUX_MOE and not last_layer:
+            # M3 slice 1: GEMM1 consumes the pre-gather scattered shard via
+            # flux AGScatter (token all-gather fused into the grouped GEMM).
+            # NOTE: the gate above still ran on the gathered tokens from
+            # fetch_mlp_latent, so that AG still happens in slice 1; removing
+            # it (all-gather only topk metadata) is a later micro-opt.
+            # Returns (num_tokens, hidden) TP-partial sums with the exact
+            # contract of self.experts' output here, or None to fall back.
+            final_hidden_states = try_flux_moe_forward(
+                self, hidden_states, topk_output
+            )
+        if final_hidden_states is None:
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         # Under the input-scattered (RS+AG) path, the next layer's
         # reduce-scatter over the attn-tp group already reduces the EP
