@@ -197,66 +197,120 @@ class FluxMoeAGScatter:
         w13_weight: torch.Tensor,
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """AGScatter GEMM1 -> silu*mul -> per-expert GEMM2 -> unsort+combine.
-
-        Returns (ntokens_global, hidden) TP-partial sums, token order matching
-        the gathered order used for routing (flux's internal all-gather and
-        sglang's fetch AG both concatenate rank shards in rank order).
-        """
-        ntokens, topk = topk_ids_global.shape
-        num_experts = w13_weight.shape[0]
-        inter_shard = w13_weight.shape[1] // 2
-
-        splits_gpu, scatter_index = _scatter_metadata(topk_ids_global, num_experts)
-
-        # w13 stacks [gate; up] along dim 1; dim-1 slices are non-contiguous
-        # views (per-expert 2D blocks are contiguous). See module NOTE.
-        gate_w = w13_weight[:, :inter_shard, :]
-        up_w = w13_weight[:, inter_shard:, :]
-        if _CONTIG_W:
-            gate_w = gate_w.contiguous()
-            up_w = up_w.contiguous()
-
-        gate_out, up_out = self._run_gemm1(
-            hidden_shard, [gate_w, up_w], splits_gpu, scatter_index
+        return flux_moe_compute(
+            self,
+            hidden_shard,
+            topk_ids_global,
+            topk_weights_global,
+            w13_weight,
+            w2_weight,
         )
-        total_rows = scatter_index.numel()
-        if gate_out.shape[0] != total_rows:
-            if gate_out.shape[0] > total_rows:
-                # flux may hand back max-ntokens-sized buffers.
-                gate_out = gate_out[:total_rows]
-                up_out = up_out[:total_rows]
-            else:
-                raise RuntimeError(
-                    f"GEMM1 rows {gate_out.shape[0]} < expected {total_rows}"
-                )
 
-        # sglang's SiluAndMul expects a concatenated tensor; flux returns the
-        # groups separately, so apply silu*mul directly.
-        act = F.silu(gate_out) * up_out
 
-        # GEMM2: plain matmul per expert segment of the expert-sorted rows
-        # (seg boundaries = splits cumsum). Unfused on purpose in slice 1;
-        # GatherRS takes over in slice 2. The .tolist() is a GPU->CPU sync.
-        down = torch.empty(
-            (total_rows, w2_weight.shape[1]),
-            dtype=act.dtype,
-            device=act.device,
+def _moe_tail(
+    gate_out: torch.Tensor,
+    up_out: torch.Tensor,
+    splits_gpu: torch.Tensor,
+    scatter_index: torch.Tensor,
+    topk_weights_global: torch.Tensor,
+    w2_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Post-GEMM1 tail: silu*mul -> per-expert GEMM2 -> unsort + weighted sum.
+
+    Pure function of tensors so the numeric probe can feed it reference GEMM1
+    outputs; the serving path goes through here too (via flux_moe_compute).
+    """
+    ntokens, topk = scatter_index.shape
+    total_rows = scatter_index.numel()
+    assert gate_out.shape[0] == total_rows and up_out.shape[0] == total_rows
+
+    # sglang's SiluAndMul expects a concatenated tensor; flux returns the
+    # groups separately, so apply silu*mul directly.
+    act = F.silu(gate_out) * up_out
+
+    # GEMM2: plain matmul per expert segment of the expert-sorted rows
+    # (seg boundaries = splits cumsum). Unfused on purpose in slice 1;
+    # GatherRS takes over in slice 2. The .tolist() is a GPU->CPU sync.
+    down = torch.empty(
+        (total_rows, w2_weight.shape[1]),
+        dtype=act.dtype,
+        device=act.device,
+    )
+    start = 0
+    for expert_id, count in enumerate(splits_gpu.tolist()):
+        if count == 0:
+            continue
+        end = start + count
+        torch.mm(act[start:end], w2_weight[expert_id].t(), out=down[start:end])
+        start = end
+
+    # Unsort back to token order and apply the routing weights: for token
+    # t, out[t] = sum_k w[t,k] * down[scatter_index[t,k]]. bf16 accumulate
+    # over topk matches the existing post_reorder kernel's numerics.
+    gathered = down[scatter_index.view(-1).long()].view(ntokens, topk, -1)
+    weights = topk_weights_global.to(gathered.dtype).reshape(ntokens, topk, 1)
+    return (gathered * weights).sum(dim=1)
+
+
+def flux_moe_compute(
+    op: "FluxMoeAGScatter",
+    hidden_shard: torch.Tensor,
+    topk_ids_global: torch.Tensor,
+    topk_weights_global: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    capture: Optional[dict] = None,
+) -> torch.Tensor:
+    """AGScatter GEMM1 -> silu*mul -> per-expert GEMM2 -> unsort+combine.
+
+    Single compute path shared by serving (FluxMoeAGScatter.forward via
+    try_flux_moe_forward) and the numeric probe
+    (scripts/probe_flux_moe_numerics.py). Returns (ntokens_global, hidden)
+    TP-partial sums, token order matching the gathered order used for routing
+    (flux's internal all-gather and sglang's fetch AG both concatenate rank
+    shards in rank order).
+
+    ``capture``, when given, receives the expert-sorted intermediates:
+    gate_out, up_out (post row-slice), splits_gpu, scatter_index.
+    """
+    num_experts = w13_weight.shape[0]
+    inter_shard = w13_weight.shape[1] // 2
+
+    splits_gpu, scatter_index = _scatter_metadata(topk_ids_global, num_experts)
+
+    # w13 stacks [gate; up] along dim 1; dim-1 slices are non-contiguous
+    # views (per-expert 2D blocks are contiguous). See module NOTE.
+    gate_w = w13_weight[:, :inter_shard, :]
+    up_w = w13_weight[:, inter_shard:, :]
+    if _CONTIG_W:
+        gate_w = gate_w.contiguous()
+        up_w = up_w.contiguous()
+
+    gate_out, up_out = op._run_gemm1(
+        hidden_shard, [gate_w, up_w], splits_gpu, scatter_index
+    )
+    total_rows = scatter_index.numel()
+    if gate_out.shape[0] != total_rows:
+        if gate_out.shape[0] > total_rows:
+            # flux may hand back max-ntokens-sized buffers.
+            gate_out = gate_out[:total_rows]
+            up_out = up_out[:total_rows]
+        else:
+            raise RuntimeError(
+                f"GEMM1 rows {gate_out.shape[0]} < expected {total_rows}"
+            )
+
+    if capture is not None:
+        capture.update(
+            gate_out=gate_out,
+            up_out=up_out,
+            splits_gpu=splits_gpu,
+            scatter_index=scatter_index,
         )
-        start = 0
-        for expert_id, count in enumerate(splits_gpu.tolist()):
-            if count == 0:
-                continue
-            end = start + count
-            torch.mm(act[start:end], w2_weight[expert_id].t(), out=down[start:end])
-            start = end
 
-        # Unsort back to token order and apply the routing weights: for token
-        # t, out[t] = sum_k w[t,k] * down[scatter_index[t,k]]. bf16 accumulate
-        # over topk matches the existing post_reorder kernel's numerics.
-        gathered = down[scatter_index.view(-1).long()].view(ntokens, topk, -1)
-        weights = topk_weights_global.to(gathered.dtype).reshape(ntokens, topk, 1)
-        return (gathered * weights).sum(dim=1)
+    return _moe_tail(
+        gate_out, up_out, splits_gpu, scatter_index, topk_weights_global, w2_weight
+    )
 
 
 # One op per shape shared by ALL layers: the flux op holds nvshmem workspace
