@@ -94,6 +94,26 @@ _CONTIG_W = os.environ.get("SGLANG_FLUX_MOE_CONTIG_W", "0") == "1"
 # back to per-forward slicing (with CONTIG_W honored) for A/B.
 _LOAD_REPACK = os.environ.get("SGLANG_FLUX_MOE_LOAD_REPACK", "1") == "1"
 _REPACK_LOGGED = False
+# Free the original packed w13_weight storage AFTER the repack, reclaiming its
+# ~9.2GB/GPU so the repack path fits on TP2 (30B-A3B weights + retained w13 +
+# repacked gate/up OOMs a 46GB L20). DANGEROUS: with w13 freed the torch-
+# experts fallback (self.experts on w13) would read empty storage -> silent
+# garbage, so this HARD-DISABLES that fallback -- try_flux_moe_forward raises
+# instead of ever returning None once w13 is freed. Default OFF; only takes
+# effect with SGLANG_FLUX_MOE=1 AND _LOAD_REPACK on. Freed only after the
+# FIRST successful flux forward (so w13 is intact through the first gate and
+# the cached gate/up are proven usable); later forwards validate shape from
+# cached metadata, never from the freed tensor.
+#
+# CRITICAL CONSTRAINT -- PREFILL-ONLY: the flux MoE path engages ONLY on
+# extend/prefill batches (input_scattered is False for DECODE). A decode batch
+# needs self.experts, which is exactly what freeing breaks -- so the guard will
+# RAISE on the first decode step. Use FREE_W13=1 ONLY for a prefill-dominated
+# throughput measurement (e.g. max-new-tokens ~= 1, or a pure prefill bench);
+# it is NOT safe for normal generation. This is a measurement-enablement lever,
+# never a production setting.
+_FREE_W13 = os.environ.get("SGLANG_FLUX_MOE_FREE_W13", "0") == "1"
+_FREE_W13_LOGGED = False
 # Mirrors MAX_M used by the attention-side AGCook/GemmRS glue in unquant.py.
 _MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 # M3 slice 2: tail implementation selector.
@@ -207,6 +227,16 @@ if _TAIL_MODE == "gather_rs":
         "in isolation but deadlocks the 48-layer collective interleave. "
         "Production must use SGLANG_FLUX_MOE_TAIL=torch. Proceeding only "
         "because it was explicitly requested (repro/debug)."
+    )
+
+if _FREE_W13:
+    logger.warning(
+        "[FLUX-MOE] SGLANG_FLUX_MOE_FREE_W13=1: original w13 storage will be "
+        "freed after the first flux forward to reclaim memory. This is a "
+        "PREFILL-ONLY measurement lever -- the flux path engages on prefill "
+        "only, so a DECODE batch will RAISE (torch-experts fallback would read "
+        "freed weights). NOT a production setting; use only for a "
+        "prefill-dominated throughput A/B."
     )
 
 _ENGAGED_LOGGED = False
@@ -703,8 +733,14 @@ def flux_moe_compute(
     global _GATHER_RS_DISABLED, _GATHER_RS_ENGAGED_LOGGED
     global _GATHER_RS_SKIP_SMALL_LOGGED
 
-    num_experts = w13_weight.shape[0]
-    inter_shard = w13_weight.shape[1] // 2
+    # In freed-mode w13_weight is empty; take shapes from the prebuilt gate
+    # group (gate_w is (E, inter_shard, hidden)) so nothing reads freed storage.
+    if gate_up is not None:
+        num_experts = gate_up[0].shape[0]
+        inter_shard = gate_up[0].shape[1]
+    else:
+        num_experts = w13_weight.shape[0]
+        inter_shard = w13_weight.shape[1] // 2
     # Rank-uniform tail choice: topk_ids_global is the gathered routing (same
     # global token count on every rank), so this comparison never desyncs the
     # gather_rs collective. Decided BEFORE the _scatter_metadata .item() sync
@@ -822,29 +858,39 @@ _OP_CACHE: dict = {}
 
 
 def _get_or_build_op(moe_block, w13_weight, topk, hidden):
-    inter_shard = w13_weight.shape[1] // 2
-    key = (
-        w13_weight.shape[0],
-        topk,
-        hidden,
-        inter_shard,
-        w13_weight.dtype,
-        _FFN_MODE,
-    )
-    op = _OP_CACHE.get(key)
-    if op is not None:
+    # In freed-mode w13_weight is an empty tensor: reuse the op cached on the
+    # block (built on the first, pre-free forward) instead of reading w13
+    # shapes. The op is also cached on the block so this never dereferences a
+    # freed tensor.
+    if getattr(moe_block, "_flux_w13_freed", False):
+        op = getattr(moe_block, "_flux_op", None)
+        if op is None:
+            raise RuntimeError(
+                "[FLUX-MOE] op cache miss after w13 freed on layer "
+                f"{getattr(moe_block, 'layer_id', '?')}. Rerun without "
+                "SGLANG_FLUX_MOE_FREE_W13."
+            )
         return op
-    op = FluxMoeAGScatter(
-        tp_group=get_tp_group().device_group,
-        tp_size=get_tensor_model_parallel_world_size(),
-        num_experts=w13_weight.shape[0],
-        topk=topk,
-        hidden=hidden,
-        inter_shard=inter_shard,
-        dtype=w13_weight.dtype,
-        ffn_mode=_FFN_MODE,
-    )
-    _OP_CACHE[key] = op
+    inter_shard = w13_weight.shape[1] // 2
+    num_experts = w13_weight.shape[0]
+    dtype = w13_weight.dtype
+    key = (num_experts, topk, hidden, inter_shard, dtype, _FFN_MODE)
+    op = _OP_CACHE.get(key)
+    if op is None:
+        op = FluxMoeAGScatter(
+            tp_group=get_tp_group().device_group,
+            tp_size=get_tensor_model_parallel_world_size(),
+            num_experts=num_experts,
+            topk=topk,
+            hidden=hidden,
+            inter_shard=inter_shard,
+            dtype=dtype,
+            ffn_mode=_FFN_MODE,
+        )
+        _OP_CACHE[key] = op
+    # Stash on the block so freed-mode (and the free step) can reuse it without
+    # touching w13.
+    moe_block._flux_op = op
     return op
 
 
@@ -861,11 +907,20 @@ def _get_prebuilt_gate_up(moe_block, w13_weight):
     every rank hits it on the same forward with identical shapes.
     """
     global _REPACK_LOGGED
-    inter_shard = w13_weight.shape[1] // 2
     cached = getattr(moe_block, "_flux_gate_up", None)
     # Rebuild if absent or if the underlying weight tensor changed identity.
     if cached is not None and cached[0] is w13_weight:
         return cached[1], cached[2]
+    # Never (re)slice a freed w13 into a (0,...) garbage tensor: if w13 was
+    # freed the cache MUST still be valid (its key is the empty param), so a
+    # miss here means an unexpected identity change post-free.
+    if getattr(moe_block, "_flux_w13_freed", False):
+        raise RuntimeError(
+            "[FLUX-MOE] gate/up cache miss after w13 freed on layer "
+            f"{getattr(moe_block, 'layer_id', '?')} (weight identity changed "
+            "under a freed block). Rerun without SGLANG_FLUX_MOE_FREE_W13."
+        )
+    inter_shard = w13_weight.shape[1] // 2
     gate_w = w13_weight[:, :inter_shard, :].contiguous()
     up_w = w13_weight[:, inter_shard:, :].contiguous()
     moe_block._flux_gate_up = (w13_weight, gate_w, up_w)
@@ -885,6 +940,68 @@ def _get_prebuilt_gate_up(moe_block, w13_weight):
     return gate_w, up_w
 
 
+def _maybe_free_w13(moe_block, w13_weight, gate_w, up_w):
+    """After a SUCCESSFUL flux forward, drop the original packed w13 storage to
+    reclaim its memory (the repacked gate/up now hold the same data).
+
+    Only fires with SGLANG_FLUX_MOE_FREE_W13=1 (and _LOAD_REPACK). Sets
+    ``_flux_w13_freed`` so the gate switches to freed-mode (which raises
+    instead of ever returning None -> self.experts on freed storage). Caches
+    the validated shape metadata so subsequent batches validate WITHOUT
+    touching the freed tensor. Idempotent."""
+    global _FREE_W13_LOGGED
+    if getattr(moe_block, "_flux_w13_freed", False):
+        return
+    param = getattr(moe_block.experts, "w13_weight", None)
+    if param is None or param is not w13_weight:
+        return  # identity changed under us; leave it alone
+    # Invariant that makes this safe: gate_w/up_w were built with .contiguous()
+    # on non-contiguous dim-1 slices, which ALWAYS allocates fresh storage --
+    # they do NOT alias w13, so freeing w13 cannot corrupt them.
+    freed_mib = w13_weight.numel() * w13_weight.element_size() / (1024**2)
+    # Cache shape/dtype BEFORE freeing so freed-mode validation never reads it.
+    moe_block._flux_shape_meta = dict(
+        num_experts=w13_weight.shape[0],
+        inter_shard=w13_weight.shape[1] // 2,
+        hidden=w13_weight.shape[2],
+        dtype=w13_weight.dtype,
+    )
+    # Replace the large allocation with an empty tensor (frees the storage on
+    # the next CUDA-caching-allocator pass). Keep dtype/device so any stray
+    # metadata read stays type-consistent.
+    param.data = torch.empty(0, dtype=w13_weight.dtype, device=w13_weight.device)
+    moe_block._flux_w13_freed = True
+    # The repacked groups now alias no part of w13; refresh the cache entry so
+    # its identity key is the new empty param (rebuild guard stays coherent).
+    moe_block._flux_gate_up = (param, gate_w, up_w)
+    if not _FREE_W13_LOGGED:
+        _FREE_W13_LOGGED = True
+        logger.info(
+            "[FLUX-MOE] freed original w13 storage (+%.1f MiB/layer reclaimed); "
+            "torch-experts fallback DISABLED for this block (flux path now "
+            "mandatory -- any disable raises instead of running self.experts "
+            "on freed weights).",
+            freed_mib,
+        )
+
+
+def _flux_freed_guard(moe_block, reason):
+    """In freed-mode, a would-be fallback is fatal: raise a clear error instead
+    of returning None (which forward_normal would route to self.experts on the
+    freed w13). No-op when NOT in freed-mode (caller then falls back
+    normally)."""
+    if not getattr(moe_block, "_flux_w13_freed", False):
+        return  # not freed: caller handles the fallback (returns None)
+    raise RuntimeError(
+        f"[FLUX-MOE] w13 freed but flux path unusable ({reason}) on layer "
+        f"{getattr(moe_block, 'layer_id', '?')}: the torch-experts fallback "
+        f"would read freed weights and emit garbage. This most commonly means "
+        f"a DECODE batch reached the MoE (flux engages on PREFILL only) -- "
+        f"SGLANG_FLUX_MOE_FREE_W13 is a prefill-only measurement lever. Rerun "
+        f"without it (or with a prefill-only / max-new-tokens~=1 workload)."
+    )
+
+
 def try_flux_moe_forward(
     moe_block, hidden_states: torch.Tensor, topk_output
 ) -> Optional[torch.Tensor]:
@@ -893,10 +1010,15 @@ def try_flux_moe_forward(
     The caller (Qwen3MoeSparseMoeBlock.forward_normal) already checked
     SGLANG_FLUX_MOE=1 and not-last-layer. ``hidden_states`` is the gathered
     (ntokens_global, hidden) tensor the gate ran on; the flux GEMM1 instead
-    consumes the pre-gather scattered shard. Never raises: hard failures
-    disable the path on this block instance and fall back.
+    consumes the pre-gather scattered shard. Normally never raises (hard
+    failures disable the path on this block and fall back), EXCEPT once
+    SGLANG_FLUX_MOE_FREE_W13 has freed the original weights: then any would-be
+    fallback RAISES (see _flux_freed_guard), because self.experts on freed w13
+    would emit silent garbage. The free/gate decisions are env+shape driven and
+    identical on all ranks, so "never returns None" holds rank-uniformly.
     """
     if getattr(moe_block, "_flux_moe_disabled", False):
+        _flux_freed_guard(moe_block, "flux path previously disabled")
         return None
 
     from sglang.srt.layers.communicator import get_attn_tp_context
@@ -915,11 +1037,36 @@ def try_flux_moe_forward(
         or w13_weight is None
         or w2_weight is None
     ):
+        _flux_freed_guard(moe_block, "eligibility gate failed")
         return None
 
     local = ctx.mlp_inputs_.hidden_states_local
     tp_size = get_tensor_model_parallel_world_size()
     hidden = hidden_states.shape[-1]
+    freed = getattr(moe_block, "_flux_w13_freed", False)
+    # In freed-mode w13_weight is an empty tensor; validate expert-weight shape
+    # against the cached metadata instead of the freed storage.
+    if freed:
+        meta = moe_block._flux_shape_meta
+        w_ok = (
+            meta["dtype"] == hidden_states.dtype
+            and meta["hidden"] == hidden
+            and w2_weight.dim() == 3
+            and w2_weight.shape[1] == hidden
+            and w2_weight.shape[2] == meta["inter_shard"]
+            and w2_weight.shape[0] == meta["num_experts"]
+        )
+    else:
+        w_ok = (
+            w13_weight.dtype == hidden_states.dtype
+            and w13_weight.dim() == 3
+            and w2_weight.dim() == 3
+            and w13_weight.shape[1] % 2 == 0
+            and w13_weight.shape[2] == hidden
+            and w2_weight.shape[1] == hidden
+            and w2_weight.shape[2] == w13_weight.shape[1] // 2
+            and w2_weight.shape[0] == w13_weight.shape[0]
+        )
     if (
         tp_size <= 1
         or local is None
@@ -932,17 +1079,11 @@ def try_flux_moe_forward(
         or hidden_states.dtype not in (torch.bfloat16, torch.float16)
         or local.dtype != hidden_states.dtype
         # bf16/fp16 unquantized expert weights only (excludes quantized MoE).
-        or w13_weight.dtype != hidden_states.dtype
-        or w13_weight.dim() != 3
-        or w2_weight.dim() != 3
-        or w13_weight.shape[1] % 2 != 0
-        or w13_weight.shape[2] != hidden
-        or w2_weight.shape[1] != hidden
-        or w2_weight.shape[2] != w13_weight.shape[1] // 2
-        or w2_weight.shape[0] != w13_weight.shape[0]
+        or not w_ok
         or topk_ids.dim() != 2
         or topk_ids.shape[0] != hidden_states.shape[0]
     ):
+        _flux_freed_guard(moe_block, "per-batch shape gate failed")
         return None
 
     try:
@@ -965,6 +1106,9 @@ def try_flux_moe_forward(
         )
     except Exception as exc:  # noqa: BLE001 -- defensive: flux API glue is
         # unvalidated until the first GPU round; never take the server down.
+        # In freed-mode this MUST NOT silently fall back (self.experts on freed
+        # w13); surface it. _flux_freed_guard raises; else disable+fall back.
+        _flux_freed_guard(moe_block, f"flux forward raised: {exc}")
         moe_block._flux_moe_disabled = True
         logger.warning(
             "[FLUX-MOE] disabled: layer=%s reason=%s",
@@ -973,6 +1117,10 @@ def try_flux_moe_forward(
             exc_info=True,
         )
         return None
+
+    # Reclaim w13 storage AFTER the first success (gate/up proven usable).
+    if _FREE_W13 and _LOAD_REPACK and gate_up is not None:
+        _maybe_free_w13(moe_block, w13_weight, gate_up[0], gate_up[1])
 
     global _ENGAGED_LOGGED
     if not _ENGAGED_LOGGED:
@@ -984,17 +1132,22 @@ def try_flux_moe_forward(
             and _HAS_GROUPED_MM
             else _GEMM2_MODE if _TAIL_MODE == "torch" else "n/a(gather_rs)"
         )
+        freed = getattr(moe_block, "_flux_w13_freed", False)
         weights = (
-            "repacked(contiguous, CONTIG_W bypassed)"
+            ("repacked+w13-freed" if freed else "repacked(contiguous)")
+            + ", CONTIG_W bypassed"
             if _LOAD_REPACK
             else f"per-forward-slice(CONTIG_W={_CONTIG_W})"
         )
+        # w13_weight may already be the freed empty tensor here; take the
+        # expert count from the repacked gate group (always valid).
+        n_experts = gate_up[0].shape[0] if gate_up is not None else w13_weight.shape[0]
         logger.info(
             "[FLUX-MOE] engaged: layer=%s tokens=%d experts=%d topk=%d "
             "tail=%s gemm2=%s weights=%s %s",
             getattr(moe_block, "layer_id", "?"),
             hidden_states.shape[0],
-            w13_weight.shape[0],
+            n_experts,
             topk_ids.shape[1],
             _TAIL_MODE,
             gemm2,
