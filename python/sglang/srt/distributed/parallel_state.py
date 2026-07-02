@@ -323,9 +323,13 @@ class GroupCoordinator:
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
-        # Initialize pynvshmem
+        # Initialize pynvshmem (needed by both the fused dense projections
+        # and the flux MoE AGScatter/GatherRS ops).
         if (
-            os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+            (
+                os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+                or os.environ.get("SGLANG_FLUX_MOE", "0") == "1"
+            )
             and torch.distributed.get_world_size(self.device_group) > 1
         ):
             import flux
