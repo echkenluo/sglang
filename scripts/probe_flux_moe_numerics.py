@@ -38,6 +38,10 @@ Stages reported (max_abs / mean_abs / cosine, worst across ranks):
         stage only -- must match to rounding (same FLOPs); (ix)/(x) grouped-
         and loop-GEMM2 tails vs fp32 ref -- both at the final noise floor.
         Skipped if torch._grouped_mm is unavailable.
+  (xi)  load-time weight repack (SGLANG_FLUX_MOE_LOAD_REPACK): the prebuilt
+        contiguous gate/up path vs the per-forward-slice path -- must be
+        BIT-IDENTICAL (max_abs == 0), since the repack is the same
+        .contiguous() done once at load instead of every forward.
 Both ranks hold IDENTICAL weight shards, so GatherRS's cross-rank reduction
 doubles the single-shard partial: the scattered references are
 (2 * reference).chunk(TP)[rank]. A missing or rank-misordered reduction is
@@ -52,6 +56,7 @@ Verdict: the first stage exceeding 3x the bf16 noise floor, mapped to
   (b) the sglang-side torch tail / (b/gather_rs) the fused GatherRS tail
   (c) neither: genuine mixed-precision accumulation difference (quantified)
   (d) batched grouped GEMM2 diverges from the loop (perf path unsafe)
+  (e) load-time repack changes output (must be bit-identical)
 Exit code is nonzero iff any stage exceeds its threshold (or the metadata
 oracle fails), so a wrapper can sentinel it. Rank 0 prints; metrics are
 all-reduced so the exit code is rank-consistent.
@@ -152,6 +157,7 @@ def main() -> int:
         _gather_rs_tail,
         _gemm2_grouped,
         _gemm2_loop,
+        _get_prebuilt_gate_up,
         _moe_tail,
         _scatter_metadata,
         flux_moe_compute,
@@ -422,6 +428,18 @@ def main() -> int:
     cap = {}
     flux_out = flux_moe_compute(op, local, topk_ids, topk_weights, w13, w2, capture=cap)
 
+    # ---- load-time repack equivalence: the prebuilt contiguous gate/up must
+    # give byte-identical output to the per-forward slice path (it's the same
+    # .contiguous() done once). Reuses a throwaway block-like holder.
+    class _Blk:  # minimal stand-in for the sparse-moe block attr cache
+        pass
+
+    gate_up = _get_prebuilt_gate_up(_Blk(), w13)
+    flux_out_repack = flux_moe_compute(
+        op, local, topk_ids, topk_weights, w13, w2, gate_up=gate_up
+    )
+    m_repack = reduce_worst(metrics(flux_out_repack, flux_out))
+
     # ---- Path B tail isolation: the ACTUAL serving tail fed exact GEMM1 ----
     tail_out = _moe_tail(
         ref_gate32.to(DTYPE),
@@ -499,6 +517,9 @@ def main() -> int:
     exceed_tail = m_tail["mean_abs"] > thr_fin
     exceed_grs = m_grs32["mean_abs"] > thr_rs
     exceed_fin = m_fin32["mean_abs"] > thr_fin
+    # Load-time repack must be EXACTLY equal to the per-forward slice path
+    # (same .contiguous(), done once) -- bit-identical, so tolerance is 0.
+    exceed_repack = m_repack["max_abs"] != 0.0
     # Path D thresholds: grouped GEMM2 must equal the loop essentially exactly
     # (same FLOPs, both bf16 cublas) and sit at the final noise floor vs fp32.
     exceed_grp = False
@@ -555,7 +576,8 @@ def main() -> int:
         f"seed={SEED} CONTIG_W={flux_moe._CONTIG_W} "
         f"gather_rs_min_tokens={flux_moe._GATHER_RS_MIN_TOKENS} "
         f"gemm2_mode={flux_moe._GEMM2_MODE} "
-        f"has_grouped_mm={flux_moe._HAS_GROUPED_MM}"
+        f"has_grouped_mm={flux_moe._HAS_GROUPED_MM} "
+        f"load_repack={flux_moe._LOAD_REPACK}"
     )
     p0(f"flux op: {op.ctor_desc}")
     p0(f"flux gather_rs op: {op._gather_rs.ctor_desc}")
@@ -580,6 +602,7 @@ def main() -> int:
         why = grouped_err or "torch._grouped_mm unavailable"
         p0(f"(viii-x) grouped GEMM2: SKIPPED ({why}) -- serving auto mode "
            "would use the loop backend")
+    p0(fmt("(xi)  load-repack path vs per-forward-slice (must be 0)", m_repack))
     p0("-" * 100)
 
     if oracle_fail:
@@ -624,6 +647,13 @@ def main() -> int:
             f"torch._grouped_mm offsets/layout wrong. Serving must use "
             f"SGLANG_FLUX_MOE_GEMM2=loop until fixed."
         )
+    elif exceed_repack:
+        verdict = (
+            f"VERDICT: (e) load-time repack CHANGES output — repack-vs-slice "
+            f"max_abs={m_repack['max_abs']:.3e} != 0 (must be bit-identical; "
+            f"the prebuilt gate/up is the same .contiguous() done once). Bug "
+            f"in _get_prebuilt_gate_up slicing/caching."
+        )
     else:
         ratio = m_fin32["mean_abs"] / (floor_fin["mean_abs"] + EPS)
         ratio_rs = m_grs32["mean_abs"] / (floor_rs["mean_abs"] + EPS)
@@ -653,6 +683,7 @@ def main() -> int:
         or exceed_grs
         or exceed_fin
         or exceed_grp
+        or exceed_repack
     )
     dist.barrier()
     dist.destroy_process_group()

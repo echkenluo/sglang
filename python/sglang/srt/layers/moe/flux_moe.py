@@ -49,10 +49,16 @@ interpretations are implemented behind ``SGLANG_FLUX_MOE_FFN_MODE``:
   size as physically materialized, robust to FusedMoE padding); flux then
   derives the shard through its env's ffn-TP division.
 
+Weight contiguity (``SGLANG_FLUX_MOE_LOAD_REPACK``, default ON): AGScatter
+needs contiguous gate/up weight groups, but the dim-1 slices of the packed
+w13_weight are non-contiguous. The default repacks them into contiguous
+per-expert storage ONCE (lazily, cached on the sparse-moe block) so there is
+zero per-forward copy. The legacy ``SGLANG_FLUX_MOE_CONTIG_W=1`` copied all
+128 gate/up expert blocks x 48 layers on EVERY forward and is now obsolete
+(kept as a debug fallback when LOAD_REPACK=0). Memory: +1 copy of the gate+up
+weights (== w13 size) per flux-enabled layer.
+
 Other defensive levers / assumptions:
-- ``SGLANG_FLUX_MOE_CONTIG_W=1`` copies the gate/up weight groups to
-  contiguous tensors each forward (slow; correctness-validation lever in case
-  flux rejects or mishandles the non-contiguous dim-1 slices of w13_weight).
 - Op construction is collective across the TP group; the gate conditions are
   rank-uniform (shapes/env/batch geometry), so all ranks reach the lazy ctor
   on the same forward.
@@ -79,6 +85,15 @@ logger = logging.getLogger(__name__)
 
 _FFN_MODE = os.environ.get("SGLANG_FLUX_MOE_FFN_MODE", "shard")
 _CONTIG_W = os.environ.get("SGLANG_FLUX_MOE_CONTIG_W", "0") == "1"
+# Load-time weight repack (default ON): materialize contiguous per-expert
+# gate/up weight groups ONCE (lazily, on first eligible forward, cached on the
+# sparse-moe block) so AGScatter gets contiguous weights with ZERO per-forward
+# copy. This obsoletes the SGLANG_FLUX_MOE_CONTIG_W=1 per-forward
+# .contiguous() of all 128 gate/up expert blocks x 48 layers -- the suspected
+# dominant slice-1 cost. Set SGLANG_FLUX_MOE_LOAD_REPACK=0 to disable and fall
+# back to per-forward slicing (with CONTIG_W honored) for A/B.
+_LOAD_REPACK = os.environ.get("SGLANG_FLUX_MOE_LOAD_REPACK", "1") == "1"
+_REPACK_LOGGED = False
 # Mirrors MAX_M used by the attention-side AGCook/GemmRS glue in unquant.py.
 _MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 # M3 slice 2: tail implementation selector.
@@ -664,6 +679,7 @@ def flux_moe_compute(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
     capture: Optional[dict] = None,
+    gate_up: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """AGScatter GEMM1 -> silu*mul -> GEMM2 tail (torch or flux GatherRS).
 
@@ -717,13 +733,18 @@ def flux_moe_compute(
         topk_ids_global, num_experts
     )
 
-    # w13 stacks [gate; up] along dim 1; dim-1 slices are non-contiguous
-    # views (per-expert 2D blocks are contiguous). See module NOTE.
-    gate_w = w13_weight[:, :inter_shard, :]
-    up_w = w13_weight[:, inter_shard:, :]
-    if _CONTIG_W:
-        gate_w = gate_w.contiguous()
-        up_w = up_w.contiguous()
+    if gate_up is not None:
+        # Load-time repacked contiguous gate/up groups: no per-forward copy.
+        gate_w, up_w = gate_up
+    else:
+        # w13 stacks [gate; up] along dim 1; dim-1 slices are non-contiguous
+        # views (per-expert 2D blocks are contiguous). CONTIG_W copies them
+        # EVERY forward -- the load-time repack (default) makes this obsolete.
+        gate_w = w13_weight[:, :inter_shard, :]
+        up_w = w13_weight[:, inter_shard:, :]
+        if _CONTIG_W:
+            gate_w = gate_w.contiguous()
+            up_w = up_w.contiguous()
 
     gate_out, up_out = op._run_gemm1(
         hidden_shard, [gate_w, up_w], splits_gpu, scatter_index
@@ -827,6 +848,43 @@ def _get_or_build_op(moe_block, w13_weight, topk, hidden):
     return op
 
 
+def _get_prebuilt_gate_up(moe_block, w13_weight):
+    """Lazily materialize contiguous per-expert gate/up weight groups on the
+    sparse-moe block, ONCE (first eligible forward), and reuse thereafter.
+
+    Returns (gate_w, up_w), each (E, inter_shard, hidden) contiguous, so
+    AGScatter needs no per-forward copy. Cached on moe_block keyed by the
+    w13_weight tensor identity so a weight reload / different layer rebuilds.
+    Memory: +1 copy of the MoE gate+up weights per flux-enabled layer (== the
+    size of w13, since gate+up together are all of w13). w2 is untouched.
+    Lazy-on-first-forward (not a load hook): simpler, and rank-uniform because
+    every rank hits it on the same forward with identical shapes.
+    """
+    global _REPACK_LOGGED
+    inter_shard = w13_weight.shape[1] // 2
+    cached = getattr(moe_block, "_flux_gate_up", None)
+    # Rebuild if absent or if the underlying weight tensor changed identity.
+    if cached is not None and cached[0] is w13_weight:
+        return cached[1], cached[2]
+    gate_w = w13_weight[:, :inter_shard, :].contiguous()
+    up_w = w13_weight[:, inter_shard:, :].contiguous()
+    moe_block._flux_gate_up = (w13_weight, gate_w, up_w)
+    if not _REPACK_LOGGED:
+        _REPACK_LOGGED = True
+        bytes_per = gate_w.numel() * gate_w.element_size()
+        logger.info(
+            "[FLUX-MOE] load-time weight repack done: contiguous gate/up "
+            "(E=%d, inter_shard=%d, hidden=%d) built once per layer; "
+            "CONTIG_W per-forward copy BYPASSED. +%.1f MiB/layer "
+            "(gate+up == w13 size).",
+            w13_weight.shape[0],
+            inter_shard,
+            w13_weight.shape[2],
+            2 * bytes_per / (1024**2),
+        )
+    return gate_w, up_w
+
+
 def try_flux_moe_forward(
     moe_block, hidden_states: torch.Tensor, topk_output
 ) -> Optional[torch.Tensor]:
@@ -889,7 +947,22 @@ def try_flux_moe_forward(
 
     try:
         op = _get_or_build_op(moe_block, w13_weight, topk_ids.shape[1], hidden)
-        out = op.forward(local, topk_ids, topk_weights, w13_weight, w2_weight)
+        # Load-time repack (default): prebuild contiguous gate/up ONCE so
+        # AGScatter needs no per-forward .contiguous() (the suspected slice-1
+        # cost). SGLANG_FLUX_MOE_LOAD_REPACK=0 falls back to per-forward
+        # slicing inside flux_moe_compute (CONTIG_W honored there).
+        gate_up = (
+            _get_prebuilt_gate_up(moe_block, w13_weight) if _LOAD_REPACK else None
+        )
+        out = flux_moe_compute(
+            op,
+            local,
+            topk_ids,
+            topk_weights,
+            w13_weight,
+            w2_weight,
+            gate_up=gate_up,
+        )
     except Exception as exc:  # noqa: BLE001 -- defensive: flux API glue is
         # unvalidated until the first GPU round; never take the server down.
         moe_block._flux_moe_disabled = True
@@ -911,15 +984,21 @@ def try_flux_moe_forward(
             and _HAS_GROUPED_MM
             else _GEMM2_MODE if _TAIL_MODE == "torch" else "n/a(gather_rs)"
         )
+        weights = (
+            "repacked(contiguous, CONTIG_W bypassed)"
+            if _LOAD_REPACK
+            else f"per-forward-slice(CONTIG_W={_CONTIG_W})"
+        )
         logger.info(
             "[FLUX-MOE] engaged: layer=%s tokens=%d experts=%d topk=%d "
-            "tail=%s gemm2=%s %s",
+            "tail=%s gemm2=%s weights=%s %s",
             getattr(moe_block, "layer_id", "?"),
             hidden_states.shape[0],
             w13_weight.shape[0],
             topk_ids.shape[1],
             _TAIL_MODE,
             gemm2,
+            weights,
             op.ctor_desc,
         )
     return out
