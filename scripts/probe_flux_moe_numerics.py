@@ -53,6 +53,21 @@ all-reduced so the exit code is rank-consistent.
 SGLANG_FLUX_MOE_MAX_NTOKENS (default 8192) also applies here; it sizes both
 flux workspaces (GatherRS max_m = max_ntokens * topk) and must be set before
 launch if the nvshmem heap is tight.
+
+HANG-LOCALIZATION MODE (SGLANG_FLUX_MOE_PROBE_NS): when set, the probe skips
+the numeric comparison and instead runs the real gather_rs tail across a
+comma-separated batch-size sweep, printing an [ENTER]/[OK] heartbeat per case
+so a deadlock pins to one batch shape (reproduces the serving hang without a
+server). Suffix a size with "c" for concentrated routing (all tokens pick
+experts [0, topk) -> most experts get 0 tokens). Example:
+
+    SGLANG_FLUX_MOE_PROBE_NS="2,4,8,8c,512" \
+        torchrun --nproc_per_node=2 scripts/probe_flux_moe_numerics.py
+
+A case that hangs freezes right after its [ENTER] line; the first such n (or
+the first concentrated case) is the trigger. The sweep calls _gather_rs_tail
+directly, so it is NOT gated by SGLANG_FLUX_MOE_GATHER_RS_MIN_TOKENS -- that
+is deliberate, so the collective is actually entered at tiny M.
 """
 
 import os
@@ -140,6 +155,93 @@ def main() -> int:
         outs = [torch.zeros_like(t) for _ in range(world)]
         dist.all_gather(outs, t)
         return [o.item() for o in outs]
+
+    def make_op(inter_shard=INTER_SHARD):
+        return FluxMoeAGScatter(
+            tp_group=dist.group.WORLD,
+            tp_size=TP,
+            num_experts=N_EXPERTS,
+            topk=TOPK,
+            hidden=HIDDEN,
+            inter_shard=inter_shard,
+            dtype=DTYPE,
+            ffn_mode="full",
+        )
+
+    # ---- tiny-batch hang localization (SGLANG_FLUX_MOE_PROBE_NS) -----------
+    # Runs the REAL gather_rs tail across a sweep of batch sizes, printing a
+    # heartbeat before/after each so a hang pins to one n. This reproduces the
+    # serving deadlock (2-token warmup) without a server. "Nc" (e.g. "8c")
+    # forces concentrated routing: all tokens pick experts [0, topk), so every
+    # other expert gets 0 tokens -- the zero-count-expert regime that flux's
+    # own tests (even round-robin over few experts, huge M) never exercise.
+    probe_ns_env = os.environ.get("SGLANG_FLUX_MOE_PROBE_NS", "")
+    if probe_ns_env:
+        cases = []
+        for tok in probe_ns_env.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            concentrated = tok.endswith("c")
+            cases.append((int(tok[:-1] if concentrated else tok), concentrated))
+        p0("=" * 100)
+        p0(f"HANG-LOCALIZATION SWEEP: cases={cases} (Nc = concentrated routing)")
+        p0("Each case: build inputs -> barrier -> gather_rs tail -> sync -> "
+           "barrier. A hang stops right after the last '[ENTER]' line.")
+        p0("-" * 100)
+        sweep_op = make_op()
+        gsweep = torch.Generator().manual_seed(SEED)
+        # Small fan-in-scaled weights so activations stay finite; values are
+        # irrelevant to a collective deadlock, only shapes/counts matter.
+        w13_s = (
+            torch.randn(N_EXPERTS, 2 * INTER_SHARD, HIDDEN, generator=gsweep)
+            * HIDDEN**-0.5
+        ).to(dev, DTYPE)
+        w2_s = (
+            torch.randn(N_EXPERTS, HIDDEN, INTER_SHARD, generator=gsweep)
+            * INTER_SHARD**-0.5
+        ).to(dev, DTYPE)
+        for n_tok, concentrated in cases:
+            tag = f"n={n_tok}{' concentrated' if concentrated else ''}"
+            if n_tok % TP != 0:
+                p0(f"[SKIP ] {tag}: not divisible by tp={TP} (gate rejects it)")
+                continue
+            xs = torch.randn(n_tok, HIDDEN, generator=gsweep).to(dev, DTYPE)
+            if concentrated:
+                tids = (
+                    torch.arange(TOPK, dtype=torch.int32).repeat(n_tok, 1).to(dev)
+                )
+                tw = torch.full((n_tok, TOPK), 1.0 / TOPK, device=dev)
+            else:
+                pr = torch.softmax(
+                    torch.randn(n_tok, N_EXPERTS, generator=gsweep).to(dev).float(),
+                    dim=-1,
+                )
+                tw, tids = torch.topk(pr, TOPK, dim=-1)
+                tw = (tw / tw.sum(-1, keepdim=True)).contiguous()
+                tids = tids.to(torch.int32).contiguous()
+            loc = xs.chunk(TP, dim=0)[rank].contiguous()
+            sp, si = _scatter_metadata(tids, N_EXPERTS)
+            nz = int((sp > 0).sum().item())
+            gate_out, up_out = sweep_op._run_gemm1(
+                loc, [w13_s[:, :INTER_SHARD, :], w13_s[:, INTER_SHARD:, :]], sp, si
+            )
+            dist.barrier()
+            p0(f"[ENTER] {tag}: rows={si.numel()} nonzero_experts={nz}/{N_EXPERTS}")
+            try:
+                out = _gather_rs_tail(sweep_op, gate_out, up_out, sp, si, tw, w2_s)
+                torch.cuda.synchronize()
+                dist.barrier()
+                p0(f"[ OK  ] {tag}: out={tuple(out.shape)}")
+            except Exception as exc:  # noqa: BLE001
+                dist.barrier()
+                p0(f"[ERROR] {tag}: {type(exc).__name__}: {exc}")
+        p0("=" * 100)
+        p0("SWEEP COMPLETE (reached end without hang). A case that hung would "
+           "have frozen after its [ENTER]; the first such n is the trigger.")
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
 
     # ---- deterministic identical inputs on both ranks (CPU generator) ------
     g = torch.Generator().manual_seed(SEED)
@@ -329,7 +431,8 @@ def main() -> int:
     p0(
         f"probe config: n={N_TOKENS} hidden={HIDDEN} E={N_EXPERTS} "
         f"inter_shard={INTER_SHARD} topk={TOPK} tp={TP} dtype={DTYPE} "
-        f"seed={SEED} CONTIG_W={flux_moe._CONTIG_W}"
+        f"seed={SEED} CONTIG_W={flux_moe._CONTIG_W} "
+        f"gather_rs_min_tokens={flux_moe._GATHER_RS_MIN_TOKENS}"
     )
     p0(f"flux op: {op.ctor_desc}")
     p0(f"flux gather_rs op: {op._gather_rs.ctor_desc}")

@@ -16,6 +16,15 @@ per-expert ``torch.mm`` loop + unsort/weighted-sum, returning
 reduction (EP-AR skip + communicator reduce-scatter), exactly like
 ``FusedMoE``'s output on this path.
 
+gather_rs runs an UNCONDITIONAL cross-rank GroupBarrier + nvshmem ring
+reduce-scatter inside every forward, so it deadlocks on the tiny batches the
+serving warmup drives (2 tokens over 128 experts -> most experts empty; a
+regime flux's own tests never cover). It therefore engages only when the
+GLOBAL token count >= SGLANG_FLUX_MOE_GATHER_RS_MIN_TOKENS (default 256),
+falling back to the torch tail below that. The threshold is compared against
+the gathered global count, identical on all ranks, so the choice is
+rank-uniform and never desyncs the collective.
+
 Known remaining costs (documented, addressed later):
 - The router gate still runs on the gathered tokens from ``fetch_mlp_latent``,
   so that all-gather still happens. The big win here is fusing the
@@ -75,9 +84,25 @@ _MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 #   ReduceScatter; output = (ntokens/tp, hidden) scattered REDUCED rows (the
 #   next layer's prepare_attn detects the row match and skips its RS).
 _TAIL_MODE = os.environ.get("SGLANG_FLUX_MOE_TAIL", "torch")
+# Minimum GLOBAL token count to engage the gather_rs tail; below it, fall back
+# to the (correct, slower) torch tail. flux GatherRS runs an UNCONDITIONAL
+# cross-rank GroupBarrier + nvshmem ring reduce-scatter inside every
+# forward_gather_rs, and flux's own tests only ever exercise huge M
+# (ntokens=32768) over few experts with an even round-robin split -- tiny M
+# and zero-count experts (our 128-expert model on the 2-token serving warmup:
+# ~16 sorted rows over 128 experts, ~112 empty) are untested and deadlock the
+# collective. The threshold MUST be compared against the global token count
+# (identical on all ranks) so the torch/gather_rs choice is rank-uniform;
+# deciding from a per-rank local count would desync the collective and hang.
+# Default 256: comfortably above serving warmup batches, and slice-2's win is
+# on large prefill chunks anyway. Set to 0 to force gather_rs always (repro).
+_GATHER_RS_MIN_TOKENS = int(
+    os.environ.get("SGLANG_FLUX_MOE_GATHER_RS_MIN_TOKENS", "256")
+)
 
 _ENGAGED_LOGGED = False
 _GATHER_RS_ENGAGED_LOGGED = False
+_GATHER_RS_SKIP_SMALL_LOGGED = False
 # Global, not per-layer: the flux ops are cached per shape and shared by all
 # layers, so a gather_rs failure is structural (API/workspace), not per-layer.
 # Disabling falls back to the torch tail only; AGScatter GEMM1 stays engaged
@@ -486,9 +511,33 @@ def flux_moe_compute(
     gate_out, up_out (post row-slice), splits_gpu, scatter_index.
     """
     global _GATHER_RS_DISABLED, _GATHER_RS_ENGAGED_LOGGED
+    global _GATHER_RS_SKIP_SMALL_LOGGED
 
     num_experts = w13_weight.shape[0]
     inter_shard = w13_weight.shape[1] // 2
+    # Rank-uniform tail choice: topk_ids_global is the gathered routing (same
+    # global token count on every rank), so this comparison never desyncs the
+    # gather_rs collective. Decided BEFORE the _scatter_metadata .item() sync
+    # so a below-threshold batch takes the torch tail with no risk of blocking
+    # on a prior rank's pending collective.
+    ntokens_global = topk_ids_global.shape[0]
+    use_gather_rs = (
+        _TAIL_MODE == "gather_rs"
+        and not _GATHER_RS_DISABLED
+        and ntokens_global >= _GATHER_RS_MIN_TOKENS
+    )
+    if (
+        _TAIL_MODE == "gather_rs"
+        and ntokens_global < _GATHER_RS_MIN_TOKENS
+        and not _GATHER_RS_SKIP_SMALL_LOGGED
+    ):
+        _GATHER_RS_SKIP_SMALL_LOGGED = True
+        logger.info(
+            "[FLUX-MOE] gather_rs skipped: tokens=%d < min=%d (torch tail; "
+            "flux GatherRS deadlocks its cross-rank barrier on tiny batches)",
+            ntokens_global,
+            _GATHER_RS_MIN_TOKENS,
+        )
 
     splits_gpu, scatter_index = _scatter_metadata(topk_ids_global, num_experts)
 
@@ -522,7 +571,7 @@ def flux_moe_compute(
             scatter_index=scatter_index,
         )
 
-    if _TAIL_MODE == "gather_rs" and not _GATHER_RS_DISABLED:
+    if use_gather_rs:
         try:
             out = _gather_rs_tail(
                 op,
@@ -535,6 +584,10 @@ def flux_moe_compute(
             )
         except Exception as exc:  # noqa: BLE001 -- layered fallback: keep the
             # AGScatter GEMM1 engaged, only the fused tail drops out.
+            # NOTE: a mid-forward failure here is only collective-safe if it
+            # raises on ALL ranks (shape/threshold checks do; the gather_rs
+            # collective itself, once entered, would already have hung). The
+            # rank-uniform threshold above keeps every rank on the same branch.
             _GATHER_RS_DISABLED = True
             logger.warning(
                 "[FLUX-MOE] gather_rs disabled: %s (falling back to the "
