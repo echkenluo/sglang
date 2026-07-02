@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 _FFN_MODE = os.environ.get("SGLANG_FLUX_MOE_FFN_MODE", "shard")
 _CONTIG_W = os.environ.get("SGLANG_FLUX_MOE_CONTIG_W", "0") == "1"
 # Mirrors MAX_M used by the attention-side AGCook/GemmRS glue in unquant.py.
-_MAX_NTOKENS = 65536
+_MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 
 _ENGAGED_LOGGED = False
 
@@ -259,6 +259,12 @@ class FluxMoeAGScatter:
         return (gathered * weights).sum(dim=1)
 
 
+# One op per shape shared by ALL layers: the flux op holds nvshmem workspace
+# buffers (not layer state), and per-layer instances exhaust the symmetric
+# heap after a handful of layers (nvshmem_malloc -> nullptr at flux_shm.cc:117).
+_OP_CACHE: dict = {}
+
+
 def _get_or_build_op(moe_block, w13_weight, topk, hidden):
     inter_shard = w13_weight.shape[1] // 2
     key = (
@@ -269,8 +275,8 @@ def _get_or_build_op(moe_block, w13_weight, topk, hidden):
         w13_weight.dtype,
         _FFN_MODE,
     )
-    op = getattr(moe_block, "_flux_moe_op", None)
-    if op is not None and op.key == key:
+    op = _OP_CACHE.get(key)
+    if op is not None:
         return op
     op = FluxMoeAGScatter(
         tp_group=get_tp_group().device_group,
@@ -282,7 +288,7 @@ def _get_or_build_op(moe_block, w13_weight, topk, hidden):
         dtype=w13_weight.dtype,
         ffn_mode=_FFN_MODE,
     )
-    moe_block._flux_moe_op = op
+    _OP_CACHE[key] = op
     return op
 
 
