@@ -76,13 +76,16 @@ _CONTIG_W = os.environ.get("SGLANG_FLUX_MOE_CONTIG_W", "0") == "1"
 # Mirrors MAX_M used by the attention-side AGCook/GemmRS glue in unquant.py.
 _MAX_NTOKENS = int(os.environ.get("SGLANG_FLUX_MOE_MAX_NTOKENS", "8192"))
 # M3 slice 2: tail implementation selector.
-# - "torch" (default): the slice-1 tail (silu*mul + python per-expert GEMM2
-#   loop + unsort/combine); output = (ntokens, hidden) TP-partial sums for the
-#   downstream communicator RS.
-# - "gather_rs": flux GemmGroupedV2/V3 GatherRS, fusing grouped GEMM2 + topk
-#   gather + fp32 per-row scaling + weighted reduce + cross-rank
-#   ReduceScatter; output = (ntokens/tp, hidden) scattered REDUCED rows (the
-#   next layer's prepare_attn detects the row match and skips its RS).
+# - "torch" (default, PRODUCTION): the slice-1 tail (silu*mul + per-expert
+#   GEMM2 + unsort/combine); output = (ntokens, hidden) TP-partial sums for
+#   the downstream communicator RS.
+# - "gather_rs" (EXPERIMENTAL, KNOWN-HANGING at serving scale -- see the
+#   "GATHER_RS SERVING-HANG CHARACTERIZATION" block below): flux
+#   GemmGroupedV2/V3 GatherRS fusing grouped GEMM2 + topk gather + fp32 per-row
+#   scaling + weighted reduce + cross-rank ReduceScatter; output =
+#   (ntokens/tp, hidden) scattered REDUCED rows. Numerically correct in
+#   isolation (probe Path C: 0.87x noise floor) but deadlocks the 48-layer
+#   serving interleave. Do NOT enable in production.
 _TAIL_MODE = os.environ.get("SGLANG_FLUX_MOE_TAIL", "torch")
 # Minimum GLOBAL token count to engage the gather_rs tail; below it, fall back
 # to the (correct, slower) torch tail. flux GatherRS runs an UNCONDITIONAL
@@ -99,6 +102,75 @@ _TAIL_MODE = os.environ.get("SGLANG_FLUX_MOE_TAIL", "torch")
 _GATHER_RS_MIN_TOKENS = int(
     os.environ.get("SGLANG_FLUX_MOE_GATHER_RS_MIN_TOKENS", "256")
 )
+
+# ============================================================================
+# GATHER_RS SERVING-HANG CHARACTERIZATION (why SGLANG_FLUX_MOE_TAIL=gather_rs
+# is NOT production; torch tail is the shipping slice-1 path)
+# ============================================================================
+# Status: the fused GatherRS tail is numerically correct in isolation (probe
+# Path C, n=512 single AGScatter->GatherRS composition: 0.87x the bf16 noise
+# floor, exit 0) but HANGS the full 48-layer model at serving scale on any
+# batch that engages it (>= min_tokens; observed on the 4096-token S1 prefill:
+# bench timeout, server log shows the two "gemm_grouped_v2_gather_rs.cc:410
+# (n/split_n)%1024, set split_n=2" heal warnings -- i.e. GatherRS entered its
+# forward -- then freezes).
+#
+# What was ruled OUT (static audit against flux checkout 69ac719):
+# - The prepare_attn RS-skip is rank-uniform and correct. Under the scattered
+#   flow residual is already token-sharded (local rows) at prepare_mlp/attn;
+#   the torch tail returns FULL rows (local*tp != local for tp>1, local>0) so
+#   the skip is False and the RS runs; the gather_rs tail returns LOCAL rows
+#   so it fires. Row counts derive from forward_batch (identical on all ranks)
+#   and None/zero cases are guarded, so both ranks always take the same branch
+#   -- no collective-count divergence. (Hypothesis 2: refuted.)
+# - Divisibility: GatherRS FLUX_CHECK_DIV(m_full, world*topk) => ntokens%tp==0,
+#   which the engage gate already guarantees; 4096%2==0. These are C++
+#   assertions (raise, not hang), and the batch got PAST them (heal warnings
+#   printed). (Hypothesis 3 edge: refuted for the observed case.)
+#
+# Leading cause (Hypothesis 1, flux-internal, NOT fixable from sglang glue):
+# GatherRS's GroupBarrier(tp_group, ring_mode = tp>8 => false for TP2) resolves
+# to nvshmemx_barrier_all_on_stream over NVSHMEM_TEAM_WORLD, enqueued on a
+# PRIVATE gather_rs_stream and event-chained to the main stream, TWICE per
+# forward (flux_shm.cc flux_barrier_all_on_stream; gemm_grouped_v2_gather_rs.cc
+# :654,678). AGScatter also issues nvshmem collectives on its own cp_stream.
+# A single interleave works (Path C); the 48x serving interleave -- AGScatter
+# collective -> attention TP collectives -> the (correctly) skipped RS ->
+# GatherRS TEAM_WORLD barrier on a private stream -> next layer -- accumulates
+# cross-stream/heap state that the two ops' independent barrier teams and
+# nvshmem symmetric workspaces (both sized by max_ntokens) do not compose
+# through. Reproduce without a server via the probe's
+# SGLANG_FLUX_MOE_PROBE_LAYERS=48 mode.
+#
+# What a real slice-2 fix would require (flux-side, out of scope here):
+# - a shared/serialized barrier team so AGScatter and GatherRS don't hold two
+#   independent TEAM_WORLD barriers in flight across a layer, OR GatherRS
+#   running its barrier+RS on the main stream (no private-stream event chain),
+#   OR
+# - a non-fused fallback: keep AGScatter GEMM1, do GEMM2 as a batched grouped
+#   matmul (see below) and the reduce-scatter via sglang's own
+#   reduce_scatter_tensor -- i.e. no flux GatherRS at all.
+#
+# PRAGMATIC ALTERNATIVE for slice-1's -36% (no flux GatherRS needed): that
+# regression is the python per-expert for-loop + .tolist() sync in _moe_tail,
+# not GEMM2 FLOPs. Replace the loop with a SINGLE batched grouped matmul over
+# the expert-sorted rows with splits.cumsum offsets -- options in the tree /
+# torch: a segment/grouped-mm kernel (sglang already ships fp8 grouped-mm in
+# cutlass_moe.py; a bf16 grouped-mm op, e.g. torch._grouped_mm on new enough
+# torch, or a triton segmented matmul, fits the same shape) -- removing the
+# per-layer python + kernel-launch overhead and the D2H sync while keeping the
+# torch tail's proven numerics and collective-free reduction. This is the
+# recommended next step over debugging flux GatherRS composition.
+# ============================================================================
+if _TAIL_MODE == "gather_rs":
+    logger.warning(
+        "[FLUX-MOE] SGLANG_FLUX_MOE_TAIL=gather_rs is EXPERIMENTAL and "
+        "KNOWN TO HANG the full model at serving scale (see the "
+        "characterization block in flux_moe.py). It is numerically correct "
+        "in isolation but deadlocks the 48-layer collective interleave. "
+        "Production must use SGLANG_FLUX_MOE_TAIL=torch. Proceeding only "
+        "because it was explicitly requested (repro/debug)."
+    )
 
 _ENGAGED_LOGGED = False
 _GATHER_RS_ENGAGED_LOGGED = False

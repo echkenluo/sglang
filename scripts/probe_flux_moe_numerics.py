@@ -68,6 +68,16 @@ A case that hangs freezes right after its [ENTER] line; the first such n (or
 the first concentrated case) is the trigger. The sweep calls _gather_rs_tail
 directly, so it is NOT gated by SGLANG_FLUX_MOE_GATHER_RS_MIN_TOKENS -- that
 is deliberate, so the collective is actually entered at tiny M.
+
+MULTI-LAYER INTERLEAVE MODE (SGLANG_FLUX_MOE_PROBE_LAYERS): replays L
+iterations of [AGScatter GEMM1 -> gather_rs tail] on one fixed batch
+(SGLANG_FLUX_MOE_PROBE_N, default 4096), a server-free repro of the 48-layer
+serving interleave that Path C's single composition does not exercise. Prints
+a per-iteration heartbeat so a deadlock pins to the iteration index
+(distinguishes accumulated-state/heap growth from a single-op bug). Example:
+
+    SGLANG_FLUX_MOE_PROBE_LAYERS=48 SGLANG_FLUX_MOE_PROBE_N=4096 \
+        torchrun --nproc_per_node=2 scripts/probe_flux_moe_numerics.py
 """
 
 import os
@@ -239,6 +249,69 @@ def main() -> int:
         p0("=" * 100)
         p0("SWEEP COMPLETE (reached end without hang). A case that hung would "
            "have frozen after its [ENTER]; the first such n is the trigger.")
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
+
+    # ---- multi-layer interleave repro (SGLANG_FLUX_MOE_PROBE_LAYERS) -------
+    # Path C proved ONE AGScatter->GatherRS composition works at n=512. The
+    # serving hang is at the FULL 48-layer loop where AGScatter (nvshmem
+    # collective) and GatherRS (nvshmem TEAM_WORLD barrier + ring RS) interleave
+    # 48x. This mode replays exactly that: L iterations of
+    # [AGScatter GEMM1 -> gather_rs tail] on a fixed batch, printing a
+    # heartbeat per iter so a hang pins to the iteration index (isolating
+    # accumulated-state / heap-growth from a single-op bug). Set
+    # SGLANG_FLUX_MOE_PROBE_LAYERS=48 (and optionally SGLANG_FLUX_MOE_PROBE_N to
+    # the batch size, default 4096 = the batch that hung serving).
+    probe_layers = int(os.environ.get("SGLANG_FLUX_MOE_PROBE_LAYERS", "0"))
+    if probe_layers > 0:
+        n_tok = int(os.environ.get("SGLANG_FLUX_MOE_PROBE_N", "4096"))
+        assert n_tok % TP == 0, f"SGLANG_FLUX_MOE_PROBE_N={n_tok} must be % tp"
+        p0("=" * 100)
+        p0(f"MULTI-LAYER INTERLEAVE REPRO: layers={probe_layers} n={n_tok} "
+           f"(each iter = AGScatter GEMM1 -> gather_rs tail, like one decoder "
+           f"MoE). A hang freezes right after the last '[iter K]' line.")
+        p0("-" * 100)
+        li_op = make_op()
+        gli = torch.Generator().manual_seed(SEED)
+        w13_l = (
+            torch.randn(N_EXPERTS, 2 * INTER_SHARD, HIDDEN, generator=gli)
+            * HIDDEN**-0.5
+        ).to(dev, DTYPE)
+        w2_l = (
+            torch.randn(N_EXPERTS, HIDDEN, INTER_SHARD, generator=gli)
+            * INTER_SHARD**-0.5
+        ).to(dev, DTYPE)
+        xs = torch.randn(n_tok, HIDDEN, generator=gli).to(dev, DTYPE)
+        pr = torch.softmax(
+            torch.randn(n_tok, N_EXPERTS, generator=gli).to(dev).float(), dim=-1
+        )
+        tw, tids = torch.topk(pr, TOPK, dim=-1)
+        tw = (tw / tw.sum(-1, keepdim=True)).contiguous()
+        tids = tids.to(torch.int32).contiguous()
+        loc = xs.chunk(TP, dim=0)[rank].contiguous()
+        sp, si = _scatter_metadata(tids, N_EXPERTS)
+        w13_groups = [w13_l[:, :INTER_SHARD, :], w13_l[:, INTER_SHARD:, :]]
+        for it in range(probe_layers):
+            dist.barrier()
+            p0(f"[iter {it}] enter")
+            try:
+                g_out, u_out = li_op._run_gemm1(loc, w13_groups, sp, si)
+                out = _gather_rs_tail(li_op, g_out, u_out, sp, si, tw, w2_l)
+                torch.cuda.synchronize()
+            except Exception as exc:  # noqa: BLE001
+                dist.barrier()
+                p0(f"[iter {it}] ERROR {type(exc).__name__}: {exc}")
+                break
+        else:
+            dist.barrier()
+            p0(f"[ OK  ] all {probe_layers} iters completed, out="
+               f"{tuple(out.shape)}")
+        p0("=" * 100)
+        p0("If this froze at some [iter K], the interleave accumulates state "
+           "that deadlocks (hypothesis 1: heap/barrier). If it completed but "
+           "serving still hangs, the trigger is the attention/prepare_attn "
+           "collectives BETWEEN the MoE ops, not the MoE ops alone.")
         dist.barrier()
         dist.destroy_process_group()
         return 0
