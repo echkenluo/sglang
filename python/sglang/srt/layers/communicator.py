@@ -777,10 +777,19 @@ class LayerCommunicator:
                 get_attn_tp_context().set_mlp_inputs(mlp_inputs)
             return hidden_states, residual
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
-            hidden_states, residual = self._tp_reduce_scatter(
-                hidden_states,
-                residual,
-            )
+            if (
+                residual is not None
+                and hidden_states.shape[0] == residual.shape[0]
+                and hidden_states.shape[0] > 0
+            ):
+                # A fused GemmRS o_proj already produced the scattered-reduced
+                # shard (rows match the scattered residual); skip the RS.
+                pass
+            else:
+                hidden_states, residual = self._tp_reduce_scatter(
+                    hidden_states,
+                    residual,
+                )
             if hidden_states.shape[0] == 0:
                 residual = hidden_states
             else:

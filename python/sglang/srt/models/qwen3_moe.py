@@ -18,6 +18,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
@@ -104,6 +105,9 @@ Qwen3MoeConfig = None
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
+
+# Flux fused AG-GEMM/GemmRS on the attention projections (MoE FFN untouched).
+_FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -503,8 +507,15 @@ class Qwen3MoeAttention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+            fuse_ag_gemm=_FLUX_FUSE,
         )
 
+        # Under the scattered residual flow the last layer keeps full rows
+        # (communicator takes the all-reduce branch), so no fused RS there.
+        self._flux_last_layer = (
+            config is not None
+            and layer_id == getattr(config, "num_hidden_layers", -1) - 1
+        )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -514,6 +525,10 @@ class Qwen3MoeAttention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
+            fuse_gemm_rs=(_FLUX_FUSE and not (
+                config is not None
+                and layer_id == getattr(config, "num_hidden_layers", -1) - 1
+            )),
         )
 
         self.rotary_emb = get_rope(
@@ -606,8 +621,20 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        hidden_states = get_attn_tp_context().fetch_qkv_latent()
-        qkv, _ = self.qkv_proj(hidden_states)
+        ctx = get_attn_tp_context()
+        if (
+            forward_batch.useFlux
+            and ctx.input_scattered
+            and getattr(self.qkv_proj, "fuse_ag_gemm", False)
+            and ctx.attn_inputs_ is not None
+        ):
+            # AGCook consumes the pre-gather scattered shard; the fused
+            # kernel performs the all-gather inside the GEMM.
+            hidden_states = ctx.attn_inputs_.hidden_states_local
+            qkv, _ = self.qkv_proj(hidden_states, useFlux=True)
+        else:
+            hidden_states = ctx.fetch_qkv_latent()
+            qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
@@ -722,7 +749,16 @@ class Qwen3MoeAttention(nn.Module):
         fo_out = fo_overlap.maybe_o_proj(attn_output, self.o_proj.weight)
         if fo_out is not None:
             return fo_out
-        output, _ = self.o_proj(attn_output)
+        if (
+            fb.useFlux
+            and get_attn_tp_context().input_scattered
+            and getattr(self.o_proj, "fuse_gemm_rs", False)
+        ):
+            # Fused GEMM+reduce-scatter: output is the scattered-reduced
+            # shard; prepare_mlp detects the row count and skips its RS.
+            output, _ = self.o_proj(attn_output, useFlux=True)
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward(
