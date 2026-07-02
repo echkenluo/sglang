@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -54,7 +55,11 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.flux_moe import try_flux_moe_forward
+from sglang.srt.layers.moe.flux_moe import (
+    _GATE_LOCAL,
+    gather_local_routing,
+    try_flux_moe_forward,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -332,31 +337,74 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        ctx = get_attn_tp_context()
         last_layer = (self.layer_id == self.config.num_hidden_layers - 1)
-        hidden_states = get_attn_tp_context().fetch_mlp_latent(last_layer=last_layer)
 
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-
-        final_hidden_states = None
-        if _FLUX_MOE and not last_layer:
-            # M3: GEMM1 consumes the pre-gather scattered shard via flux
-            # AGScatter (token all-gather fused into the grouped GEMM).
-            # NOTE: the gate above still ran on the gathered tokens from
-            # fetch_mlp_latent, so that AG still happens; removing it
-            # (all-gather only topk metadata) is a later micro-opt.
-            # Returns (num_tokens, hidden) TP-partial sums (torch tail) or
-            # (num_tokens/tp, hidden) scattered-reduced rows (gather_rs
-            # tail), or None to fall back to the normal experts path.
-            final_hidden_states = try_flux_moe_forward(
-                self, hidden_states, topk_output
+        # Gate-on-local (flux MoE): the router gate is a pure per-token function
+        # with REPLICATED weights, so each rank routes its own scattered tokens
+        # WITHOUT gathering; we then all-gather only the tiny routing metadata
+        # and let AGScatter's internal gather be the ONLY token all-gather. This
+        # skips fetch_mlp_latent's full-hidden all-gather entirely (which
+        # slice-1 redundantly paid on top of AGScatter's internal gather).
+        gate_local = (
+            _FLUX_MOE
+            and _GATE_LOCAL
+            and not last_layer
+            and ctx.input_scattered
+            and ctx.mlp_inputs_ is not None
+        )
+        if gate_local:
+            local_shard = ctx.mlp_inputs_.hidden_states_local
+            hidden_dim = local_shard.shape[-1]
+            tp_size = get_tensor_model_parallel_world_size()
+            # Route the LOCAL tokens (identical to routing them post-gather:
+            # per-token, replicated gate), then all-gather the metadata.
+            router_logits_local, _ = self.gate(local_shard.view(-1, hidden_dim))
+            topk_local = self.topk(local_shard, router_logits_local)
+            ids_g, w_g = gather_local_routing(
+                topk_local.topk_ids, topk_local.topk_weights, tp_size
             )
-        if final_hidden_states is None:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            num_tokens = local_shard.shape[0] * tp_size
+            final_hidden_states = try_flux_moe_forward(
+                self,
+                local_shard,
+                None,
+                global_routing=(ids_g, w_g),
+                global_ntokens=num_tokens,
+            )
+            if final_hidden_states is None:
+                # Gate-local cannot cleanly fall back to self.experts (it needs
+                # the gathered tokens, which we deliberately did not gather).
+                # This only happens if the flux gate rejected the batch AND w13
+                # is not freed; recover by gathering and taking the normal path.
+                hidden_states = ctx.fetch_mlp_latent(last_layer=last_layer)
+                num_tokens, hidden_dim = hidden_states.shape
+                hidden_states = hidden_states.view(-1, hidden_dim)
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+                final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            hidden_states = ctx.fetch_mlp_latent(last_layer=last_layer)
+            num_tokens, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
+
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+
+            final_hidden_states = None
+            if _FLUX_MOE and not last_layer:
+                # M3: GEMM1 consumes the pre-gather scattered shard via flux
+                # AGScatter. This branch is the GATE_LOCAL=0 A/B path: the gate
+                # ran on the gathered tokens, so the full-hidden AG still
+                # happened. Returns (num_tokens, hidden) TP-partial sums (torch
+                # tail) or (num_tokens/tp, hidden) scattered-reduced rows
+                # (gather_rs tail), or None to fall back to the experts path.
+                final_hidden_states = try_flux_moe_forward(
+                    self, hidden_states, topk_output
+                )
+            if final_hidden_states is None:
+                final_hidden_states = self.experts(hidden_states, topk_output)
 
         # Under the input-scattered (RS+AG) path, the next layer's
         # reduce-scatter over the attn-tp group already reduces the EP

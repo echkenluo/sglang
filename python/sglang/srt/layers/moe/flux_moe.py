@@ -85,6 +85,18 @@ logger = logging.getLogger(__name__)
 
 _FFN_MODE = os.environ.get("SGLANG_FLUX_MOE_FFN_MODE", "shard")
 _CONTIG_W = os.environ.get("SGLANG_FLUX_MOE_CONTIG_W", "0") == "1"
+# Gate on the SCATTERED local shard (default ON): under input_scattered each
+# rank already holds its own tokens' full hidden, and the router gate is a pure
+# per-token function with REPLICATED (not TP-sharded) weights, so routing is
+# gather-invariant -- each rank can route its own tokens with NO gather. We
+# then all-gather only the tiny routing metadata (topk_ids/topk_weights,
+# ntokens x topk) and let AGScatter's internal gather be the ONLY token
+# all-gather. This removes the redundant full-hidden fetch_mlp_latent AG that
+# slice-1 paid on top of AGScatter's internal gather (the token AG was done
+# TWICE). Set SGLANG_FLUX_MOE_GATE_LOCAL=0 to restore the fetch_mlp_latent
+# gate-then-AGScatter path for A/B.
+_GATE_LOCAL = os.environ.get("SGLANG_FLUX_MOE_GATE_LOCAL", "1") == "1"
+_GATE_LOCAL_LOGGED = False
 # Load-time weight repack (default ON): materialize contiguous per-expert
 # gate/up weight groups ONCE (lazily, on first eligible forward, cached on the
 # sparse-moe block) so AGScatter gets contiguous weights with ZERO per-forward
@@ -286,6 +298,32 @@ def _make_moe_args(flux_mod, max_ntokens, hidden, ffn_hidden, nexperts, topk, dt
             ),
             "positional",
         )
+
+
+def gather_local_routing(topk_ids_local, topk_weights_local, tp_size):
+    """All-gather per-rank (local-token) routing into GLOBAL routing.
+
+    Each rank ran the (replicated) gate on its own scattered token shard,
+    producing topk_ids/topk_weights for LOCAL tokens. AGScatter's internal
+    token gather concatenates rank shards in RANK order ([shard0; shard1;...]),
+    and all_gather_into_tensor produces exactly that rank-contiguous layout, so
+    the gathered global routing rows line up 1:1 with AGScatter's gathered
+    tokens -- identical to what the old gate-on-fetch_mlp_latent path produced.
+
+    Small comm: (local_tokens x topk) int32 + fp32, KB-scale (vs the full
+    (tokens x hidden) bf16 all-gather this replaces). Assumes every rank holds
+    the same local_tokens count (true under input_scattered: gathered rows are
+    an exact TP multiple, so local == global/tp on every rank).
+    """
+    local_tokens, topk = topk_ids_local.shape
+    global_tokens = local_tokens * tp_size
+    ids_global = topk_ids_local.new_empty((global_tokens, topk))
+    get_tp_group().all_gather_into_tensor(ids_global, topk_ids_local.contiguous())
+    w_global = topk_weights_local.new_empty((global_tokens, topk))
+    get_tp_group().all_gather_into_tensor(
+        w_global, topk_weights_local.contiguous()
+    )
+    return ids_global, w_global
 
 
 def _scatter_metadata(
@@ -1003,19 +1041,32 @@ def _flux_freed_guard(moe_block, reason):
 
 
 def try_flux_moe_forward(
-    moe_block, hidden_states: torch.Tensor, topk_output
+    moe_block,
+    hidden_states: Optional[torch.Tensor],
+    topk_output,
+    global_routing: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    global_ntokens: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     """Run the MoE FFN through flux AGScatter; None means "use the normal path".
 
     The caller (Qwen3MoeSparseMoeBlock.forward_normal) already checked
-    SGLANG_FLUX_MOE=1 and not-last-layer. ``hidden_states`` is the gathered
-    (ntokens_global, hidden) tensor the gate ran on; the flux GEMM1 instead
-    consumes the pre-gather scattered shard. Normally never raises (hard
-    failures disable the path on this block and fall back), EXCEPT once
-    SGLANG_FLUX_MOE_FREE_W13 has freed the original weights: then any would-be
-    fallback RAISES (see _flux_freed_guard), because self.experts on freed w13
-    would emit silent garbage. The free/gate decisions are env+shape driven and
-    identical on all ranks, so "never returns None" holds rank-uniformly.
+    SGLANG_FLUX_MOE=1 and not-last-layer. The flux GEMM1 consumes the pre-gather
+    scattered shard (ctx.mlp_inputs_.hidden_states_local); ``hidden_states`` is
+    used only for dtype/hidden-dim/global-count validation and the engaged log.
+
+    Routing source:
+    - gate-on-gathered (GATE_LOCAL=0): pass topk_output (computed on the
+      gathered full tokens) and the gathered ``hidden_states``.
+    - gate-on-local (GATE_LOCAL=1): pass global_routing=(topk_ids_global,
+      topk_weights_global) already all-gathered from the per-rank local gate,
+      global_ntokens, and hidden_states=the local shard (dtype/hidden proxy).
+      This avoids materializing / all-gathering the full hidden tensor.
+
+    Normally never raises (hard failures disable the path on this block and fall
+    back), EXCEPT once SGLANG_FLUX_MOE_FREE_W13 has freed the original weights:
+    then any would-be fallback RAISES (see _flux_freed_guard). The free/gate
+    decisions are env+shape driven and identical on all ranks, so "never returns
+    None" holds rank-uniformly.
     """
     if getattr(moe_block, "_flux_moe_disabled", False):
         _flux_freed_guard(moe_block, "flux path previously disabled")
@@ -1024,8 +1075,11 @@ def try_flux_moe_forward(
     from sglang.srt.layers.communicator import get_attn_tp_context
 
     ctx = get_attn_tp_context()
-    topk_ids = getattr(topk_output, "topk_ids", None)
-    topk_weights = getattr(topk_output, "topk_weights", None)
+    if global_routing is not None:
+        topk_ids, topk_weights = global_routing
+    else:
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        topk_weights = getattr(topk_output, "topk_weights", None)
     w13_weight = getattr(moe_block.experts, "w13_weight", None)
     w2_weight = getattr(moe_block.experts, "w2_weight", None)
     if (
@@ -1036,6 +1090,7 @@ def try_flux_moe_forward(
         or topk_weights is None
         or w13_weight is None
         or w2_weight is None
+        or hidden_states is None
     ):
         _flux_freed_guard(moe_block, "eligibility gate failed")
         return None
@@ -1043,6 +1098,11 @@ def try_flux_moe_forward(
     local = ctx.mlp_inputs_.hidden_states_local
     tp_size = get_tensor_model_parallel_world_size()
     hidden = hidden_states.shape[-1]
+    # Global token count: gathered rows (gate-on-gathered) or the explicit
+    # count passed by the gate-local path (hidden_states is the shard there).
+    global_tokens = (
+        global_ntokens if global_ntokens is not None else hidden_states.shape[0]
+    )
     freed = getattr(moe_block, "_flux_w13_freed", False)
     # In freed-mode w13_weight is an empty tensor; validate expert-weight shape
     # against the cached metadata instead of the freed storage.
@@ -1074,14 +1134,14 @@ def try_flux_moe_forward(
         or local.shape[0] == 0
         # The scattered shard must be exactly this rank's slice of the
         # gathered rows (also excludes the last layer, which keeps full rows).
-        or local.shape[0] * tp_size != hidden_states.shape[0]
-        or hidden_states.shape[0] > _MAX_NTOKENS
+        or local.shape[0] * tp_size != global_tokens
+        or global_tokens > _MAX_NTOKENS
         or hidden_states.dtype not in (torch.bfloat16, torch.float16)
         or local.dtype != hidden_states.dtype
         # bf16/fp16 unquantized expert weights only (excludes quantized MoE).
         or not w_ok
         or topk_ids.dim() != 2
-        or topk_ids.shape[0] != hidden_states.shape[0]
+        or topk_ids.shape[0] != global_tokens
     ):
         _flux_freed_guard(moe_block, "per-batch shape gate failed")
         return None
@@ -1142,16 +1202,18 @@ def try_flux_moe_forward(
         # w13_weight may already be the freed empty tensor here; take the
         # expert count from the repacked gate group (always valid).
         n_experts = gate_up[0].shape[0] if gate_up is not None else w13_weight.shape[0]
+        gate_path = "local-shard+meta-AG" if global_routing is not None else "gathered"
         logger.info(
             "[FLUX-MOE] engaged: layer=%s tokens=%d experts=%d topk=%d "
-            "tail=%s gemm2=%s weights=%s %s",
+            "tail=%s gemm2=%s weights=%s gate=%s %s",
             getattr(moe_block, "layer_id", "?"),
-            hidden_states.shape[0],
+            global_tokens,
             n_experts,
             topk_ids.shape[1],
             _TAIL_MODE,
             gemm2,
             weights,
+            gate_path,
             op.ctor_desc,
         )
     return out

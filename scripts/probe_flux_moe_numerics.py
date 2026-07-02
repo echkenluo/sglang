@@ -42,6 +42,11 @@ Stages reported (max_abs / mean_abs / cosine, worst across ranks):
         contiguous gate/up path vs the per-forward-slice path -- must be
         BIT-IDENTICAL (max_abs == 0), since the repack is the same
         .contiguous() done once at load instead of every forward.
+  (xii) gate-local routing (SGLANG_FLUX_MOE_GATE_LOCAL): routing computed on
+        each rank's SCATTERED shard + metadata-all-gathered vs routing on the
+        gathered full tokens -- topk_ids / splits / scatter_index must be
+        BIT-IDENTICAL (the gate is a replicated per-token fn, so routing is
+        gather-invariant; this also validates the metadata-AG row order).
 Both ranks hold IDENTICAL weight shards, so GatherRS's cross-rank reduction
 doubles the single-shard partial: the scattered references are
 (2 * reference).chunk(TP)[rank]. A missing or rank-misordered reduction is
@@ -57,6 +62,7 @@ Verdict: the first stage exceeding 3x the bf16 noise floor, mapped to
   (c) neither: genuine mixed-precision accumulation difference (quantified)
   (d) batched grouped GEMM2 diverges from the loop (perf path unsafe)
   (e) load-time repack changes output (must be bit-identical)
+  (f) gate-local routing differs from gate-gathered (must be bit-identical)
 Exit code is nonzero iff any stage exceeds its threshold (or the metadata
 oracle fails), so a wrapper can sentinel it. Rank 0 prints; metrics are
 all-reduced so the exit code is rank-consistent.
@@ -161,6 +167,7 @@ def main() -> int:
         _moe_tail,
         _scatter_metadata,
         flux_moe_compute,
+        gather_local_routing,
     )
 
     def _combine(down, scatter_index, topk_weights_global):
@@ -368,6 +375,33 @@ def main() -> int:
 
     gate_w = w13[:, :INTER_SHARD, :]
     up_w = w13[:, INTER_SHARD:, :]
+
+    # ---- gate-local routing identity (SGLANG_FLUX_MOE_GATE_LOCAL) -----------
+    # Prove that routing computed on each rank's SCATTERED shard, then metadata-
+    # all-gathered, is BIT-IDENTICAL to routing computed on the gathered full
+    # tokens. Uses a real per-token gate (replicated matrix) so the comparison
+    # is meaningful: gate_router(x) = softmax(x @ Wg.T) -> renorm topk.
+    Wg = (torch.randn(N_EXPERTS, HIDDEN, generator=g) * HIDDEN**-0.5).to(dev, DTYPE)
+
+    def _route(h):
+        pr = torch.softmax((h @ Wg.t()).float(), dim=-1)
+        tw, tid = torch.topk(pr, TOPK, dim=-1)
+        tw = (tw / tw.sum(-1, keepdim=True)).contiguous()
+        return tid.to(torch.int32).contiguous(), tw.contiguous()
+
+    # gathered-gate: route all tokens at once.
+    ids_gathered, w_gathered = _route(x_full)
+    # local-gate + metadata-AG: route this rank's shard, all-gather metadata.
+    ids_loc, w_loc = _route(local)
+    ids_ag, w_ag = gather_local_routing(ids_loc, w_loc, TP)
+    # scatter metadata from each; splits/scatter_index must match exactly.
+    sp_gathered, si_gathered, seg_gathered = _scatter_metadata(ids_gathered, N_EXPERTS)
+    sp_ag, si_ag, seg_ag = _scatter_metadata(ids_ag, N_EXPERTS)
+    m_ids = int((ids_ag != ids_gathered).sum().item())
+    m_w = (w_ag - w_gathered).abs().max().item()
+    m_splits = int((sp_ag != sp_gathered).sum().item())
+    m_scatter = int((si_ag != si_gathered).sum().item())
+    gate_local_bad = bool(m_ids or m_splits or m_scatter or m_w > 0.0)
 
     # ---- Path A: fp32 reference (truth) ------------------------------------
     xs32 = x_full.float()[token_of_row]
@@ -577,7 +611,8 @@ def main() -> int:
         f"gather_rs_min_tokens={flux_moe._GATHER_RS_MIN_TOKENS} "
         f"gemm2_mode={flux_moe._GEMM2_MODE} "
         f"has_grouped_mm={flux_moe._HAS_GROUPED_MM} "
-        f"load_repack={flux_moe._LOAD_REPACK}"
+        f"load_repack={flux_moe._LOAD_REPACK} "
+        f"gate_local={flux_moe._GATE_LOCAL}"
     )
     p0(f"flux op: {op.ctor_desc}")
     p0(f"flux gather_rs op: {op._gather_rs.ctor_desc}")
@@ -603,6 +638,11 @@ def main() -> int:
         p0(f"(viii-x) grouped GEMM2: SKIPPED ({why}) -- serving auto mode "
            "would use the loop backend")
     p0(fmt("(xi)  load-repack path vs per-forward-slice (must be 0)", m_repack))
+    p0(
+        f"{'(xii) gate-local vs gate-gathered routing (must be 0)':<50s} "
+        f"ids_mismatch={m_ids} splits_mismatch={m_splits} "
+        f"scatter_mismatch={m_scatter} w_max_abs={m_w:.3e}"
+    )
     p0("-" * 100)
 
     if oracle_fail:
@@ -654,6 +694,15 @@ def main() -> int:
             f"the prebuilt gate/up is the same .contiguous() done once). Bug "
             f"in _get_prebuilt_gate_up slicing/caching."
         )
+    elif gate_local_bad:
+        verdict = (
+            f"VERDICT: (f) gate-local routing DIFFERS from gate-gathered — "
+            f"ids_mismatch={m_ids} splits_mismatch={m_splits} "
+            f"scatter_mismatch={m_scatter} w_max_abs={m_w:.3e} (must be 0). "
+            f"Local-shard routing must equal full-token routing; check the "
+            f"gate is replicated + the metadata-AG row order. Serving must use "
+            f"SGLANG_FLUX_MOE_GATE_LOCAL=0 until fixed."
+        )
     else:
         ratio = m_fin32["mean_abs"] / (floor_fin["mean_abs"] + EPS)
         ratio_rs = m_grs32["mean_abs"] / (floor_rs["mean_abs"] + EPS)
@@ -684,6 +733,7 @@ def main() -> int:
         or exceed_fin
         or exceed_grp
         or exceed_repack
+        or gate_local_bad
     )
     dist.barrier()
     dist.destroy_process_group()
