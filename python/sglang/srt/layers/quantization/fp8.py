@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -103,6 +104,7 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+_FLUX_FP8 = os.environ.get("SGLANG_FLUX_FP8", "0") == "1"
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
@@ -435,6 +437,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)
+
+        # SGLANG_FLUX_FP8: layer was constructed with a flux fuse intent
+        # (see LinearBase.__init__). Record a lazy-construction placeholder
+        # for the fp8 flux op; the actual op is built and used in a later
+        # task (forward-path wiring is out of scope here).
+        if _FLUX_FP8 and getattr(layer, "_flux_fp8_fuse", None):
+            layer._flux_fp8_op = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -37,7 +38,14 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    print_warning_once,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -49,6 +57,7 @@ _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
+_FLUX_FP8 = os.environ.get("SGLANG_FLUX_FP8", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -175,14 +184,27 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
-        if fuse_gemm_rs:
-            assert (quant_config is None)
+
+        # Quantized checkpoint requesting flux fusion (fuse_gemm_rs/fuse_ag_gemm,
+        # driven by SGLANG_USE_FUSED_OVERLAP): unlike the quant_config is None
+        # case below, we never force an unquant quant_method here. Either record
+        # the fuse intent for SGLANG_FLUX_FP8 to pick up, or warn once and fall
+        # back to the standard quantized quant_method chosen below.
+        if quant_config is not None and (fuse_gemm_rs or fuse_ag_gemm):
+            if _FLUX_FP8:
+                self._flux_fp8_fuse = "gemm_rs" if fuse_gemm_rs else "ag_gemm"
+            else:
+                print_warning_once(
+                    "flux fusion requested but SGLANG_FLUX_FP8 not set; "
+                    "falling back to standard quantized path"
+                )
+
+        if fuse_gemm_rs and quant_config is None:
             from sglang.srt.layers.quantization.unquant import GemmRS
 
             self.quant_method: Optional[QuantizeMethodBase] = GemmRS()
             self.fuse_gemm_rs = True
-        elif fuse_ag_gemm:
-            assert (quant_config is None)
+        elif fuse_ag_gemm and quant_config is None:
             from sglang.srt.layers.quantization.unquant import AGCook
 
             self.quant_method = AGCook()
