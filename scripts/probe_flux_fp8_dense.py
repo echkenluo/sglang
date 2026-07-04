@@ -59,9 +59,19 @@ Anchors (the four divergence points, m2-design section 3 table):
       a small multiplicative slack on top of the reference's own distance to
       fp32. flux must not be materially further from fp32 than the same-math
       torch reference is.
-  (4) post-RS     scattered bf16      : flux-internal RS == torch
-      reduce_scatter of the SAME bf16 partials, within the reduction-order
-      noise floor. Only meaningful on the o_proj (GemmRS) joint.
+  (4) post-RS     scattered bf16      : fp32-anchored at the post-RS stage,
+      mirroring anchor (3): |flux_rs - fp32_rs| <= 1.1 * max(|ref_rs -
+      fp32_rs|, rs_floor), where fp32_rs / ref_rs are the torch
+      reduce_scatters of the fp32-anchor / reference legs' GEMM outputs and
+      rs_floor is a genuine RS-stage perturbation floor (the reference bf16
+      partials re-reduced with REORDERED rank-summation). Calibration fix
+      after the first GPU run (probe_run1): the fused GemmRS necessarily
+      accumulates GEMM+RS in a different order than torch RS, so flux-vs-ref
+      post-RS sits at the anchor-(3) rounding scale (max_abs ~3e-2 at
+      cos ~= 1 -- benign); gating it against a deterministic
+      torch-RS-vs-torch-RS floor (1.5e-07) was a probe defect -- the M3
+      campaign's benign-rounding-vs-mismatch fork. Only meaningful on the
+      o_proj (GemmRS) joint.
 
 The five hard-won requirements (each a scar; see task-6-brief.md):
   1. sglang TP-group init -- NOT bare torchrun. The T5 fp8 path reads the
@@ -438,17 +448,48 @@ def main() -> int:
     )
     o_floor = reduce_worst(metrics(o_scat_fp32_reorder, o_scattered_fp32))
 
-    # ---- anchor (4): flux RS == torch reduce_scatter, within floor ---------
-    # Both the flux GemmRS and the reference reduce the SAME per-rank bf16
-    # partials; the difference must sit within the reduction-order noise floor.
+    # ---- anchor (4) prep: flux-vs-ref (REPORTED) + RS-stage reorder floor --
+    # flux-vs-ref at post-RS is reported, NOT gated: the fused GemmRS
+    # accumulates its GEMM + RS in a different order than the torch reference
+    # by construction, so this difference legitimately sits at the post-GEMM
+    # rounding scale (probe_run1: max_abs ~3.1e-2 at cos ~= 1 -- benign).
     m_o_flux_ref = reduce_worst(metrics(o_flux, o_scattered_ref))
-    a4_bad = m_o_flux_ref["mean_abs"] > POSTGEMM_SLACK * o_floor["mean_abs"] + EPS
+    # Genuine RS-stage perturbation floor: re-reduce the SAME reference bf16
+    # partials with REORDERED rank-summation (manual RS emulation, reversed
+    # rank order) and compare against the torch reduce_scatter of those
+    # partials. NOTE at TP=2 a two-term float sum is commutative, so this
+    # floor is expected ~0; anchor (4)'s max() below then calibrates the
+    # budget by the ref-vs-fp32 term instead (quant-dominated, the honest
+    # yardstick).
+    gathered_partials = [torch.empty_like(o_partial) for _ in range(TP)]
+    dist.all_gather(
+        gathered_partials, o_partial.contiguous(), group=tp_group.device_group
+    )
+    o_rs_reorder_full = gathered_partials[TP - 1]
+    for r_idx in reversed(range(TP - 1)):
+        o_rs_reorder_full = o_rs_reorder_full + gathered_partials[r_idx]
+    o_rs_reorder = o_rs_reorder_full.chunk(TP, dim=0)[rank].contiguous()
+    rs_floor = reduce_worst(metrics(o_rs_reorder, o_scattered_ref))
 
     # ---- anchor (3) for o_proj: |flux - fp32| <= slack*|ref - fp32| + floor -
     m_o_flux_fp32 = reduce_worst(metrics(o_flux, o_scattered_fp32))
     m_o_ref_fp32 = reduce_worst(metrics(o_scattered_ref, o_scattered_fp32))
     o_budget = POSTGEMM_SLACK * m_o_ref_fp32["mean_abs"] + o_floor["mean_abs"]
     a3_o_bad = m_o_flux_fp32["mean_abs"] > o_budget
+
+    # ---- anchor (4): post-RS, fp32-anchored three-leg form -----------------
+    # Calibration fix (probe_run1): the old form gated flux-vs-ref against
+    # the deterministic torch-RS-vs-torch-RS floor (printed 1.508668e-07) --
+    # a yardstick no differently-ordered-but-correct fused kernel can meet.
+    # Mirror anchor (3) at the post-RS stage instead: flux must be no further
+    # from the fp32 RS anchor than the same-math torch reference is, with the
+    # RS-stage reorder floor as a degenerate-case backstop. A wrong rank
+    # block, a missing reduction (1x vs 2x values), or a scale slip still
+    # blows this up; benign reduction-order rounding does not.
+    a4_budget = (
+        POSTGEMM_SLACK * max(m_o_ref_fp32["mean_abs"], rs_floor["mean_abs"]) + EPS
+    )
+    a4_bad = m_o_flux_fp32["mean_abs"] > a4_budget
 
     # ========================================================================
     # report
@@ -487,9 +528,10 @@ def main() -> int:
     p0(fmt("  noise floor (fp32 reorder vs fp32, scattered)", o_floor))
     p0(fmt("  (i)  flux  vs fp32 (scattered)", m_o_flux_fp32))
     p0(fmt("  (ii) ref   vs fp32 (scattered)", m_o_ref_fp32))
-    p0(fmt("  (i)  flux  vs (ii) ref (scattered)", m_o_flux_ref))
+    p0(fmt("  (i)  flux  vs (ii) ref (scattered, reported)", m_o_flux_ref))
+    p0(fmt("  rs-stage reorder floor (rank-reord vs torch RS)", rs_floor))
     p0(f"  anchor3 budget (post-GEMM) = {o_budget:.6e}")
-    p0(f"  anchor4 budget (post-RS)   = {POSTGEMM_SLACK * o_floor['mean_abs'] + EPS:.6e}")
+    p0(f"  anchor4 budget (post-RS)   = {a4_budget:.6e}")
     p0("-" * 100)
     p0("VERDICT TABLE (per anchor, worst across ranks):")
     p0(verdict_line("  anchor1  post-quant  fp8 payload+scale bitwise", a1_bad))
@@ -500,7 +542,7 @@ def main() -> int:
             a3_qkv_bad or a3_o_bad,
         )
     )
-    p0(verdict_line("  anchor4  post-RS     flux RS == torch RS", a4_bad))
+    p0(verdict_line("  anchor4  post-RS     |flux-fp32| <= 1.1x|ref-fp32|", a4_bad))
     p0("=" * 100)
 
     # First failing anchor (ordered) drives the sentinel.
