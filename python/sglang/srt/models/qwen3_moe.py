@@ -698,11 +698,17 @@ class Qwen3MoeAttention(nn.Module):
         if (
             forward_batch.useFlux
             and ctx.input_scattered
-            and getattr(self.qkv_proj, "fuse_ag_gemm", False)
+            and (
+                getattr(self.qkv_proj, "fuse_ag_gemm", False)
+                or getattr(self.qkv_proj, "_flux_fp8_fuse", None) == "ag_gemm"
+            )
             and ctx.attn_inputs_ is not None
         ):
-            # AGCook consumes the pre-gather scattered shard; the fused
-            # kernel performs the all-gather inside the GEMM.
+            # AGCook (bf16) / the fp8 flux AG path consumes the pre-gather
+            # scattered shard: the fused kernel performs the all-gather
+            # inside the GEMM, and the fp8 sticky fallback all-gathers
+            # explicitly before its native GEMM -- either way the rows come
+            # back full-M (same contract as the dense qwen3 wiring).
             hidden_states = ctx.attn_inputs_.hidden_states_local
             qkv, _ = self.qkv_proj(hidden_states, useFlux=True)
         else:
@@ -825,10 +831,17 @@ class Qwen3MoeAttention(nn.Module):
         if (
             fb.useFlux
             and get_attn_tp_context().input_scattered
-            and getattr(self.o_proj, "fuse_gemm_rs", False)
+            and (
+                getattr(self.o_proj, "fuse_gemm_rs", False)
+                or getattr(self.o_proj, "_flux_fp8_fuse", None) == "gemm_rs"
+            )
         ):
-            # Fused GEMM+reduce-scatter: output is the scattered-reduced
-            # shard; prepare_mlp detects the row count and skips its RS.
+            # Fused GEMM+reduce-scatter (bf16 GemmRS or the fp8 flux path;
+            # the fp8 sticky fallback reduce-scatters explicitly): output is
+            # the scattered-reduced shard; prepare_mlp detects the row count
+            # and skips its RS. The last layer never carries either fuse
+            # marker (excluded at construction) and so keeps full rows for
+            # the all-reduce branch.
             output, _ = self.o_proj(attn_output, useFlux=True)
         else:
             output, _ = self.o_proj(attn_output)
