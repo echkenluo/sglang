@@ -70,6 +70,31 @@ _TRUTHY = ("1", "true", "yes", "on")
 # GroupCoordinator) is dropped -- see WORKSPACE LIFETIME in the header.
 _KEEPALIVE: List[Any] = []
 
+_FUSION_FLAG_CACHE: Optional[bool] = None
+
+
+def _tokenweave_fusion_enabled() -> bool:
+    """Cheap, cached read of SGLANG_ENABLE_TOKENWEAVE_FUSION.
+
+    The single flag helper the upstream call-site gates import
+    (layers/communicator.py and layers/layernorm.py) so the generic fused
+    dispatcher becomes reachable on CUDA when -- and only when -- the flag is
+    on. Deliberately module-level and torch-op free: importing this module
+    never touches the kernel dir (the launcher/extension load happens inside
+    TokenWeaveFusedCommunicator.__init__ only).
+
+    The value is latched on first call. That matches the backend itself: the
+    communicator is constructed (or not) from the same env var at engine
+    init, so flipping the env after process start cannot enable or disable
+    the backend anyway -- the only supported state is the process-start one.
+    """
+    global _FUSION_FLAG_CACHE
+    if _FUSION_FLAG_CACHE is None:
+        _FUSION_FLAG_CACHE = (
+            os.environ.get("SGLANG_ENABLE_TOKENWEAVE_FUSION", "0") == "1"
+        )
+    return _FUSION_FLAG_CACHE
+
 
 class TokenWeaveFusedCommunicator:
     """Fused multimem AllReduce+RMSNorm over one persistent symm workspace.

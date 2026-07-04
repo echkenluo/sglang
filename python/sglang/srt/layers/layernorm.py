@@ -103,6 +103,9 @@ def _forward_with_allreduce_fusion(
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
+        from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+            _tokenweave_fusion_enabled,
+        )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
@@ -126,6 +129,24 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result is not None:
                     return fused_result
+            elif _tokenweave_fusion_enabled():
+                # TokenWeave (ladder4 stage A): on CUDA the generic fused
+                # dispatcher is otherwise unreachable (this fork routes to
+                # flashinfer); with the flag on it takes this site over
+                # (mutually exclusive with flashinfer fusion by design). On a
+                # None miss (should_engage guard / sticky disable) reproduce
+                # the call site's pre-patch not-handled behavior -- explicit
+                # all-reduce + norm -- instead of falling into the flashinfer
+                # call: its gate (apply_flashinfer_allreduce_fusion) was not
+                # consulted when tokenweave opened the outer gate, and its
+                # max_token_num assert is not None-safe for larger batches.
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, weight, norm_module.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
             else:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,

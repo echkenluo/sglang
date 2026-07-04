@@ -34,6 +34,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+    _tokenweave_fusion_enabled,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
@@ -1112,6 +1115,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                # TokenWeave (ladder4 stage A): route into the layernorm's
+                # fused path so the generic dispatcher gets a shot; on a miss
+                # the layernorm fork reproduces the not-handled branch below.
+                or _tokenweave_fusion_enabled()
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
