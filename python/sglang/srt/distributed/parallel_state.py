@@ -437,6 +437,10 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
                 device_group=self.device_group,
+                # For the residual all-gather inside graph capture, where raw
+                # torch.distributed collectives are eager-only (see the
+                # graph_capture table below).
+                pynccl_comm=self.pynccl_comm,
             )
 
         # Create communicator for other hardware backends

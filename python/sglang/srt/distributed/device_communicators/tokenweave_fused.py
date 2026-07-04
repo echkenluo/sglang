@@ -22,8 +22,45 @@
 # 2026-07-03 first-H20-run crash. Therefore ONE symm workspace is allocated
 # per process (lazily, on the first eligible call, because hidden_size is
 # unknown at engine init), kept alive in the module-global _KEEPALIVE list,
-# and never freed; process exit reclaims it. The fixed-address, no-per-call-
-# allocation design also keeps the door open for CUDA-graph capture (stage B).
+# and never freed; process exit reclaims it.
+#
+# STAGE B: CUDA-GRAPH COMPATIBILITY (V2 probe green on the H20: multimem
+# kernel + CAS handshake + all-gather all record/replay correctly, and the
+# graph swallows ~53% of the eager call). What this file guarantees:
+#   1. PRE-CAPTURE INIT: workspace rendezvous / extension build / hidden lock
+#      happen on the FIRST ENGAGED CALL, and sglang's graph runner runs two
+#      eager, TP-barrier-synchronized warmup forwards per batch size BEFORE
+#      recording (cuda_graph_runner.capture_one_batch_size: the
+#      `for _ in range(2): synchronize(); tp_group.barrier(); run_once()`
+#      loop precedes _capture_graph). The first warmup therefore performs the
+#      lazy init eagerly and in rank lockstep. Belt: _ensure_workspace
+#      declines (returns False -> None -> unfused fallback; rank-uniform
+#      because capture is lockstep) if it is ever reached with stream capture
+#      in progress -- rendezvous/allocation must never be recorded.
+#   2. FROZEN ENGAGEMENT: every should_engage guard reads static per-graph
+#      facts (tensor shapes/dtypes are fixed by the captured batch size --
+#      tokens = bs * num_tokens_per_bs is a capture-time constant; env values
+#      are latched at init; the disabled bit is frozen after init). The
+#      verdict at capture time equals the verdict at every replay; no guard
+#      reads tensor DATA.
+#   3. ALLOC-FREE, SIDE-EFFECT-FREE HOT PATH: between should_engage and
+#      return, the fused call performs only views/slices, in-place
+#      copy_/zero_ on preallocated buffers, the kernel launch, and a
+#      preallocated-buffer all-gather. No torch.empty/clone, no python state
+#      mutation (the one-time engaged log lives in workspace init, which
+#      never runs under capture).
+#   4. RANK-UNIFORM INIT VERDICT: workspace init all-reduces its success
+#      across ranks (phase 1 local allocation, phase 2 collective rendezvous
+#      + capability checks), so an init failure can never leave the sticky
+#      disable half-set across ranks. Post-init per-call failures are
+#      rank-uniform by construction (all guards are shape-static).
+#   5. COLLECTIVE BACKEND FOR THE RESIDUAL AG: per sglang's graph-mode table
+#      (parallel_state.GroupCoordinator.graph_capture: torch.distributed is
+#      eager-only, pynccl is the in-graph path), the all-gather uses pynccl
+#      when it is enabled -- graph_capture enables it around BOTH the eager
+#      warmups and the recording, so the warmups exercise exactly the branch
+#      the graph records -- and torch.distributed otherwise. Same idiom as
+#      GroupCoordinator._all_reduce_in_place.
 
 import importlib.util
 import logging
@@ -112,6 +149,11 @@ class TokenWeaveFusedCommunicator:
         residual tensors are mutated in place and returned, so the call site
         cannot tell the backends apart. Returns None (after sticky-disabling)
         on the first runtime failure so the caller falls back.
+
+    Stage B: the engaged call path is CUDA-graph capturable end to end --
+    see "STAGE B: CUDA-GRAPH COMPATIBILITY" in the module header for the
+    five guarantees (pre-capture init, frozen engagement, alloc-free hot
+    path, rank-uniform init verdict, graph-safe collective backend).
     """
 
     def __init__(
@@ -119,6 +161,7 @@ class TokenWeaveFusedCommunicator:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         device_group: Optional[ProcessGroup] = None,
+        pynccl_comm: Optional[Any] = None,
     ):
         """
         Args:
@@ -130,6 +173,11 @@ class TokenWeaveFusedCommunicator:
                 stage-A residual shard all-gather (the kernel writes the
                 pre-norm sum only into this rank's token shard; non-token-
                 split callers need the full replicated residual stream).
+            pynccl_comm: The GroupCoordinator's PyNcclCommunicator, used for
+                the residual all-gather whenever it is enabled -- i.e. inside
+                graph_capture (warmups and recording), where raw
+                torch.distributed collectives are off-limits per sglang's
+                graph-mode table (stage B guarantee 5 in the module header).
         """
         self.disabled = True
 
@@ -156,6 +204,7 @@ class TokenWeaveFusedCommunicator:
         self.device = device
         self.group = group
         self.device_group = device_group
+        self.pynccl_comm = pynccl_comm
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
 
@@ -206,6 +255,8 @@ class TokenWeaveFusedCommunicator:
 
         # hidden_size is unknown at engine init; the workspace is allocated
         # once, on the first eligible call (_ensure_workspace), never freed.
+        # With CUDA graphs, that first call is one of the runner's eager
+        # pre-capture warmup forwards (stage B guarantee 1).
         self.hidden: Optional[int] = None
         self._region_buf: Optional[torch.Tensor] = None  # symm-mem, flat
         self._handle: Optional[Any] = None
@@ -213,7 +264,6 @@ class TokenWeaveFusedCommunicator:
         self._signal_pads: int = 0
         self._res_shard: Optional[torch.Tensor] = None
         self._res_stage: Optional[torch.Tensor] = None
-        self._engaged_logged = False
 
         self.disabled = False
         logger.info(
@@ -327,6 +377,10 @@ class TokenWeaveFusedCommunicator:
         the caller falls back to the unfused path (same fail-safe shape as
         fp8.py's _FLUX_FP8_DISABLED)."""
         try:
+            if not self._ensure_workspace(input_.shape[-1]):
+                # Not ready (mid-capture first call, or uniformly disabled at
+                # init) -- rank-uniform None, caller runs the unfused path.
+                return None
             return self._fused_ar_rmsnorm_impl(input_, residual, weight, eps)
         except Exception as exc:  # noqa: BLE001 -- sticky fail-safe
             # NOTE: a mid-forward failure is only collective-safe if it
@@ -349,8 +403,16 @@ class TokenWeaveFusedCommunicator:
         weight: torch.Tensor,
         eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # CAPTURE AUDIT (stage B guarantee 3): everything below is legal
+        # inside CUDA-graph recording -- python-side arithmetic/views only,
+        # in-place device ops on PREALLOCATED buffers (workspace region,
+        # _res_shard, _res_stage -- all created in _ensure_workspace, which
+        # cannot run here: the caller already guaranteed readiness), one
+        # kernel launch with baked scalar args, one preallocated-buffer
+        # all-gather. No torch.empty/clone, no host sync/barrier, no logging,
+        # no attribute writes. Every branch (padding, CTA policy) depends
+        # only on shapes, which are capture-time constants per graph.
         num_tokens, hidden = input_.shape
-        self._ensure_workspace(hidden)
 
         world_size = self.world_size
         # Pad the row count up to a multiple of world_size for the kernel's
@@ -409,8 +471,21 @@ class TokenWeaveFusedCommunicator:
         # rank needs the full replicated residual stream, so gather the
         # shards (rank order == row order by construction). This all-gather
         # is a stage-A cost the token-split stage C removes.
+        #
+        # Backend per sglang's graph-mode table (stage B guarantee 5, same
+        # idiom as GroupCoordinator._all_reduce_in_place): pynccl whenever it
+        # is enabled -- graph_capture flips it on around both the eager
+        # warmups and the recording, so the captured branch is the warmed
+        # branch -- raw torch.distributed otherwise (plain eager serving,
+        # gate-A1 probe). Both buffers preallocated either way.
         res_stage = self._res_stage[:m_pad]
-        dist.all_gather_into_tensor(res_stage, res_shard, group=self.device_group)
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(res_stage, res_shard)
+        else:
+            dist.all_gather_into_tensor(
+                res_stage, res_shard, group=self.device_group
+            )
 
         # Copy out of the persistent workspace (it is reused by the very next
         # fused call while these outputs are still live) with the SAME
@@ -419,71 +494,135 @@ class TokenWeaveFusedCommunicator:
         # cannot tell the backends apart. No per-call allocation.
         residual.copy_(res_stage[:num_tokens])
         input_.copy_(region[:num_tokens])
-
-        if not self._engaged_logged:
-            self._engaged_logged = True
-            logger.info(
-                "[TOKENWEAVE] engaged: tokens=%d hidden=%d world_size=%d "
-                "max_ctas=%d",
-                num_tokens,
-                hidden,
-                world_size,
-                max_ctas,
-            )
         return input_, residual
 
-    def _ensure_workspace(self, hidden: int) -> None:
+    def _agree_all_ranks(self, local_ok: bool) -> bool:
+        """Rank-uniform verdict on an init step (stage B guarantee 4). Eager
+        only -- never reached from inside a capture (_ensure_workspace's
+        capture guard precedes every use). Raw torch.distributed is fine
+        here: sglang's graph-mode restriction applies to RECORDED
+        collectives, not eager ones."""
+        flag = torch.tensor(
+            [0 if local_ok else 1], dtype=torch.int32, device=self.device
+        )
+        dist.all_reduce(flag, group=self.device_group)
+        return int(flag.item()) == 0
+
+    def _ensure_workspace(self, hidden: int) -> bool:
         """Allocate + rendezvous the symm workspace once, on the first
-        eligible call (collective: every rank reaches here together because
-        should_engage is rank-uniform). Never freed -- see WORKSPACE LIFETIME
-        in the module header."""
+        eligible call; True when ready. Rank-uniform by construction: every
+        verdict (including failures) is agreed via all-reduce, so either all
+        ranks commit or all ranks disable (stage B guarantee 4). Never freed
+        -- see WORKSPACE LIFETIME in the module header. With CUDA graphs the
+        first eligible call is one of the runner's eager pre-capture warmups
+        (stage B guarantee 1); the capture guard below is the belt for any
+        path that skipped them."""
         if self._region_buf is not None:
-            return
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            # Rendezvous/allocation must never be recorded into a graph.
+            # Capture is TP-lockstep, so this decline is rank-uniform and the
+            # graph simply records the unfused fallback. Not sticky: an eager
+            # call afterwards may still initialize.
+            return False
 
-        buf = torch_symm_mem.empty(
-            self.max_tokens_pad * hidden, dtype=self.dtype, device=self.device
-        )
-        handle = torch_symm_mem.rendezvous(buf, self.group.group_name)
-        # GC trap: keep the multicast-bound allocation alive for the process
-        # lifetime even if this communicator is dropped.
-        _KEEPALIVE.append((buf, handle))
+        # Phase 1: local allocations (symm buffer + AG staging). Failures
+        # here (e.g. OOM) can be rank-local, so agree before the collective
+        # rendezvous -- a one-sided rendezvous entry would deadlock.
+        buf = None
+        err = ""
+        try:
+            buf = torch_symm_mem.empty(
+                self.max_tokens_pad * hidden, dtype=self.dtype, device=self.device
+            )
+            # Keep-alive immediately: even a not-yet-rendezvous'd symm tensor
+            # must never reach GC on a failure path (belt against the
+            # destructor trap; leaks only on the disable path, by design).
+            _KEEPALIVE.append(buf)
+            res_shard = torch.empty(
+                self.max_tokens_pad // self.world_size,
+                hidden,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            res_stage = torch.empty(
+                self.max_tokens_pad, hidden, dtype=self.dtype, device=self.device
+            )
+        except Exception as e:  # noqa: BLE001 -- folded into the verdict
+            err = f"workspace allocation failed: {e}"
+        if not self._agree_all_ranks(not err):
+            self.disabled = True
+            logger.warning(
+                "[TOKENWEAVE] disabled uniformly at workspace init: %s",
+                err or "allocation failed on another rank",
+            )
+            return False
 
-        mc_ptr = getattr(handle, "multicast_ptr", 0)
-        if not mc_ptr:
-            raise RuntimeError(
-                "symm-mem handle has multicast_ptr==0: NVLS multicast is not "
-                "available on this topology/torch build; the fused kernel "
-                "hard-requires it"
+        # Phase 2: collective rendezvous (all ranks enter together -- phase 1
+        # agreement guarantees that) + local capability checks, agreed again.
+        err = ""
+        try:
+            handle = torch_symm_mem.rendezvous(buf, self.group.group_name)
+            # GC trap: keep the multicast-bound allocation alive for the
+            # process lifetime even if this communicator is dropped.
+            _KEEPALIVE.append(handle)
+            mc_ptr = getattr(handle, "multicast_ptr", 0)
+            if not mc_ptr:
+                raise RuntimeError(
+                    "symm-mem handle has multicast_ptr==0: NVLS multicast is "
+                    "not available on this topology/torch build; the fused "
+                    "kernel hard-requires it"
+                )
+            signal_pads = getattr(handle, "signal_pad_ptrs_dev", None)
+            if signal_pads is None:
+                raise RuntimeError(
+                    "symm-mem handle lacks signal_pad_ptrs_dev on this torch "
+                    "build"
+                )
+            pad_size = getattr(handle, "signal_pad_size", None)
+            max_ctas_bound = self._max_ctas_override or 16
+            if (
+                pad_size is not None
+                and max_ctas_bound * self.world_size * 4 > pad_size
+            ):
+                raise RuntimeError(
+                    f"max_ctas {max_ctas_bound} x world_size {self.world_size} "
+                    f"needs {max_ctas_bound * self.world_size * 4}B of signal "
+                    f"pad but the handle reports {pad_size}B; lower "
+                    f"SGLANG_TOKENWEAVE_MAX_CTAS"
+                )
+        except Exception as e:  # noqa: BLE001 -- folded into the verdict
+            err = f"rendezvous/capability checks failed: {e}"
+        if not self._agree_all_ranks(not err):
+            self.disabled = True
+            logger.warning(
+                "[TOKENWEAVE] disabled uniformly at workspace init: %s",
+                err or "rendezvous/capability checks failed on another rank",
             )
-        signal_pads = getattr(handle, "signal_pad_ptrs_dev", None)
-        if signal_pads is None:
-            raise RuntimeError(
-                "symm-mem handle lacks signal_pad_ptrs_dev on this torch build"
-            )
-        pad_size = getattr(handle, "signal_pad_size", None)
-        max_ctas_bound = self._max_ctas_override or 16
-        if pad_size is not None and max_ctas_bound * self.world_size * 4 > pad_size:
-            raise RuntimeError(
-                f"max_ctas {max_ctas_bound} x world_size {self.world_size} "
-                f"needs {max_ctas_bound * self.world_size * 4}B of signal pad "
-                f"but the handle reports {pad_size}B; lower "
-                f"SGLANG_TOKENWEAVE_MAX_CTAS"
-            )
+            return False
 
-        self._res_shard = torch.empty(
-            self.max_tokens_pad // self.world_size,
-            hidden,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self._res_stage = torch.empty(
-            self.max_tokens_pad, hidden, dtype=self.dtype, device=self.device
-        )
+        self._res_shard = res_shard
+        self._res_stage = res_stage
         self._handle = handle
         self._mc_ptr = mc_ptr
         self._signal_pads = signal_pads
         self._region_buf = buf
         self.hidden = hidden
+        # One-time "engaged" evidence, deliberately OUTSIDE the hot path so
+        # nothing flips python state inside a captured region (stage B
+        # guarantee 3). This point is never under capture (guard above).
+        logger.info(
+            "[TOKENWEAVE] engaged: workspace ready (hidden=%d max_tokens=%d"
+            "(pad %d) world_size=%d rank=%d max_ctas=%s); fused path live "
+            "from here on",
+            hidden,
+            self.max_tokens,
+            self.max_tokens_pad,
+            self.world_size,
+            self.rank,
+            self._max_ctas_override if self._max_ctas_override else "auto(8/16)",
+        )
+        return True
 
     def close(self) -> None:
         # Intentionally a no-op: the symm workspace is multicast-bound and
