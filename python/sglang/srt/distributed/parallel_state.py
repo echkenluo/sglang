@@ -416,6 +416,29 @@ class GroupCoordinator:
                 device=self.device,
             )
 
+        # TokenWeave fused AR+RMSNorm backend (ladder4 stage A). Env-gated:
+        # with SGLANG_ENABLE_TOKENWEAVE_FUSION unset this stays None (no
+        # module import, no allocation, and the fused_allreduce_rmsnorm
+        # branch below is unreachable). Only the TP group dispatches
+        # fused_allreduce_rmsnorm (communication_op.py), so only "tp" builds
+        # one.
+        self.tokenweave_comm: Optional[Any] = None
+        if (
+            os.environ.get("SGLANG_ENABLE_TOKENWEAVE_FUSION", "0") == "1"
+            and group_name == "tp"
+            and self.world_size > 1
+            and self.device.type == "cuda"
+        ):
+            from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+                TokenWeaveFusedCommunicator,
+            )
+
+            self.tokenweave_comm = TokenWeaveFusedCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+            )
+
         # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -640,6 +663,21 @@ class GroupCoordinator:
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        # TokenWeave fused multimem AR+RMSNorm (ladder4 stage A, eager
+        # decode). Unreachable when SGLANG_ENABLE_TOKENWEAVE_FUSION is off
+        # (tokenweave_comm is then never constructed; should_engage's first
+        # check, the disabled bit, also folds the flag in). On engagement it
+        # returns the same (norm_out, residual_out) tuple contract as the
+        # custom_fused_ar_rms path below, or None (after sticky-disabling) so
+        # the caller falls back.
+        tokenweave_comm = self.tokenweave_comm
+        if tokenweave_comm is not None and tokenweave_comm.should_engage(
+            input_, residual_inp_, weight_
+        ):
+            return tokenweave_comm.fused_ar_rmsnorm(
+                input_, residual_inp_, weight_, eps
+            )
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
