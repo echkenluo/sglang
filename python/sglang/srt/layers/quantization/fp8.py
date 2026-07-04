@@ -253,13 +253,15 @@ class Fp8Config(QuantizationConfig):
 
 
 # SGLANG_FLUX_FP8 (M2): fused flux GEMM+comm for fp8-quantized linears.
-# s2a split: GemmRS (o_proj) runs the rerouted flux dequant EVT with a
-# per-token scale_a (M,1) and a per-channel scale_b vector (splatted scalar
-# for now); AGKernel (qkv) still rides the s1 per-tensor absmax epilogue
-# (scalar scale_a x scalar scale_b) until s2b. Ops are built lazily on the
-# first qualifying forward; any construction/call failure disables the path
-# process-wide and drops to the native fp8 GEMM plus explicit torch
-# collectives, mirroring the M3 gather_rs fail-safe (flux_moe.py).
+# s2 (a: GemmRS/o_proj, b: AGKernel/qkv): both ops run the rerouted flux
+# dequant EVT with a per-token scale_a (M,1) and a per-channel scale_b
+# vector (splatted scalar for now). The AG side gathers the scale rows
+# through flux's symmetric scale buffers, so the s1 per-batch amax
+# MAX-allreduce is gone -- neither path adds a collective anymore. Requires
+# an s2 flux build (flux.FLUX_FP8_PER_ROW_SCALE guard). Ops are built lazily
+# on the first qualifying forward; any construction/call failure disables
+# the path process-wide and drops to the native fp8 GEMM plus explicit
+# torch collectives, mirroring the M3 gather_rs fail-safe (flux_moe.py).
 _FLUX_FP8_DISABLED = False
 _FLUX_FP8_ENGAGED_LOGGED = False
 # flux ops allocate MAX_M-sized symmetric buffers; share one op across all
@@ -884,6 +886,22 @@ class Fp8LinearMethod(LinearMethodBase):
             raise RuntimeError(
                 "flux fp8 supports the plain cutlass/triton fp8 backends only"
             )
+        import flux  # cached after the first import; cheap dict lookup
+
+        if not getattr(flux, "FLUX_FP8_PER_ROW_SCALE", False):
+            # Stale-lib tripwire (s2): this code passes per-token/vector
+            # scales. A pre-s2 flux would NOT error on them -- its AG binding
+            # takes any tensor opaquely (data_ptr pass-through, no fp8 shape
+            # checks in gemm_with_barrier.cc) and the absmax epilogue reads
+            # only scale[0], silently mis-scaling every token but the first.
+            # So detection cannot come from the op call; gate on the marker
+            # the s2 flux python package exports. Raising here lands in
+            # _apply_flux_fp8's fail-safe: loud warning + sticky fallback.
+            raise RuntimeError(
+                "flux package predates the s2 per-row fp8 scale kernels "
+                "(flux.FLUX_FP8_PER_ROW_SCALE missing) -- refusing to feed "
+                "vector scales to absmax kernels; check the installed flux"
+            )
         op = layer._flux_fp8_op
         if op is None:
             op = _flux_fp8_get_op(layer, kind)
@@ -918,22 +936,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer._flux_fp8_weight_scale,
             )
 
-        # "ag_gemm" (qkv side): flux gathers only the fp8 payload and applies
-        # ONE scalar input_scale to the whole gathered A (only the S8 path
-        # gathers per-row scales, all_gather_gemm_op.cc). A per-tensor scale
-        # computed on the local shard differs per rank, so make it
-        # rank-uniform by MAX-reducing the amax before quantizing -- an
-        # s1-only simplification (one fp32 scalar per forward; s2's per-token
-        # scales remove it).
-        amax = x_2d.abs().amax().float().reshape(1)
-        if get_tensor_model_parallel_world_size() > 1:
-            torch.distributed.all_reduce(
-                amax,
-                op=torch.distributed.ReduceOp.MAX,
-                group=get_tp_group().device_group,
-            )
-        x_s = (amax / torch.finfo(fp8_dtype).max).clamp(min=1e-12)
-        x_q, _ = scaled_fp8_quant(x_2d, x_s)
+        # "ag_gemm" (qkv side, s2b): flux now gathers the per-token scale
+        # rows alongside the fp8 payload (the s8 symmetric-buffer channel,
+        # un-gated for fp8 in all_gather_op.cc / all_gather_gemm_op.cc), and
+        # the rerouted dequant EVT consumes the gathered [M_full, 1] scale.
+        # So quantize per-token LOCALLY and hand flux the local (M_local, 1)
+        # slice -- the s1 per-batch amax MAX-allreduce (the only collective
+        # this path added) is gone.
+        x_q, x_s = scaled_fp8_quant(x_2d, use_per_token_if_dynamic=True)
         output = op.forward(
             x_q,
             layer._flux_fp8_weight,
@@ -952,9 +962,9 @@ class Fp8LinearMethod(LinearMethodBase):
         scale: dequantize to fp32, take the global amax, re-encode to E4M3.
         Known-lossy; end-model quality is recorded, not gated (m2-design
         section 3). The native-path weight is left untouched for
-        non-qualifying batches. Only the SHAPE handed to flux differs by op
-        kind (s2a): gemm_rs gets the scalar splatted to an [n] vector for the
-        dequant EVT, ag_gemm keeps the scalar for the absmax epilogue.
+        non-qualifying batches. The scalar is handed to flux splatted to an
+        [n] vector (s2: both gemm_rs and ag_gemm run the per-row dequant
+        EVT, which takes a per-channel weight_scale).
 
         Persistent cost: one extra fp8 copy per fuse-flagged layer, i.e.
         roughly duplicate attention/MLP projection weights. s1 accepts the
@@ -988,18 +998,14 @@ class Fp8LinearMethod(LinearMethodBase):
         # flux RCR layout with transpose_weight=False: B is the [N, K]
         # row-major weight, same as the bf16 GemmRS/AGCook path.
         layer._flux_fp8_weight = w_q
-        w_s_scalar = w_s.to(torch.float32).reshape(1)
-        if getattr(layer, "_flux_fp8_fuse", None) == "gemm_rs":
-            # s2a step 1 (B side): the rerouted GemmRS dequant EVT takes
-            # weight_scale as an [n] per-channel vector, so splat the
-            # per-tensor scalar across n -- numerically identical to the s1
-            # scalar on the B side. Step 2 upgrades this to true per-channel
-            # scales (recovering the B-side requant loss).
-            layer._flux_fp8_weight_scale = w_s_scalar.repeat(w_q.shape[0])
-        else:
-            # ag_gemm (qkv) still runs the per-tensor absmax epilogue and
-            # keeps the scalar scale (s2b will move it to vectors).
-            layer._flux_fp8_weight_scale = w_s_scalar
+        # s2 B side (s2a: gemm_rs, s2b: ag_gemm): both rerouted flux dequant
+        # EVTs take weight_scale as an [n] per-channel vector, so splat the
+        # per-tensor scalar across n -- numerically identical to the s1
+        # scalar on the B side. True per-channel scales are the follow-up
+        # step (recovering the B-side requant loss).
+        layer._flux_fp8_weight_scale = (
+            w_s.to(torch.float32).reshape(1).repeat(w_q.shape[0])
+        )
 
     @staticmethod
     def _flux_fp8_blockwise_to_tensor_strip(
