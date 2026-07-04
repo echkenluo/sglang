@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    block_quant_to_tensor_quant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -63,6 +64,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import (
+    MAX_M,
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
@@ -249,6 +251,57 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
+
+
+# SGLANG_FLUX_FP8 (M2 s1): fused flux GEMM+comm for fp8-quantized linears.
+# s1 rides the only instantiated SM89 dense fp8 flux kernels (per-tensor
+# scale_a x per-tensor scale_b, absmax epilogue). Ops are built lazily on the
+# first qualifying forward; any construction/call failure disables the path
+# process-wide and drops to the native fp8 GEMM plus explicit torch
+# collectives, mirroring the M3 gather_rs fail-safe (flux_moe.py).
+_FLUX_FP8_DISABLED = False
+_FLUX_FP8_ENGAGED_LOGGED = False
+# flux ops allocate MAX_M-sized symmetric buffers; share one op across all
+# layers of the same shape, like the bf16 GemmRS/AGCook ctx caches in unquant.
+_FLUX_FP8_OP_CACHE: Dict[tuple, Any] = {}
+
+
+def _flux_fp8_get_op(layer: Module, kind: str):
+    """Build (or fetch from the shape cache) the fp8 flux op for `layer`."""
+    import flux  # deferred: only reached once SGLANG_FLUX_FP8 engages
+
+    n = layer.output_size_per_partition
+    k = layer.input_size_per_partition
+    key = (kind, n, k)
+    op = _FLUX_FP8_OP_CACHE.get(key)
+    if op is None:
+        if kind == "gemm_rs":
+            # Mirrors the bf16 GemmRS ctor (unquant.py) but with fp8 input
+            # dtype; the fp8 instantiations emit bf16 (E4M3xE4M3->BF16).
+            op = flux.GemmRS(
+                get_tp_group().device_group,
+                1,  # one node
+                MAX_M,
+                n,
+                fp8_dtype,
+                layer.orig_dtype,
+                transpose_weight=False,
+                fuse_reduction=False,
+            )
+        else:  # "ag_gemm"
+            op = flux.AGKernel(
+                get_tp_group().device_group,
+                1,  # one node
+                MAX_M,
+                n,
+                k,
+                fp8_dtype,
+                layer.orig_dtype,
+                use_pdl=False,
+            )
+        _FLUX_FP8_OP_CACHE[key] = op
+    layer._flux_fp8_op = op
+    return op
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -439,9 +492,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
         # SGLANG_FLUX_FP8: layer was constructed with a flux fuse intent
-        # (see LinearBase.__init__). Record a lazy-construction placeholder
-        # for the fp8 flux op; the actual op is built and used in a later
-        # task (forward-path wiring is out of scope here).
+        # (see LinearBase.__init__). Record the lazy-construction placeholder
+        # for the fp8 flux op; the op is built on the first qualifying forward
+        # (_apply_flux_fp8), and the attribute's presence is what routes
+        # useFlux from the linear forwards into apply().
         if _FLUX_FP8 and getattr(layer, "_flux_fp8_fuse", None):
             layer._flux_fp8_op = None
 
@@ -684,7 +738,14 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        useFlux: bool = False,
     ) -> torch.Tensor:
+        # useFlux is only routed here (see ColumnParallelLinear/
+        # RowParallelLinear.forward) for layers carrying the SGLANG_FLUX_FP8
+        # fuse intent; everything else takes the unchanged paths below.
+        if useFlux and getattr(layer, "_flux_fp8_fuse", None) is not None:
+            return self._apply_flux_fp8(layer, x, bias)
+
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,
@@ -753,6 +814,170 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+
+    def _apply_flux_fp8(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        global _FLUX_FP8_DISABLED, _FLUX_FP8_ENGAGED_LOGGED
+
+        kind = layer._flux_fp8_fuse
+        if not _FLUX_FP8_DISABLED:
+            try:
+                output = self._forward_flux_fp8(layer, x, bias, kind)
+            except Exception as exc:  # noqa: BLE001 -- sticky fail-safe, same
+                # pattern as the M3 gather_rs tail: WARN once, permanently
+                # drop to the native fp8 GEMM + torch collectives. NOTE: a
+                # mid-forward failure is only collective-safe if it raises on
+                # ALL ranks (deterministic ctor/shape/dtype errors do).
+                _FLUX_FP8_DISABLED = True
+                logger.warning(
+                    "[FLUX-FP8] disabled: %s (falling back to the native fp8 "
+                    "path + torch comm)",
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                if not _FLUX_FP8_ENGAGED_LOGGED:
+                    _FLUX_FP8_ENGAGED_LOGGED = True
+                    logger.info(
+                        "[FLUX-FP8] engaged (op=%s, layer=%s)",
+                        kind,
+                        getattr(layer, "_flux_fp8_prefix", "?"),
+                    )
+                return output
+        return self._flux_fp8_fallback(layer, x, bias, kind)
+
+    def _forward_flux_fp8(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        kind: str,
+    ) -> torch.Tensor:
+        if self.use_marlin or self.use_mxfp8 or _use_aiter:
+            raise RuntimeError(
+                "flux fp8 supports the plain cutlass/triton fp8 backends only"
+            )
+        op = layer._flux_fp8_op
+        if op is None:
+            op = _flux_fp8_get_op(layer, kind)
+        if getattr(layer, "_flux_fp8_weight", None) is None:
+            self._flux_fp8_prepare_weight(layer)
+
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        if kind == "gemm_rs":
+            if bias is not None:
+                # flux rejects bias on the fp8 GemmRS ("FP8 does not support
+                # bias"); the fallback path handles bias correctly.
+                raise ValueError("flux fp8 GemmRS does not support bias")
+            # o_proj side: rows are full-M, columns K-sharded. A LOCAL
+            # per-tensor scale per rank is exact here: the absmax epilogue
+            # applies alpha*scale_a*scale_b to the accumulator inside each
+            # rank's GEMM (gemm_v2_impl.hpp:312-325), so every partial D is
+            # fully dequantized BEFORE the reduce-scatter sums it, and the RS
+            # reduces bf16 partials (never quantized).
+            x_q, x_s = scaled_fp8_quant(x_2d)
+            return op.forward(
+                x_q,
+                layer._flux_fp8_weight,
+                input_scale=x_s,
+                weight_scale=layer._flux_fp8_weight_scale,
+            )
+
+        # "ag_gemm" (qkv side): flux gathers only the fp8 payload and applies
+        # ONE scalar input_scale to the whole gathered A (only the S8 path
+        # gathers per-row scales, all_gather_gemm_op.cc). A per-tensor scale
+        # computed on the local shard differs per rank, so make it
+        # rank-uniform by MAX-reducing the amax before quantizing -- an
+        # s1-only simplification (one fp32 scalar per forward; s2's per-token
+        # scales remove it).
+        amax = x_2d.abs().amax().float().reshape(1)
+        if get_tensor_model_parallel_world_size() > 1:
+            torch.distributed.all_reduce(
+                amax,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_tp_group().device_group,
+            )
+        x_s = (amax / torch.finfo(fp8_dtype).max).clamp(min=1e-12)
+        x_q, _ = scaled_fp8_quant(x_2d, x_s)
+        output = op.forward(
+            x_q,
+            layer._flux_fp8_weight,
+            input_scale=x_s,
+            weight_scale=layer._flux_fp8_weight_scale,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def _flux_fp8_prepare_weight(self, layer: Module) -> None:
+        """Cache a per-tensor requantized copy of the fp8 weight for flux.
+
+        s1 stepping stone: the only instantiated SM89 dense fp8 flux kernels
+        take scalar (per-tensor) scales, so whatever granularity the layer
+        holds (blockwise checkpoint scales or per-channel/per-tensor runtime
+        scales) is requantized down to ONE scale: dequantize to fp32, take
+        the global amax, re-encode to E4M3. Known-lossy; end-model quality is
+        recorded, not gated (m2-design section 3). The native-path weight is
+        left untouched for non-qualifying batches.
+        """
+        if self.block_quant:
+            # Blockwise checkpoint (e.g. Qwen3-FP8): weight [N, K] fp8 +
+            # weight_scale_inv [ceil(N/bn), ceil(K/bk)].
+            w_q, w_s = block_quant_to_tensor_quant(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                self.quant_config.weight_block_size,
+            )
+        else:
+            # The non-block path stores the weight transposed ([K, N] view)
+            # with a per-tensor scalar or per-channel(N) scale.
+            w_kn = layer.weight.data
+            scale = layer.weight_scale.data
+            w32 = w_kn.t().to(torch.float32)  # [N, K]
+            if scale.numel() == 1:
+                w32 = w32 * scale
+            elif scale.numel() == w32.shape[0]:
+                w32 = w32 * scale.reshape(-1, 1)
+            else:
+                raise ValueError(
+                    f"unexpected weight_scale shape {tuple(scale.shape)} for "
+                    "flux fp8 per-tensor requantization"
+                )
+            w_q, w_s = scaled_fp8_quant(w32.contiguous())
+        # flux RCR layout with transpose_weight=False: B is the [N, K]
+        # row-major weight, same as the bf16 GemmRS/AGCook path.
+        layer._flux_fp8_weight = w_q
+        layer._flux_fp8_weight_scale = w_s.to(torch.float32).reshape(1)
+
+    def _flux_fp8_fallback(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        kind: str,
+    ) -> torch.Tensor:
+        """Native fp8 GEMM + explicit torch collectives with flux semantics.
+
+        The model already committed this batch to the scattered flux flow
+        (useFlux is env+token-count driven, residuals are chunked), so the
+        fallback must still gather before / reduce-scatter after the GEMM.
+        """
+        if kind == "ag_gemm":
+            x_full = get_tp_group().all_gather(x, dim=0)
+            return self.apply(layer, x_full, bias)
+        output = self.apply(layer, x, bias)
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return output
+        scattered = output.new_empty(
+            (output.shape[0] // tp_size, output.shape[1])
+        )
+        get_tp_group().reduce_scatter_tensor(scattered, output)
+        return scattered
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):

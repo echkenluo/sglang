@@ -193,6 +193,7 @@ class LinearBase(torch.nn.Module):
         if quant_config is not None and (fuse_gemm_rs or fuse_ag_gemm):
             if _FLUX_FP8:
                 self._flux_fp8_fuse = "gemm_rs" if fuse_gemm_rs else "ag_gemm"
+                self._flux_fp8_prefix = prefix
             else:
                 print_warning_once(
                     "flux fusion requested but SGLANG_FLUX_FP8 not set; "
@@ -503,7 +504,9 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        if useFlux and self.fuse_ag_gemm:
+        # _flux_fp8_op: SGLANG_FLUX_FP8 fp8 layer with a flux fuse intent
+        # (set by Fp8LinearMethod.create_weights); route useFlux into apply.
+        if useFlux and (self.fuse_ag_gemm or hasattr(self, "_flux_fp8_op")):
             output_parallel = self.quant_method.apply(self, input_, bias, useFlux)
         else:
             output_parallel = self.quant_method.apply(self, input_, bias)
@@ -1566,7 +1569,8 @@ class RowParallelLinear(LinearBase):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            if useFlux and self.fuse_gemm_rs:
+            # _flux_fp8_op: see ColumnParallelLinear.forward.
+            if useFlux and (self.fuse_gemm_rs or hasattr(self, "_flux_fp8_op")):
                 output_parallel = self.quant_method.apply(
                     self, input_parallel, bias=bias_, useFlux=useFlux
                 )
