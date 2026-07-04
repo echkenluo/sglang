@@ -84,8 +84,10 @@ class Qwen3Attention(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         first_layer: bool = True,
+        last_layer: bool = False,
     ) -> None:
         super().__init__()
+        self.last_layer = last_layer
         self.hidden_size = hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -279,8 +281,23 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        qkv_useFlux = forward_batch.useFlux
         if get_attn_tp_context().input_scattered:
-            hidden_states = get_attn_tp_context().fetch_qkv_latent()
+            if qkv_useFlux and (
+                getattr(self.qkv_proj, "fuse_ag_gemm", False)
+                or getattr(self.qkv_proj, "_flux_fp8_fuse", None) == "ag_gemm"
+            ):
+                # AGCook (bf16) / the fp8 flux AG path consumes the pre-gather
+                # scattered shard: the fused kernel performs the all-gather
+                # inside the GEMM, and the fp8 sticky fallback all-gathers
+                # explicitly before its native GEMM -- either way the rows
+                # come back full-M. Fetching here would gather a second time
+                # (same contract as the qwen3_moe wiring).
+                pass
+            else:
+                hidden_states = get_attn_tp_context().fetch_qkv_latent()
+                # Input is already gathered; qkv must not all-gather again.
+                qkv_useFlux = False
 
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
@@ -304,7 +321,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
-                useFlux=forward_batch.useFlux,
+                useFlux=qkv_useFlux,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -318,7 +335,15 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output, useFlux=forward_batch.useFlux)
+        # Under the scattered flow the LAST layer must keep full rows:
+        # prepare_mlp's else branch (_tp_all_reduce_with_scattered_residual)
+        # expects a full-M TP-partial o_proj output, not the scattered-reduced
+        # shard a fused GemmRS would emit (same reason qwen3_moe excludes the
+        # last layer from fuse_gemm_rs).
+        o_proj_useFlux = forward_batch.useFlux and not (
+            get_attn_tp_context().input_scattered and self.last_layer
+        )
+        output, _ = self.o_proj(attn_output, useFlux=o_proj_useFlux)
         return output
 
     def prepare_qkv_latent(
@@ -346,6 +371,7 @@ class Qwen3DecoderLayer(nn.Module):
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(
             first_layer=first_layer,
+            last_layer=last_layer,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -428,7 +454,20 @@ class Qwen3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if self.first_layer and forward_batch.useFlux:
+        # Non-scattered M1 flow only: the fused GemmRS o_proj emits scattered
+        # rows while the residual is still full-M, so chunk it once at the
+        # first layer. Under the scattered flow prepare_attn already produced
+        # the scattered [M/tp] residual -- chunking it again would mangle it
+        # (torch.chunk of M/tp rows into tp mis-sized pieces) and break
+        # prepare_mlp's row-match skip, which must fire for BOTH the flux op
+        # and the fp8 sticky fallback (each returns scattered-reduced rows);
+        # non-qualifying batches (useFlux=False) return full-M partials and
+        # still take the communicator RS.
+        if (
+            self.first_layer
+            and forward_batch.useFlux
+            and not get_attn_tp_context().input_scattered
+        ):
             n_slices = get_tensor_model_parallel_world_size()
             residual_slices = torch.chunk(residual, n_slices, dim=0)
             my_residual = residual_slices[get_tensor_model_parallel_rank()]
@@ -455,15 +494,42 @@ class Qwen3DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+        mlp_useFlux = forward_batch.useFlux
         if get_attn_tp_context().input_scattered:
-            hidden_states = get_attn_tp_context().fetch_mlp_latent(
-                last_layer=self.is_last_layer
-            )
+            if (
+                mlp_useFlux
+                and not self.is_last_layer
+                and (
+                    getattr(self.mlp.gate_up_proj, "fuse_ag_gemm", False)
+                    or getattr(self.mlp.gate_up_proj, "_flux_fp8_fuse", None)
+                    == "ag_gemm"
+                )
+            ):
+                # gate_up consumes the scattered shard directly (the fused
+                # AG-GEMM, or the fp8 fallback's explicit all-gather, brings
+                # the rows back to full-M); fetching would gather twice.
+                pass
+            else:
+                hidden_states = get_attn_tp_context().fetch_mlp_latent(
+                    last_layer=self.is_last_layer
+                )
+                # Rows are full already (gathered here, or full-M from the
+                # last layer's all-reduce branch): the MLP must run the plain
+                # path -- no AG in gate_up, and down_proj's all-reduce must
+                # not be suppressed by useFlux.
+                mlp_useFlux = False
         hidden_states = self.mlp(
-            hidden_states, use_reduce_scatter, useFlux=forward_batch.useFlux
+            hidden_states, use_reduce_scatter, useFlux=mlp_useFlux
         )
 
-        if self.last_layer and forward_batch.useFlux:
+        # Non-scattered M1 flow only (mirrors the first-layer chunk): under
+        # the scattered flow the last layer's residual is already full-M
+        # (returned by _tp_all_reduce_with_scattered_residual).
+        if (
+            self.last_layer
+            and forward_batch.useFlux
+            and not get_attn_tp_context().input_scattered
+        ):
             residual = tensor_model_parallel_all_gather(my_residual, 0)
         else:
             residual = my_residual
