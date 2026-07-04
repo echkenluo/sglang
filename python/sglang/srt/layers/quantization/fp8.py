@@ -253,11 +253,12 @@ class Fp8Config(QuantizationConfig):
 
 
 # SGLANG_FLUX_FP8 (M2): fused flux GEMM+comm for fp8-quantized linears.
-# s2 (a: GemmRS/o_proj, b: AGKernel/qkv): both ops run the rerouted flux
-# dequant EVT with a per-token scale_a (M,1) and a per-channel scale_b
-# vector (splatted scalar for now). The AG side gathers the scale rows
-# through flux's symmetric scale buffers, so the s1 per-batch amax
-# MAX-allreduce is gone -- neither path adds a collective anymore. Requires
+# s2 (a: GemmRS/o_proj, b: AGKernel/qkv, 9.2: per-channel B): both ops run
+# the rerouted flux dequant EVT with a per-token scale_a (M,1) and a TRUE
+# per-channel scale_b [n] vector (weights requantized per output channel
+# from the blockwise checkpoint at load time). The AG side gathers the
+# scale rows through flux's symmetric scale buffers, so the s1 per-batch
+# amax MAX-allreduce is gone -- neither path adds a collective anymore. Requires
 # an s2 flux build (flux.FLUX_FP8_PER_ROW_SCALE guard). Ops are built lazily
 # on the first qualifying forward; any construction/call failure disables
 # the path process-wide and drops to the native fp8 GEMM plus explicit
@@ -955,26 +956,34 @@ class Fp8LinearMethod(LinearMethodBase):
         return output
 
     def _flux_fp8_prepare_weight(self, layer: Module) -> None:
-        """Cache a per-tensor requantized copy of the fp8 weight for flux.
+        """Cache a per-OUTPUT-CHANNEL requantized fp8 weight copy for flux.
 
-        Whatever granularity the layer holds (blockwise checkpoint scales or
-        per-channel/per-tensor runtime scales) is requantized down to ONE
-        scale: dequantize to fp32, take the global amax, re-encode to E4M3.
-        Known-lossy; end-model quality is recorded, not gated (m2-design
-        section 3). The native-path weight is left untouched for
-        non-qualifying batches. The scalar is handed to flux splatted to an
-        [n] vector (s2: both gemm_rs and ag_gemm run the per-row dequant
-        EVT, which takes a per-channel weight_scale).
+        s2 step 9.2: both rerouted flux dequant EVTs consume weight_scale as
+        a per-channel [n] vector (VisitorRowBroadcast), so requantize the
+        checkpoint to TRUE per-channel granularity instead of the earlier
+        one-scalar-splat (which collapsed the blockwise checkpoint to a
+        single per-tensor scale and dominated the residual quality delta
+        once activations went per-token):
+          - blockwise checkpoint: dequantize with the block scales, take
+            each output channel's own amax over its K elements, re-encode
+            that row with its own scale (strip-bounded, see helper).
+          - runtime per-channel(N) scale: the payload is ALREADY quantized
+            per output channel -- reuse weight and scales exactly (zero
+            requant loss).
+          - runtime per-tensor scalar: dequantize and requantize per
+            channel (a refinement of the single scale; this path keeps its
+            pre-existing full-tensor fp32 transient).
+        The native-path weight is left untouched for non-qualifying batches.
 
-        Persistent cost: one extra fp8 copy per fuse-flagged layer, i.e.
-        roughly duplicate attention/MLP projection weights. s1 accepts the
-        double storage (same trade as the M3 load-time repack); running this
-        at load time makes the KV-pool sizing absorb it automatically.
+        Persistent cost: one extra fp8 copy plus an [n] fp32 vector per
+        fuse-flagged layer, i.e. roughly duplicate attention/MLP projection
+        weights (same trade as the M3 load-time repack); running this at
+        load time makes the KV-pool sizing absorb it automatically.
         """
         if self.block_quant:
             # Blockwise checkpoint (e.g. Qwen3-FP8): weight [N, K] fp8 +
             # weight_scale_inv [ceil(N/bn), ceil(K/bk)].
-            w_q, w_s = self._flux_fp8_blockwise_to_tensor_strip(
+            w_q, w_s_vec = self._flux_fp8_blockwise_to_channel_strip(
                 layer.weight.data,
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
@@ -984,44 +993,53 @@ class Fp8LinearMethod(LinearMethodBase):
             # with a per-tensor scalar or per-channel(N) scale.
             w_kn = layer.weight.data
             scale = layer.weight_scale.data
-            w32 = w_kn.t().to(torch.float32)  # [N, K]
-            if scale.numel() == 1:
-                w32 = w32 * scale
-            elif scale.numel() == w32.shape[0]:
-                w32 = w32 * scale.reshape(-1, 1)
+            n = w_kn.shape[1]
+            if scale.numel() == n:
+                # Already per output channel: the fp8 payload is exactly what
+                # the flux EVT dequantizes with these scales. No requant.
+                w_q = w_kn.t().contiguous()  # [N, K] row-major fp8
+                w_s_vec = scale.to(torch.float32).reshape(-1).contiguous()
+            elif scale.numel() == 1:
+                fp_max = torch.finfo(fp8_dtype).max
+                w32 = w_kn.t().to(torch.float32) * scale  # [N, K]
+                amax = w32.abs().amax(dim=1, keepdim=True)  # [N, 1]
+                s = amax.clamp(min=1e-12) / fp_max
+                w_q = (w32 / s).clamp_(min=-fp_max, max=fp_max).to(fp8_dtype)
+                w_s_vec = s.reshape(-1)
             else:
                 raise ValueError(
                     f"unexpected weight_scale shape {tuple(scale.shape)} for "
-                    "flux fp8 per-tensor requantization"
+                    "flux fp8 per-channel requantization"
                 )
-            w_q, w_s = scaled_fp8_quant(w32.contiguous())
         # flux RCR layout with transpose_weight=False: B is the [N, K]
-        # row-major weight, same as the bf16 GemmRS/AGCook path.
+        # row-major weight, same as the bf16 GemmRS/AGCook path; the scale
+        # is the true per-channel [n] fp32 vector.
         layer._flux_fp8_weight = w_q
-        # s2 B side (s2a: gemm_rs, s2b: ag_gemm): both rerouted flux dequant
-        # EVTs take weight_scale as an [n] per-channel vector, so splat the
-        # per-tensor scalar across n -- numerically identical to the s1
-        # scalar on the B side. True per-channel scales are the follow-up
-        # step (recovering the B-side requant loss).
-        layer._flux_fp8_weight_scale = (
-            w_s.to(torch.float32).reshape(1).repeat(w_q.shape[0])
-        )
+        layer._flux_fp8_weight_scale = w_s_vec
 
     @staticmethod
-    def _flux_fp8_blockwise_to_tensor_strip(
+    def _flux_fp8_blockwise_to_channel_strip(
         w_q_block: torch.Tensor,
         w_s: torch.Tensor,
         block_size: List[int],
     ) -> tuple:
-        """Blockwise -> per-tensor requant with a strip-bounded transient.
+        """Blockwise -> per-OUTPUT-CHANNEL requant with a strip-bounded
+        transient. Returns (w_q [N, K] fp8, weight_scale [N] fp32).
 
-        Same math as fp8_utils.block_quant_to_tensor_quant (dequantize with
-        the block scales, global amax, one-scale E4M3 re-encode), but that
-        helper materializes the whole [N, K] weight in fp32 -- hundreds of MB
-        for the MLP projections, which OOMs if the late (first-forward) prep
-        path ever runs with the KV pool already holding VRAM. Dequantize per
-        block_n-row strip instead, in two passes (amax, then quantize), so
-        the fp32 transient stays at strip size.
+        Layout/block math: weight is [N, K] (N = output channels), block
+        scales are w_s[i, j] for the block covering rows
+        [i*block_n, (i+1)*block_n) x cols [j*block_k, (j+1)*block_k), so an
+        output channel (row) n dequantizes with scale row i = n // block_n
+        expanded along K (repeat_interleave(block_k), trimmed to K). A
+        block_n-row strip therefore contains every K element of its rows
+        AND uses exactly one scale row -- the per-channel amax is complete
+        within the strip, so ONE pass suffices (the per-tensor predecessor
+        needed two: global amax, then quantize). The fp32 transient stays
+        at strip size, keeping the OOM discipline of the late (first-
+        forward) prep path.
+
+        Degenerate all-zero channels keep the amax clamp convention of the
+        full-tensor helpers (input_to_float8 / scaled_fp8_quant).
         """
         block_n, block_k = block_size[0], block_size[1]
         n, k = w_q_block.shape
@@ -1032,26 +1050,19 @@ class Fp8LinearMethod(LinearMethodBase):
         # Per-column dequant scales, expanded once: [n_tiles, k] fp32.
         col_scale = w_s.to(torch.float32).repeat_interleave(block_k, dim=1)[:, :k]
         fp_max = torch.finfo(fp8_dtype).max
-        amax = None
-        for j in range(n_tiles):
-            strip = w_q_block[j * block_n : min((j + 1) * block_n, n)].to(
-                torch.float32
-            )
-            strip *= col_scale[j]
-            strip_amax = strip.abs().amax()
-            amax = strip_amax if amax is None else torch.maximum(amax, strip_amax)
-        # Mirror the amax clamp of the full-tensor helpers (input_to_float8 /
-        # scaled_fp8_quant) so degenerate all-zero weights stay well-defined.
-        scale = amax.clamp(min=1e-12) / fp_max
         out = torch.empty((n, k), dtype=fp8_dtype, device=w_q_block.device)
+        out_scale = torch.empty((n,), dtype=torch.float32, device=w_q_block.device)
         for j in range(n_tiles):
             r0, r1 = j * block_n, min((j + 1) * block_n, n)
             strip = w_q_block[r0:r1].to(torch.float32)
             strip *= col_scale[j]
-            out[r0:r1] = (strip / scale).clamp(min=-fp_max, max=fp_max).to(
+            amax = strip.abs().amax(dim=1, keepdim=True)  # [rows, 1]
+            s = amax.clamp(min=1e-12) / fp_max
+            out[r0:r1] = (strip / s).clamp_(min=-fp_max, max=fp_max).to(
                 fp8_dtype
             )
-        return out, scale.reshape(1)
+            out_scale[r0:r1] = s.reshape(-1)
+        return out, out_scale
 
     def _flux_fp8_fallback(
         self,
