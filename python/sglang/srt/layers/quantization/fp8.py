@@ -47,7 +47,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    block_quant_to_tensor_quant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -733,6 +732,28 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+        # SGLANG_FLUX_FP8: build the cached per-tensor flux weight copy NOW,
+        # at load time -- VRAM is plentiful and the KV-pool sizing runs
+        # afterwards, so the copy is accounted for automatically. Deferring
+        # to the first qualifying forward OOMs instead: by then the memory
+        # pool owns nearly all VRAM (gate-run2 lesson). A failure here must
+        # not kill serving: leave the layer unprepared and let the
+        # first-forward fail-safe decide (late prep or sticky fallback).
+        if (
+            _FLUX_FP8
+            and getattr(layer, "_flux_fp8_fuse", None)
+            and not (self.use_marlin or self.use_mxfp8 or _use_aiter)
+        ):
+            try:
+                self._flux_fp8_prepare_weight(layer)
+            except Exception as exc:  # noqa: BLE001 -- same fail-safe contract
+                logger.warning(
+                    "[FLUX-FP8] load-time weight prep failed for %s: %s "
+                    "(will retry lazily at first forward)",
+                    getattr(layer, "_flux_fp8_prefix", "?"),
+                    exc,
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -865,6 +886,13 @@ class Fp8LinearMethod(LinearMethodBase):
         if op is None:
             op = _flux_fp8_get_op(layer, kind)
         if getattr(layer, "_flux_fp8_weight", None) is None:
+            # Normally prepared at load time (process_weights_after_loading);
+            # reaching this is the late path, where the KV pool already owns
+            # nearly all VRAM and the fp32 transient may not fit.
+            print_warning_once(
+                "[FLUX-FP8] preparing flux weights at first forward "
+                "(load-time prep was skipped or failed); VRAM may be scarce"
+            )
             self._flux_fp8_prepare_weight(layer)
 
         x_2d = x.contiguous().view(-1, x.shape[-1])
@@ -923,11 +951,16 @@ class Fp8LinearMethod(LinearMethodBase):
         the global amax, re-encode to E4M3. Known-lossy; end-model quality is
         recorded, not gated (m2-design section 3). The native-path weight is
         left untouched for non-qualifying batches.
+
+        Persistent cost: one extra fp8 copy per fuse-flagged layer, i.e.
+        roughly duplicate attention/MLP projection weights. s1 accepts the
+        double storage (same trade as the M3 load-time repack); running this
+        at load time makes the KV-pool sizing absorb it automatically.
         """
         if self.block_quant:
             # Blockwise checkpoint (e.g. Qwen3-FP8): weight [N, K] fp8 +
             # weight_scale_inv [ceil(N/bn), ceil(K/bk)].
-            w_q, w_s = block_quant_to_tensor_quant(
+            w_q, w_s = self._flux_fp8_blockwise_to_tensor_strip(
                 layer.weight.data,
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
@@ -952,6 +985,52 @@ class Fp8LinearMethod(LinearMethodBase):
         # row-major weight, same as the bf16 GemmRS/AGCook path.
         layer._flux_fp8_weight = w_q
         layer._flux_fp8_weight_scale = w_s.to(torch.float32).reshape(1)
+
+    @staticmethod
+    def _flux_fp8_blockwise_to_tensor_strip(
+        w_q_block: torch.Tensor,
+        w_s: torch.Tensor,
+        block_size: List[int],
+    ) -> tuple:
+        """Blockwise -> per-tensor requant with a strip-bounded transient.
+
+        Same math as fp8_utils.block_quant_to_tensor_quant (dequantize with
+        the block scales, global amax, one-scale E4M3 re-encode), but that
+        helper materializes the whole [N, K] weight in fp32 -- hundreds of MB
+        for the MLP projections, which OOMs if the late (first-forward) prep
+        path ever runs with the KV pool already holding VRAM. Dequantize per
+        block_n-row strip instead, in two passes (amax, then quantize), so
+        the fp32 transient stays at strip size.
+        """
+        block_n, block_k = block_size[0], block_size[1]
+        n, k = w_q_block.shape
+        n_tiles = (n + block_n - 1) // block_n
+        k_tiles = (k + block_k - 1) // block_k
+        assert n_tiles == w_s.shape[0], (n_tiles, w_s.shape)
+        assert k_tiles == w_s.shape[1], (k_tiles, w_s.shape)
+        # Per-column dequant scales, expanded once: [n_tiles, k] fp32.
+        col_scale = w_s.to(torch.float32).repeat_interleave(block_k, dim=1)[:, :k]
+        fp_max = torch.finfo(fp8_dtype).max
+        amax = None
+        for j in range(n_tiles):
+            strip = w_q_block[j * block_n : min((j + 1) * block_n, n)].to(
+                torch.float32
+            )
+            strip *= col_scale[j]
+            strip_amax = strip.abs().amax()
+            amax = strip_amax if amax is None else torch.maximum(amax, strip_amax)
+        # Mirror the amax clamp of the full-tensor helpers (input_to_float8 /
+        # scaled_fp8_quant) so degenerate all-zero weights stay well-defined.
+        scale = amax.clamp(min=1e-12) / fp_max
+        out = torch.empty((n, k), dtype=fp8_dtype, device=w_q_block.device)
+        for j in range(n_tiles):
+            r0, r1 = j * block_n, min((j + 1) * block_n, n)
+            strip = w_q_block[r0:r1].to(torch.float32)
+            strip *= col_scale[j]
+            out[r0:r1] = (strip / scale).clamp(min=-fp_max, max=fp_max).to(
+                fp8_dtype
+            )
+        return out, scale.reshape(1)
 
     def _flux_fp8_fallback(
         self,
