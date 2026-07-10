@@ -75,6 +75,25 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
 
+        # Variable-length drafting ("bet longer on strong match"): candidate
+        # per-step draft lengths. The corpus is always queried at the cap
+        # (= max tier = speculative_num_draft_tokens) and the draft tree is
+        # truncated to the chosen tier. A single tier keeps static behavior.
+        self.draft_tiers: List[int] = sorted(
+            server_args.speculative_ngram_draft_tiers
+            or [server_args.speculative_num_draft_tokens]
+        )
+        assert self.draft_tiers[-1] == self.draft_token_num
+        # EMA of accepted drafts per verify step; drives tier selection.
+        # Starts at 0 so cold start bets the smallest tier and ramps up.
+        self._accept_len_ema = 0.0
+        self._verify_step_count = 0
+        self._last_step_stats = None  # (chosen_tier, can_run_cuda_graph)
+        # Stride of the accept_tokens staging consumed from batch.spec_info in
+        # _prepare_draft_tokens; _update_ngram_corpus reuses it after
+        # batch.spec_info has been replaced by this step's verify input.
+        self._prev_stride = self.draft_token_num
+
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
@@ -179,30 +198,47 @@ class NGRAMWorker(BaseSpecWorker):
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
 
-        self.draft_tokens_batch = []
-        self.tree_mask_batch = []
-        self.retrieve_indexes_batch = []
-        self.retrieve_next_token_batch = []
-        self.retrieve_next_sibling_batch = []
-        self.positions_batch = []
+    def _get_step_views(self, bs: int, d: int):
+        """Carve contiguous (bs, d)/flat views over the cap-sized backings.
 
-        for bs in range(0, self.max_batch_size + 1):
-            self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
-            self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
-            self.positions_batch.append(self.positions[: bs * self.draft_token_num])
-            self.draft_tokens_batch.append(
-                self.draft_tokens[: bs * self.draft_token_num]
-            )
-            self.tree_mask_batch.append(
-                self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
-            )
+        The 2-D backings are (max_batch_size, cap); a [:bs, :d] slice would be
+        non-contiguous for d < cap, so carve from the flat storage instead
+        (downstream kernels assume dense (bs, d) layout).
+        """
+        n = bs * d
+        return (
+            self.retrieve_indexes.view(-1)[:n].view(bs, d),
+            self.retrieve_next_token.view(-1)[:n].view(bs, d),
+            self.retrieve_next_sibling.view(-1)[:n].view(bs, d),
+            self.positions[:n],
+            self.tree_mask[: n * d],
+            self.draft_tokens[:n],
+        )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
         # result processor calls it with batch_size as a keyword argument.
+        if num_correct_drafts_per_req and len(self.draft_tiers) > 1:
+            batch_avg = sum(num_correct_drafts_per_req) / len(
+                num_correct_drafts_per_req
+            )
+            self._accept_len_ema = 0.7 * self._accept_len_ema + 0.3 * batch_avg
+            self._verify_step_count += 1
+            if self._verify_step_count % 32 == 0 and self._last_step_stats is not None:
+                # Under overlap this result lags the stashed step by one
+                # iteration; good enough for low-frequency observability.
+                tier, can_run_graph = self._last_step_stats
+                logger.info(
+                    "[ngram-var-draft] step=%d tier=%d accept_ema=%.2f "
+                    "last_accept=%s cuda_graph=%s",
+                    self._verify_step_count,
+                    tier,
+                    self._accept_len_ema,
+                    num_correct_drafts_per_req,
+                    can_run_graph,
+                )
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
@@ -210,7 +246,12 @@ class NGRAMWorker(BaseSpecWorker):
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
         bs = len(batch.reqs)
-        stride = self.draft_token_num
+        # accept_tokens was laid out by the step that produced batch.spec_info;
+        # with variable drafting its stride can differ from this step's tier,
+        # so always read the producer's stride (and stash it for
+        # _update_ngram_corpus, which runs after spec_info is replaced).
+        stride = batch.spec_info.draft_token_num
+        self._prev_stride = stride
 
         prev_token_ids, prev_accept_lens = (
             batch.spec_info.accept_tokens,
@@ -272,15 +313,30 @@ class NGRAMWorker(BaseSpecWorker):
             return
 
         bs = len(batch.reqs)
-
-        retrieve_index = self.retrieve_indexes_batch[bs]
-        retrieve_next_token = self.retrieve_next_token_batch[bs]
-        retrieve_next_sibling = self.retrieve_next_sibling_batch[bs]
-        positions = self.positions_batch[bs]
-        tree_mask = self.tree_mask_batch[bs]
-        draft_tokens = self.draft_tokens_batch[bs]
+        cap = self.draft_token_num
 
         req_drafts, mask = self._prepare_draft_tokens(batch)
+        d = self._choose_draft_tier(bs, mask)
+        if d < cap:
+            # fillResult emits BFS order, so the first d nodes of each
+            # request's tree form a prefix-closed subtree: plain truncation
+            # keeps tokens/mask a valid draft tree.
+            req_drafts = np.ascontiguousarray(
+                req_drafts.reshape(bs, cap)[:, :d]
+            ).reshape(-1)
+            mask = np.ascontiguousarray(
+                mask.reshape(bs, cap, cap)[:, :d, :d]
+            ).reshape(-1)
+
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            positions,
+            tree_mask,
+            draft_tokens,
+        ) = self._get_step_views(bs, d)
+
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
@@ -293,20 +349,18 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token,  # mutable
             retrieve_next_sibling,  # mutable
             bs,
-            self.draft_token_num,
+            d,
         )
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
             tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            mask = mask.reshape(bs, d, d)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
             for i in range(bs):
                 seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
+                req_mask = torch.ones((d, seq_len), device=self.device)
                 req_mask = torch.cat(
                     (
                         req_mask,
@@ -325,9 +379,9 @@ class NGRAMWorker(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             req_to_token=batch.req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + self.draft_token_num,
+            end_offset=batch.seq_lens + d,
             batch_size=bs,
-            draft_token_num=self.draft_token_num,
+            draft_token_num=d,
             device=self.device,
         )
 
@@ -340,12 +394,36 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
-            draft_token_num=self.draft_token_num,
+            draft_token_num=d,
         )
+
+    def _choose_draft_tier(self, bs: int, mask: np.ndarray) -> int:
+        """Pick this step's draft length from self.draft_tiers.
+
+        Signals: the draft tree's deepest chain (how far the corpus can
+        continue right now) and the accept-length EMA (how much of recent
+        bets was actually accepted). Bet roughly twice the recent accept
+        length, bounded by the available continuation, then round up to the
+        smallest tier that covers it.
+        """
+        if len(self.draft_tiers) == 1:
+            return self.draft_tiers[0]
+        cap = self.draft_token_num
+        # A mask row sums root + ancestors + self, so node depth in draft
+        # tokens = row sum - 1; zero-padded rows read as depth 1 and never
+        # dominate a real chain.
+        tree_depth = int(mask.reshape(bs, cap, cap).sum(axis=2).max()) - 1
+        want = min(tree_depth, int(2.0 * self._accept_len_ema) + 2)
+        for tier in self.draft_tiers:
+            if tier >= want:
+                return tier
+        return self.draft_tiers[-1]
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
-        i, stride = 0, self.draft_token_num
+        # prev_token_ids was staged by _prepare_draft_tokens with the stride of
+        # the PREVIOUS step's spec_info (batch.spec_info now holds this step's).
+        i, stride = 0, self._prev_stride
         # Same splice condition as _prepare_draft_tokens: only overlap mode
         # has accepted tokens missing from req.output_ids.
         use_prev_tokens = self.enable_overlap and not batch.has_grammar
@@ -435,12 +513,17 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            # This step's draft length; with variable drafting it can differ
+            # from self.draft_token_num (the cap), so every layout-stride
+            # consumer below must use it.
+            step_draft_token_num = verify_input.draft_token_num
+            self._last_step_stats = (step_draft_token_num, can_run_cuda_graph)
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,
                 accept_lens,
                 accept_index,
-                self.draft_token_num,
+                step_draft_token_num,
             )
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
@@ -463,7 +546,7 @@ class NGRAMWorker(BaseSpecWorker):
                     logits_output,
                     predict,
                     accept_index,
-                    self.draft_token_num - 1,
+                    step_draft_token_num - 1,
                 )
 
             if on_publish is not None:
@@ -480,6 +563,8 @@ class NGRAMWorker(BaseSpecWorker):
                 self.ngram_corpus.erase_match_state(list(departed_rids))
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
+            # Row stride of accept_tokens/next_token_ids in this result.
+            result_stride = step_draft_token_num
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)
@@ -496,13 +581,17 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens[:, 0] = predict
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
+            result_stride = self.draft_token_num
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
-        # Construct the next draft input
+        # Construct the next draft input. draft_token_num must be the stride
+        # accept_tokens was laid out with (this step's tier), NOT the cap: the
+        # next step's _prepare_draft_tokens and the result processor both
+        # unpack with it.
         next_draft_input = NgramVerifyInput(
-            draft_token_num=self.draft_token_num,
+            draft_token_num=result_stride,
             new_seq_lens=new_seq_lens,
             accept_tokens=accept_tokens,
             accept_lens=accept_lens,
@@ -517,5 +606,5 @@ class NGRAMWorker(BaseSpecWorker):
             # it via on_publish instead.
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=result_stride,
         )

@@ -735,7 +735,10 @@ class MambaMixer2(torch.nn.Module):
                     ),
                     disable_state_update=True,
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
-                    cache_steps=draft_token_num,
+                    # Per-req write stride into the intermediate buffer: must
+                    # be its allocated step dim, not this step's draft length
+                    # (they differ under adaptive / variable-length drafting).
+                    cache_steps=layer_cache.intermediate_ssm.shape[1],
                     retrieve_parent_token=metadata.retrieve_parent_token,
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
