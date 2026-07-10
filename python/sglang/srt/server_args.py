@@ -1749,6 +1749,13 @@ class ServerArgs:
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_draft_tiers: A[
+        Optional[List[int]],
+        "Candidate per-step draft lengths for ngram speculative decoding, e.g. 8 12 16 24. "
+        "The corpus is always queried at max(tiers) and the draft tree is truncated to the "
+        "chosen tier each step (accept-length EMA + draft-tree depth). A single value (or "
+        "unset) keeps the static behavior. Sets --speculative-num-draft-tokens to max(tiers).",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Expert parallelism

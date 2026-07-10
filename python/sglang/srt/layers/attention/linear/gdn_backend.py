@@ -527,7 +527,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
                 intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
+                # Per-req write stride into the intermediate buffer: must be
+                # its allocated step dim, not this step's draft length (they
+                # differ under adaptive / variable-length drafting).
+                cache_steps=intermediate_state_cache.shape[1],
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
