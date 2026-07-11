@@ -45,6 +45,78 @@ class NGRAMWorker(BaseSpecWorker):
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
 
+    def init_cuda_graphs(self):
+        """Build one (target attn backend, decode graph runner) pair per
+        non-cap tier so every tier's verify runs on a CUDA graph.
+
+        The scheduler calls this after the target worker captured its own
+        decode graphs (at the cap width), so ``model_runner.decode_cuda_graph_runner``
+        already exists. Each tier gets its own attention backend instance
+        because the backend's cuda-graph state (e.g. the mamba verify
+        query_start_loc cache) is width-shaped; runtime switching is two
+        pointer swaps before the verify forward (same mechanism as the
+        adaptive SpecRuntimeState swap in eagle_worker_v2).
+        """
+        mr = self.model_runner
+        cap = self.draft_token_num
+        main_runner = getattr(mr, "decode_cuda_graph_runner", None)
+        self._tier_runtime = {cap: (mr.attn_backend, main_runner)}
+        self._active_tier = cap
+        if len(self.draft_tiers) == 1:
+            return
+        if main_runner is None:
+            # Graphs disabled: the eager metadata path is fully shape-dynamic,
+            # so all tiers run eager on the main backend.
+            logger.info(
+                "[ngram-bet-short] cuda graphs disabled; tiers %s run eager",
+                self.draft_tiers,
+            )
+            return
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.utils import get_available_gpu_memory
+
+        for d in self.draft_tiers[:-1]:
+            tic = perf_counter()
+            before_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+            backup_ws = mr.init_new_workspace
+            try:
+                tier_backend = mr._get_attention_backend(init_new_workspace=True)
+            finally:
+                mr.init_new_workspace = backup_ws
+            tier_runner = DecodeCudaGraphRunner(
+                mr,
+                attn_backend=tier_backend,
+                speculative_num_draft_tokens=d,
+            )
+            self._tier_runtime[d] = (tier_backend, tier_runner)
+            after_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+            logger.info(
+                "[ngram-bet-short] captured tier d=%d verify graphs: "
+                "elapsed=%.1fs mem=%.2fGB avail=%.2fGB",
+                d,
+                perf_counter() - tic,
+                before_mem - after_mem,
+                after_mem,
+            )
+
+    def _activate_tier(self, d: int) -> None:
+        """Point the target model_runner at tier ``d``'s verify runtime.
+
+        Lazy switch: only swaps when the tier changes. With graphs disabled
+        (no prebuilt pair) the main backend stays active — its eager path
+        reads all widths from spec_info dynamically.
+        """
+        if d == self._active_tier:
+            return
+        pair = self._tier_runtime.get(d)
+        if pair is not None:
+            mr = self.model_runner
+            mr.attn_backend, mr.decode_cuda_graph_runner = pair
+        self._active_tier = d
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -77,20 +149,31 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
 
-        # Variable-length drafting ("bet longer on strong match"): candidate
-        # per-step draft lengths. The corpus is always queried at the cap
-        # (= max tier = speculative_num_draft_tokens) and the draft tree is
-        # truncated to the chosen tier. A single tier keeps static behavior.
+        # Variable-length drafting, bet-short policy: candidate per-step draft
+        # lengths. The corpus is always queried at the cap (= max tier =
+        # speculative_num_draft_tokens) and the draft tree is truncated to the
+        # chosen tier. Default is the SMALLEST tier (verify width is the
+        # dominant per-step cost: MoE expert amplification grows with token
+        # count); the largest tier is bet only on a strong current-step match
+        # signal (draft-tree depth >= bet_long_depth). A single tier keeps
+        # static behavior.
         self.draft_tiers: List[int] = sorted(
             server_args.speculative_ngram_draft_tiers
             or [server_args.speculative_num_draft_tokens]
         )
         assert self.draft_tiers[-1] == self.draft_token_num
-        # EMA of accepted drafts per verify step; drives tier selection.
-        # Starts at 0 so cold start bets the smallest tier and ramps up.
+        self._bet_long_depth = server_args.speculative_ngram_bet_long_depth
+        # EMA of accepted drafts per verify step. Observability only — NOT a
+        # tier gate: it lags one step and pins the tier at the minimum
+        # (Phase 0 finding); up-tiering keys on the current-step tree depth.
         self._accept_len_ema = 0.0
         self._verify_step_count = 0
         self._last_step_stats = None  # (chosen_tier, can_run_cuda_graph)
+        # Per-tier verify runtime pairs (target attn backend, decode graph
+        # runner), keyed by draft length; built in init_cuda_graphs after the
+        # target worker captured its cap-width graphs.
+        self._tier_runtime: dict = {}
+        self._active_tier = self.draft_token_num
         # Stride of the accept_tokens staging consumed from batch.spec_info in
         # _prepare_draft_tokens; _update_ngram_corpus reuses it after
         # batch.spec_info has been replaced by this step's verify input.
@@ -458,13 +541,15 @@ class NGRAMWorker(BaseSpecWorker):
             prof.add("alloc_prep", perf_counter() - t)
 
     def _choose_draft_tier(self, bs: int, mask: np.ndarray) -> int:
-        """Pick this step's draft length from self.draft_tiers.
+        """Cost-driven bet-short tier policy.
 
-        Signals: the draft tree's deepest chain (how far the corpus can
-        continue right now) and the accept-length EMA (how much of recent
-        bets was actually accepted). Bet roughly twice the recent accept
-        length, bounded by the available continuation, then round up to the
-        smallest tier that covers it.
+        Verify width is the dominant per-step cost on this stack (profiling:
+        MoE expert weight traffic amplifies ~5x from 1 to 16 verify tokens),
+        so default to the SMALLEST tier and bet the largest one only on a
+        strong current-step signal: the draft tree's deepest chain reaching
+        --speculative-ngram-bet-long-depth tokens. The accept-length EMA is
+        deliberately not a gate — it lags one step and pins the tier at the
+        minimum after any miss run (Phase 0 finding).
         """
         if len(self.draft_tiers) == 1:
             return self.draft_tiers[0]
@@ -473,11 +558,9 @@ class NGRAMWorker(BaseSpecWorker):
         # tokens = row sum - 1; zero-padded rows read as depth 1 and never
         # dominate a real chain.
         tree_depth = int(mask.reshape(bs, cap, cap).sum(axis=2).max()) - 1
-        want = min(tree_depth, int(2.0 * self._accept_len_ema) + 2)
-        for tier in self.draft_tiers:
-            if tier >= want:
-                return tier
-        return self.draft_tiers[-1]
+        if tree_depth >= self._bet_long_depth:
+            return self.draft_tiers[-1]
+        return self.draft_tiers[0]
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
@@ -525,6 +608,10 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
+            # Point the target at this tier's (attn backend, graph runner)
+            # pair so the verify runs on a width-matching CUDA graph.
+            self._activate_tier(verify_input.draft_token_num)
+
             # Prepare grammar data on CPU if needed
             if batch.has_grammar:
                 retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()

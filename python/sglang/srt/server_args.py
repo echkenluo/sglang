@@ -1751,11 +1751,19 @@ class ServerArgs:
     ] = 10000000
     speculative_ngram_draft_tiers: A[
         Optional[List[int]],
-        "Candidate per-step draft lengths for ngram speculative decoding, e.g. 8 12 16 24. "
+        "Candidate per-step draft lengths for ngram speculative decoding, e.g. 4 16. "
         "The corpus is always queried at max(tiers) and the draft tree is truncated to the "
-        "chosen tier each step (accept-length EMA + draft-tree depth). A single value (or "
-        "unset) keeps the static behavior. Sets --speculative-num-draft-tokens to max(tiers).",
+        "chosen tier each step (bet-short policy: smallest tier by default, largest tier "
+        "when the current draft tree is deep enough — see "
+        "--speculative-ngram-bet-long-depth). A single value (or unset) keeps the static "
+        "behavior. Sets --speculative-num-draft-tokens to max(tiers).",
     ] = None
+    speculative_ngram_bet_long_depth: A[
+        int,
+        "NGRAM variable drafting: bet the largest tier only when the current step's "
+        "draft-tree deepest chain reaches this many tokens; otherwise bet the smallest "
+        "tier. Only used when --speculative-ngram-draft-tiers has multiple tiers.",
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Expert parallelism
