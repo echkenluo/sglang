@@ -1,4 +1,5 @@
 import logging
+from time import perf_counter
 from typing import List, Optional
 
 import numpy as np
@@ -11,6 +12,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.step_prof import StepProf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -93,6 +95,10 @@ class NGRAMWorker(BaseSpecWorker):
         # _prepare_draft_tokens; _update_ngram_corpus reuses it after
         # batch.spec_info has been replaced by this step's verify input.
         self._prev_stride = self.draft_token_num
+
+        # Sampling step-segment profiler (SGLANG_STEP_PROF=1). None when
+        # disabled: every instrumentation site is guarded, zero overhead.
+        self._step_prof = StepProf.maybe_create("ngram_spec", tp_rank)
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -257,6 +263,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch.spec_info.accept_tokens,
             batch.spec_info.accept_lens,
         )
+        prof = self._step_prof
+        t = perf_counter() if prof else 0.0
         if not prev_token_ids.is_cpu:
             prev_token_ids = prev_token_ids.cpu()
             prev_accept_lens = prev_accept_lens.cpu()
@@ -264,6 +272,10 @@ class NGRAMWorker(BaseSpecWorker):
         # _update_ngram_corpus after verify within the same forward call.
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
+        if prof:
+            # GPU wait: D2H sync on the previous step's accept tensors.
+            prof.add("accept_sync", perf_counter() - t)
+            t = perf_counter()
 
         self.ngram_corpus.synchronize()
         req_ids = []
@@ -297,6 +309,9 @@ class NGRAMWorker(BaseSpecWorker):
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
+        if prof:
+            # Corpus insert-thread sync + token-tail assembly + cpp batchMatch.
+            prof.add("draft_lookup", perf_counter() - t)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -316,6 +331,8 @@ class NGRAMWorker(BaseSpecWorker):
         cap = self.draft_token_num
 
         req_drafts, mask = self._prepare_draft_tokens(batch)
+        prof = self._step_prof
+        t = perf_counter() if prof else 0.0
         d = self._choose_draft_tier(bs, mask)
         if d < cap:
             # fillResult emits BFS order, so the first d nodes of each
@@ -327,6 +344,9 @@ class NGRAMWorker(BaseSpecWorker):
             mask = np.ascontiguousarray(
                 mask.reshape(bs, cap, cap)[:, :d, :d]
             ).reshape(-1)
+        if prof:
+            prof.add("tier_select", perf_counter() - t)
+            t = perf_counter()
 
         (
             retrieve_index,
@@ -339,6 +359,10 @@ class NGRAMWorker(BaseSpecWorker):
 
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+        if prof:
+            # H2D staging of draft tokens + qlen tree mask (launch cost).
+            prof.add("staging_h2d", perf_counter() - t)
+            t = perf_counter()
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
@@ -351,6 +375,9 @@ class NGRAMWorker(BaseSpecWorker):
             bs,
             d,
         )
+        if prof:
+            prof.add("tree_reconstruct", perf_counter() - t)
+            t = perf_counter()
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
@@ -372,6 +399,11 @@ class NGRAMWorker(BaseSpecWorker):
                 ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
+        if prof:
+            # Per-req full-mask expansion: H2D of qlen mask + GPU ones/cat
+            # launches; O(sum(seq_len) * d) traffic — prime floor suspect.
+            prof.add("full_mask", perf_counter() - t)
+            t = perf_counter()
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -396,6 +428,8 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=d,
         )
+        if prof:
+            prof.add("alloc_prep", perf_counter() - t)
 
     def _choose_draft_tier(self, bs: int, mask: np.ndarray) -> int:
         """Pick this step's draft length from self.draft_tiers.
@@ -454,6 +488,9 @@ class NGRAMWorker(BaseSpecWorker):
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
+        prof = self._step_prof
+        t_step = perf_counter() if prof else 0.0
+
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -470,9 +507,14 @@ class NGRAMWorker(BaseSpecWorker):
                     verify_input.retrieve_next_token.shape
                 ).cpu()
 
+            t = perf_counter() if prof else 0.0
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
+            if prof:
+                # Target verify forward, launch-to-return on this thread
+                # (graph replay dispatch or eager launch; not kernel time).
+                prof.add("verify_fwd", perf_counter() - t)
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -507,11 +549,15 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
+            t = perf_counter() if prof else 0.0
             (
                 predict,
                 accept_lens,
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+            if prof:
+                prof.add("verify_sample", perf_counter() - t)
+                t = perf_counter()
             new_seq_lens = batch.seq_lens + accept_lens
             # This step's draft length; with variable drafting it can differ
             # from self.draft_token_num (the cap), so every layout-stride
@@ -525,6 +571,9 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 step_draft_token_num,
             )
+            if prof:
+                prof.add("mamba_commit", perf_counter() - t)
+                t = perf_counter()
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
@@ -537,6 +586,9 @@ class NGRAMWorker(BaseSpecWorker):
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
             )
+            if prof:
+                # Accept gather + accepted-KV relocation launches.
+                prof.add("kv_move", perf_counter() - t)
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's
                 # accept_index is (bs, draft_token_num) -- the tree depth is not
@@ -552,6 +604,7 @@ class NGRAMWorker(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
+            t = perf_counter() if prof else 0.0
             self._update_ngram_corpus(batch)
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
@@ -565,6 +618,10 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
             # Row stride of accept_tokens/next_token_ids in this result.
             result_stride = step_draft_token_num
+            if prof:
+                # CPU corpus insert enqueue + match-state GC.
+                prof.add("corpus_update", perf_counter() - t)
+                prof.end_step(perf_counter() - t_step)
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)

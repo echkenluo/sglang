@@ -1532,9 +1532,18 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        from sglang.srt.observability.step_prof import StepProf
+
+        # Per-iteration segment profiler (SGLANG_STEP_PROF=1); decode-only
+        # stats. Only meaningful under --disable-overlap-schedule (this loop);
+        # overlap lanes rely on the worker-side profilers + torch profiler.
+        step_prof = StepProf.maybe_create("sched_loop", self.ps.tp_rank)
+
         while True:
             if self.gracefully_exit:
                 break
+
+            t0 = time.perf_counter() if step_prof else 0.0
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1542,14 +1551,26 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            t1 = time.perf_counter() if step_prof else 0.0
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            t2 = time.perf_counter() if step_prof else 0.0
+
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                t3 = time.perf_counter() if step_prof else 0.0
                 self.process_batch_result(batch, result)
+                if step_prof and batch.forward_mode.is_decode():
+                    t4 = time.perf_counter()
+                    step_prof.add("recv", t1 - t0)
+                    step_prof.add("schedule", t2 - t1)
+                    step_prof.add("launch", t3 - t2)
+                    step_prof.add("process", t4 - t3)
+                    step_prof.end_step(t4 - t0)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()

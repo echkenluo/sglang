@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from time import perf_counter
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -260,6 +261,15 @@ class TpModelWorker(BaseTpWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
+        # Sampling step-segment profiler for plain decode steps
+        # (SGLANG_STEP_PROF=1); None when disabled — zero overhead.
+        from sglang.srt.observability.step_prof import StepProf
+
+        self._step_prof = (
+            StepProf.maybe_create("plain_decode", tp_rank)
+            if not is_draft_worker
+            else None
+        )
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
         # Draft worker: target's effective context length; the draft runs at
@@ -494,12 +504,25 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
+        # Step-segment profiling: plain decode steps only (spec verify calls
+        # arrive as TARGET_VERIFY and are timed by the spec worker instead).
+        prof = self._step_prof
+        want_prof = (
+            prof is not None
+            and batch is not None
+            and batch.forward_mode.is_decode()
+            and self.pp_group.is_last_rank
+        )
+        t_step = perf_counter() if want_prof else 0.0
+
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            if want_prof:
+                prof.add("fb_init", perf_counter() - t_step)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -511,10 +534,15 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            t = perf_counter() if want_prof else 0.0
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if want_prof:
+                # Launch-to-return on this thread (graph replay or eager
+                # launch; not kernel time).
+                prof.add("model_fwd", perf_counter() - t)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -541,13 +569,20 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
+                if want_prof:
+                    # Sampling deferred to the scheduler thread this step.
+                    prof.end_step(perf_counter() - t_step)
                 return batch_result
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                t = perf_counter() if want_prof else 0.0
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if want_prof:
+                    prof.add("sample", perf_counter() - t)
+                    prof.end_step(perf_counter() - t_step)
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
