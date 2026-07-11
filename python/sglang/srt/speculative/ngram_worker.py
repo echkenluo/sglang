@@ -204,6 +204,24 @@ class NGRAMWorker(BaseSpecWorker):
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
 
+        # Pinned host staging for the per-step numpy -> GPU uploads. A pageable
+        # `torch.from_numpy(...)` source forces cudaMemcpyAsync through a
+        # sync-ing driver staging buffer (profiling: ~8 pageable H2D + stream
+        # syncs per step); writing into these reused pinned buffers first
+        # (cheap CPU memcpy + dtype cast, <30KB) makes both H2D copies truly
+        # async. Cross-step reuse is safe: before the next CPU write, the
+        # accept tensors of the previous verify are read back with `.cpu()`
+        # (in _prepare_draft_tokens under overlap, or in the result processor
+        # in sync mode), which drains the stream past the previous H2D.
+        self._drafts_pin = torch.empty(
+            (max_total_drafts,), dtype=torch.int64, pin_memory=True
+        )
+        self._mask_pin = torch.empty(
+            (max_total_mask_size,), dtype=torch.bool, pin_memory=True
+        )
+        self._drafts_pin_np = self._drafts_pin.numpy()
+        self._mask_pin_np = self._mask_pin.numpy()
+
     def _get_step_views(self, bs: int, d: int):
         """Carve contiguous (bs, d)/flat views over the cap-sized backings.
 
@@ -357,10 +375,16 @@ class NGRAMWorker(BaseSpecWorker):
             draft_tokens,
         ) = self._get_step_views(bs, d)
 
-        tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
-        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+        n_tok = bs * d
+        n_mask = n_tok * d
+        # CPU write into pinned staging (int64 -> bool cast for the mask
+        # happens here, on <=27K elements), then same-dtype async H2D.
+        self._drafts_pin_np[:n_tok] = req_drafts
+        self._mask_pin_np[:n_mask] = mask
+        tree_mask.copy_(self._mask_pin[:n_mask], non_blocking=True)
+        draft_tokens.copy_(self._drafts_pin[:n_tok], non_blocking=True)
         if prof:
-            # H2D staging of draft tokens + qlen tree mask (launch cost).
+            # Pinned staging write + async H2D of draft tokens + qlen mask.
             prof.add("staging_h2d", perf_counter() - t)
             t = perf_counter()
 
@@ -382,26 +406,28 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
-            tree_mask = []
-            mask = mask.reshape(bs, d, d)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
+            # Assemble the full mask on GPU from the qlen mask already staged
+            # in `tree_mask`. The old path re-uploaded each request's (d, d)
+            # block from pageable numpy (sync-forcing cudaMemcpyAsync) and
+            # paid per-req ones/cat/cast kernels; this is one fused ones-fill
+            # plus bs strided D2D writes, bit-identical bool layout
+            # (row r of request i = [True x seq_len_i | tree row r]).
+            qlen_mask = tree_mask.view(bs, d, d)
+            # [:bs] guard: total below sums the list, so any padded tail in
+            # seq_lens_cpu (unlike the old per-index reads) must be excluded.
+            seq_lens_list = batch.seq_lens_cpu[:bs].tolist()
+            total = d * (sum(seq_lens_list) + bs * d)
+            full_mask_out = torch.ones(total, dtype=torch.bool, device=self.device)
+            off = 0
             for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones((d, seq_len), device=self.device)
-                req_mask = torch.cat(
-                    (
-                        req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+                s = seq_lens_list[i]
+                full_mask_out[off : off + d * (s + d)].view(d, s + d)[
+                    :, s:
+                ] = qlen_mask[i]
+                off += d * (s + d)
+            tree_mask = full_mask_out
         if prof:
-            # Per-req full-mask expansion: H2D of qlen mask + GPU ones/cat
-            # launches; O(sum(seq_len) * d) traffic — prime floor suspect.
+            # Full-mask GPU assembly (ones fill + bs strided D2D writes).
             prof.add("full_mask", perf_counter() - t)
             t = perf_counter()
 
