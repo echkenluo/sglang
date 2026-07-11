@@ -1071,9 +1071,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
-                cached_tokens_details[index] = content["meta_info"].get(
+                cached_tokens_details_value = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if cached_tokens_details_value is not None:
+                    cached_tokens_details[index] = cached_tokens_details_value
+                else:
+                    cached_tokens_details.setdefault(index, None)
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
