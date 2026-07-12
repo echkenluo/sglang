@@ -66,6 +66,10 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.entrypoints.openai.incremental_encode import (
+    IncrementalTokenizeCache,
+    inc_tok_mode,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.observability.req_prof import (
     add_mark as req_prof_add_mark,
@@ -236,6 +240,24 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        # Incremental prompt tokenization cache (SGLANG_INCREMENTAL_TOKENIZE);
+        # created lazily on first use so the off mode allocates nothing.
+        self._inc_tok_cache = None
+
+    def _encode_prompt_ids(self, rendered_prompt: str, encode_kwargs: dict):
+        """Encode the rendered chat prompt, via the incremental cache when
+        SGLANG_INCREMENTAL_TOKENIZE is on/verify (append-only agent prompts
+        re-encode only the tail). Off mode is a straight passthrough."""
+        if inc_tok_mode():
+            if self._inc_tok_cache is None:
+                self._inc_tok_cache = IncrementalTokenizeCache()
+            return self._inc_tok_cache.encode(
+                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+            )
+        return self.tokenizer_manager.tokenizer.encode(
+            rendered_prompt, **encode_kwargs
+        )
 
     def _handle_last_assistant_message(
         self,
@@ -879,9 +901,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if req_prof_enabled():
                     req_prof_add_mark("template", perf_counter() - _rp_t)
                     _rp_t = perf_counter()
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
+                prompt_ids = self._encode_prompt_ids(rendered_prompt, encode_kwargs)
                 if req_prof_enabled():
                     req_prof_add_mark("encode", perf_counter() - _rp_t)
             except Exception:
@@ -907,8 +927,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     if req_prof_enabled():
                         req_prof_add_mark("template", perf_counter() - _rp_t)
                         _rp_t = perf_counter()
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
+                    prompt_ids = self._encode_prompt_ids(
+                        rendered_prompt, encode_kwargs
                     )
                     if req_prof_enabled():
                         req_prof_add_mark("encode", perf_counter() - _rp_t)
