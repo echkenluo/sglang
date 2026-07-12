@@ -101,19 +101,22 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
             if req_prof_enabled():
-                marks = req_prof_pop_marks()
-                if hasattr(adapted_request, "req_prof"):
-                    adapted_request.req_prof = {
-                        "t_asgi": getattr(
-                            getattr(raw_request, "state", None),
-                            "req_prof_t_asgi",
-                            None,
-                        ),
-                        "t_handler": received_time,
-                        "t_convert_done": monotonic_time(),
-                        "template": marks.get("template", 0.0),
-                        "encode": marks.get("encode", 0.0),
-                    }
+                # Plain assignments only (req-prof v2): stamp serving-layer
+                # durations onto the request object; consumed at the
+                # TokenizerManager finish block. No control-flow change; any
+                # failure degrades to a missing bill line, never a request
+                # error.
+                try:
+                    marks = req_prof_pop_marks()
+                    if hasattr(adapted_request, "req_prof"):
+                        adapted_request.req_prof = {
+                            "t_handler": received_time,
+                            "t_convert_done": monotonic_time(),
+                            "template": marks.get("template", 0.0),
+                            "encode": marks.get("encode", 0.0),
+                        }
+                except Exception:
+                    pass
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
