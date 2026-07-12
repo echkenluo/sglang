@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+from time import perf_counter
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -357,6 +358,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
 
+        # Per-replay launch profiler (SGLANG_GRAPH_LAUNCH_PROF=1): splits the
+        # replay wall into `prepare` (buffer fill + metadata replay) and
+        # `launch_bs*` (backend.replay = cudaGraphLaunch API wall; async
+        # enqueue, so long values mean the launch API itself blocks). None
+        # when disabled — zero overhead.
+        from sglang.srt.observability.step_prof import StepProf
+
+        self._launch_prof = StepProf.maybe_create(
+            f"graph-launch-k{self.num_tokens_per_bs}",
+            getattr(model_runner, "tp_rank", 0),
+            env="SGLANG_GRAPH_LAUNCH_PROF",
+        )
+
         # --- capture --------------------------------------------------
         try:
             with model_capture_mode():
@@ -365,6 +379,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        if self._launch_prof is not None:
+            self._log_capture_fingerprint()
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -1006,6 +1022,53 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.bs, stream_idx, variant_label
         )
 
+    def _log_capture_fingerprint(self) -> None:
+        """One-shot post-capture fingerprint for the boot-mode lottery hunt:
+        graph count / per-shape kernel-node counts (via cuGraphGetNodes when
+        cuda-python is available) / allocator segment state / static input
+        buffer addresses (layout coordinates across boots). Env-gated with
+        the launch profiler; failures are logged, never raised.
+        """
+        try:
+            graphs = getattr(self.backend, "_graphs", None) or {}
+            node_counts = {}
+            try:
+                from cuda.bindings import driver as cuda_drv
+
+                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
+                    checkCudaErrors,
+                )
+
+                for key, g in graphs.items():
+                    raw = g.raw_cuda_graph() if hasattr(g, "raw_cuda_graph") else None
+                    if raw is not None:
+                        _, n = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw, 0))
+                        node_counts[str(getattr(key, "size", key))] = int(n)
+            except Exception as e:
+                node_counts = {"unavailable": repr(e)[:60]}
+            stats = torch.cuda.memory_stats(self.model_runner.gpu_id)
+            buf_ptrs = {}
+            for name in ("input_ids", "positions", "out_cache_loc", "custom_mask"):
+                t = getattr(self.buffers, name, None)
+                if t is not None:
+                    buf_ptrs[name] = hex(t.data_ptr())
+            logger.info(
+                "[graph-launch-prof] capture fingerprint k=%d graphs=%d bs=%s "
+                "kernel_nodes=%s alloc_segments=%s reserved=%.2fGB active=%.2fGB "
+                "alloc_retries=%s buf_ptrs=%s",
+                self.num_tokens_per_bs,
+                len(graphs),
+                list(self.capture_bs),
+                node_counts,
+                stats.get("segment.all.current", -1),
+                stats.get("reserved_bytes.all.current", 0) / 1e9,
+                stats.get("active_bytes.all.current", 0) / 1e9,
+                stats.get("num_alloc_retries", -1),
+                buf_ptrs,
+            )
+        except Exception as e:
+            logger.info("[graph-launch-prof] capture fingerprint failed: %r", e)
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1018,6 +1081,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
+        prof = self._launch_prof
+        t0 = perf_counter() if prof else 0.0
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             # Publish a read-done event for the WAR barrier: a cuda-graph forward
@@ -1030,7 +1095,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            t1 = perf_counter() if prof else 0.0
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if prof:
+                t2 = perf_counter()
+                prof.add("prepare", t1 - t0)
+                # Per-bs segment: bs alternation is a lottery suspect (shared
+                # exec updates / driver revalidation on graph switch).
+                prof.add(f"launch_bs{self.bs}", t2 - t1)
+                prof.end_step(t2 - t0)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

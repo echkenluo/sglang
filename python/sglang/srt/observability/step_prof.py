@@ -40,8 +40,10 @@ class StepProf:
     """
 
     @staticmethod
-    def maybe_create(tag: str, rank: int = 0) -> "StepProf | None":
-        raw = os.environ.get("SGLANG_STEP_PROF", "")
+    def maybe_create(
+        tag: str, rank: int = 0, env: str = "SGLANG_STEP_PROF"
+    ) -> "StepProf | None":
+        raw = os.environ.get(env, "")
         if not raw or raw.lower() in ("0", "false") or rank != 0:
             return None
         try:
