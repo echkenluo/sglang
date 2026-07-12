@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from enum import Enum
+from time import perf_counter
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -66,6 +67,10 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_prof import (
+    add_mark as req_prof_add_mark,
+    req_prof_enabled,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -862,6 +867,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
+                _rp_t = perf_counter() if req_prof_enabled() else 0.0
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=False,
@@ -870,9 +876,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                if req_prof_enabled():
+                    req_prof_add_mark("template", perf_counter() - _rp_t)
+                    _rp_t = perf_counter()
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
+                if req_prof_enabled():
+                    req_prof_add_mark("encode", perf_counter() - _rp_t)
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -882,6 +893,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
+                    _rp_t = perf_counter() if req_prof_enabled() else 0.0
                     rendered_prompt = (
                         self.tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
@@ -892,9 +904,14 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
+                    if req_prof_enabled():
+                        req_prof_add_mark("template", perf_counter() - _rp_t)
+                        _rp_t = perf_counter()
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
+                    if req_prof_enabled():
+                        req_prof_add_mark("encode", perf_counter() - _rp_t)
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)

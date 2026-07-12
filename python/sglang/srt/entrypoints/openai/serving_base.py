@@ -13,6 +13,11 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.observability.req_prof import (
+    pop_marks as req_prof_pop_marks,
+    req_prof_enabled,
+    start_marks as req_prof_start_marks,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
 
@@ -90,9 +95,25 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
+            if req_prof_enabled():
+                req_prof_start_marks()
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            if req_prof_enabled():
+                marks = req_prof_pop_marks()
+                if hasattr(adapted_request, "req_prof"):
+                    adapted_request.req_prof = {
+                        "t_asgi": getattr(
+                            getattr(raw_request, "state", None),
+                            "req_prof_t_asgi",
+                            None,
+                        ),
+                        "t_handler": received_time,
+                        "t_convert_done": monotonic_time(),
+                        "template": marks.get("template", 0.0),
+                        "encode": marks.get("encode", 0.0),
+                    }
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
