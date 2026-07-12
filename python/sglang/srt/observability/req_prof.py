@@ -29,15 +29,19 @@ Same-clock segments (TokenizerManager process, perf_counter):
                  approximate from the uvicorn access log if needed)
 
 Scheduler sub-splits of wait_first (from the SchedulerReqTimeStats that
-output_streamer attaches to every batch output; timestamps are converted
-into this process's monotonic frame by ``ReqTimeStatsBase.__setstate__``,
-so they subtract directly — small negatives indicate cross-process clock
-conversion skew and are printed as-is):
-  sq_ipc_in      ZMQ send -> scheduler Req created
-  sq_recv2wq     Req created -> wait queue entry
+output_streamer attaches to every batch output; its ``__getstate__``
+whitelists exactly wait_queue/forward_entry/prefill_finished for the wire
+and only under ``--enable-metrics`` — scheduler_recv_time never travels, so
+the recv->wait-queue us-scale hop is merged into sq_ipc_admit. Timestamps
+are converted into this process's monotonic frame by
+``ReqTimeStatsBase.__setstate__`` and subtract directly; small negatives
+indicate cross-process clock-conversion skew and are printed as-is):
+  sq_ipc_admit   ZMQ send -> wait queue entry (IPC in + recv handling)
   sq_wq2fwd      wait queue -> first forward entry (admission)
   sq_prefill     forward entry -> prefill finished (incl. chunked)
   sq_out         prefill finished -> first token back in TM (detok + IPC back)
+Lanes without --enable-metrics get an explicit ``sq=unavailable`` marker
+instead of silence.
 
 Failure mode of every touch point is "one missing log line", never a request
 error: emission wraps everything in try/except; marks are inert assignments.
@@ -101,18 +105,25 @@ def emit_tm_line(rid, req_prof: dict, ts, sched_ts=None) -> None:
         )
         if sched_ts is not None:
             try:
-                recv = sched_ts.scheduler_recv_time
-                wq = sched_ts.wait_queue_entry_time
-                fe = sched_ts.forward_entry_time
-                pf = sched_ts.prefill_finished_time
-                if recv and wq and fe and pf:
+                # SchedulerReqTimeStats.__getstate__ whitelists exactly three
+                # timestamps for the wire (wait_queue / forward_entry /
+                # prefill_finished; scheduler_recv_time is NOT serialized and
+                # unpickles to the 0.0 class default), and only under
+                # --enable-metrics. Split wait_first with what travels;
+                # recv->wait-queue is us-scale and merges into sq_ipc_admit.
+                wq = getattr(sched_ts, "wait_queue_entry_time", 0.0)
+                fe = getattr(sched_ts, "forward_entry_time", 0.0)
+                pf = getattr(sched_ts, "prefill_finished_time", 0.0)
+                if wq and fe and pf:
                     line += (
-                        f" | sq_ipc_in={(recv - ts.api_server_dispatch_time) * 1e3:.1f}"
-                        f" sq_recv2wq={(wq - recv) * 1e3:.1f}"
+                        f" | sq_ipc_admit={(wq - ts.api_server_dispatch_time) * 1e3:.1f}"
                         f" sq_wq2fwd={(fe - wq) * 1e3:.1f}"
                         f" sq_prefill={(pf - fe) * 1e3:.1f}"
                         f" sq_out={(ts.first_token_time - pf) * 1e3:.1f}"
                     )
+                else:
+                    # Diagnosable, not silent (silence cost one roundtrip).
+                    line += " | sq=unavailable(needs --enable-metrics)"
             except Exception:
                 pass  # sched splits are best-effort garnish
         logger.info(line)
