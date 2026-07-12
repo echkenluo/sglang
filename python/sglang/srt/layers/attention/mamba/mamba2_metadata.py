@@ -241,7 +241,22 @@ class Mamba2Metadata(ForwardMetadata):
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
-        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        # prep_initial_states gates chunk_indices/offsets construction below.
+        # Deriving it from the GPU `has_initial_states` needs a `.item()` D2H
+        # that stalls the eager-prefill critical path (no cuda-graph cover).
+        # `extend_prefix_lens_cpu` is the exact host mirror of
+        # `extend_prefix_lens` (same source list, or its `.cpu()`; see
+        # ForwardBatch.init_new), so the CPU-side test is bit-identical and
+        # sync-free. Fall back to the D2H only on the gpu_only path where the
+        # cpu mirror is absent (same condition as `extend_seq_lens_cpu is None`
+        # handled above).
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if extend_prefix_lens_cpu is not None:
+            prep_initial_states = any(
+                int(x) > 0 for x in extend_prefix_lens_cpu[:num_prefills]
+            )
+        else:
+            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
         _seq_idx_output_size = (
