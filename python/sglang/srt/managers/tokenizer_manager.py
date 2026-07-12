@@ -2085,10 +2085,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
-                if req_prof_enabled():
-                    rp = getattr(state.obj, "req_prof", None)
-                    if rp:
-                        emit_req_prof_tm_line(rid, rp, state.time_stats)
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
@@ -2097,6 +2093,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+
+                # [req-prof] v2: single emission at request termination (this
+                # wrap-up block runs once per request, outside the token hot
+                # path). Reads existing timestamps only; scheduler splits come
+                # from recv_obj.time_stats which output_streamer attaches per
+                # request unconditionally. Any failure is swallowed inside
+                # emit — worst case is a missing log line.
+                if req_prof_enabled():
+                    rp = getattr(state.obj, "req_prof", None)
+                    if rp:
+                        sched_ts = (
+                            recv_obj.time_stats[i]
+                            if getattr(recv_obj, "time_stats", None)
+                            and len(recv_obj.time_stats) > i
+                            else None
+                        )
+                        emit_req_prof_tm_line(rid, rp, state.time_stats, sched_ts)
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)

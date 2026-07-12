@@ -1,34 +1,47 @@
-"""Per-request TTFT segment profiler (env ``SGLANG_REQUEST_PROF=1``).
+"""Per-request TTFT segment bill (env ``SGLANG_REQUEST_PROF=1``) — v2.
 
-Two one-line bills per request, joined offline by rid:
+v2 zero-intervention principle (v1 post-mortem: a BaseHTTPMiddleware arrival
+stamp deadlocked the kick-started StreamingResponse path — requests never
+reached the scheduler and shutdown raised "aclose(): asynchronous generator
+is already running"). v2 therefore:
 
-  [req-prof]        (TokenizerManager process, printed at the first-token
-                     write point) — same-clock segments:
-      http_parse    ASGI arrival -> handler entry (starlette body read +
-                    pydantic validation; needs the env-gated middleware)
-      template      apply_chat_template render time (serving_chat marks)
-      encode        tokenizer.encode time (serving_chat marks)
-      convert_other handler entry -> adapted request ready, minus the two
-                    marks (validation, sampling params, python glue)
-      tm_ingest     adapted request ready -> TokenizerManager tokenize done
-                    (async handoff + TM-side passthrough)
-      dispatch      tokenize done -> ZMQ send to scheduler
-      wait_first    ZMQ send -> first token back in TokenizerManager
-                    (merged cross-process envelope: IPC + scheduler admit +
-                    prefill + first decode + detokenize + IPC back)
-      total         arrival (or handler entry) -> first token
+  * adds NO middleware and touches NO async generator / control flow;
+  * only (a) plain ``perf_counter()`` assignments in the serving layer
+    (template/encode marks via a request-task-local ContextVar), and (b) ONE
+    log-line emission at the existing request-termination wrap-up block in
+    ``TokenizerManager._handle_batch_output`` (``state.finished``), once per
+    request, outside the token hot path.
 
-  [req-prof-sched]  (Scheduler process, printed at prefill-finish) — its own
-                    clock, sub-splits wait_first:
-      recv_to_wq    Req created -> wait queue entry
-      wq_to_fwd     wait queue -> first forward entry (admission)
-      prefill_fwd   forward entry -> prefill finished (incl. chunked)
+One line per request::
 
-Zero default overhead: every call site is gated on req_prof_enabled();
-serving-layer marks ride a ContextVar so nothing is threaded through
-signatures. All failures are swallowed into a log line — never a request
-error. Streaming chat-completions is the covered path (codex's); other
-template branches simply lack the template/encode split.
+  [req-prof] rid=.. total=.. template=.. encode=.. convert_other=..
+      tm_ingest=.. dispatch=.. wait_first=.. | sq_ipc_in=.. sq_recv2wq=..
+      sq_wq2fwd=.. sq_prefill=.. sq_out=..
+
+Same-clock segments (TokenizerManager process, perf_counter):
+  template       apply_chat_template render (serving_chat marks, cumulative)
+  encode         tokenizer.encode (serving_chat marks)
+  convert_other  handler entry -> adapted request ready, minus the two marks
+  tm_ingest      adapted ready -> TM tokenize done (async handoff+passthrough)
+  dispatch       tokenize done -> ZMQ send
+  wait_first     ZMQ send -> first token back in TM (cross-process envelope)
+  total          handler entry -> first token   (http_parse is NOT measured;
+                 approximate from the uvicorn access log if needed)
+
+Scheduler sub-splits of wait_first (from the SchedulerReqTimeStats that
+output_streamer attaches to every batch output; timestamps are converted
+into this process's monotonic frame by ``ReqTimeStatsBase.__setstate__``,
+so they subtract directly — small negatives indicate cross-process clock
+conversion skew and are printed as-is):
+  sq_ipc_in      ZMQ send -> scheduler Req created
+  sq_recv2wq     Req created -> wait queue entry
+  sq_wq2fwd      wait queue -> first forward entry (admission)
+  sq_prefill     forward entry -> prefill finished (incl. chunked)
+  sq_out         prefill finished -> first token back in TM (detok + IPC back)
+
+Failure mode of every touch point is "one missing log line", never a request
+error: emission wraps everything in try/except; marks are inert assignments.
+Covered path: single-request streaming chat completions (codex's).
 """
 
 from __future__ import annotations
@@ -68,57 +81,40 @@ def pop_marks() -> dict:
     return d or {}
 
 
-def emit_tm_line(rid, req_prof: dict, ts) -> None:
-    """ts: APIServerReqTimeStats (same process/clock as req_prof floats)."""
+def emit_tm_line(rid, req_prof: dict, ts, sched_ts=None) -> None:
+    """ts: APIServerReqTimeStats; sched_ts: SchedulerReqTimeStats or None."""
     try:
-        t_asgi = req_prof.get("t_asgi")
         t_handler = req_prof["t_handler"]
         t_conv = req_prof["t_convert_done"]
         template_ms = req_prof.get("template", 0.0) * 1e3
         encode_ms = req_prof.get("encode", 0.0) * 1e3
-        base = t_asgi if t_asgi else t_handler
-        http_parse = (t_handler - t_asgi) * 1e3 if t_asgi else -1.0
         convert_other = (t_conv - t_handler) * 1e3 - template_ms - encode_ms
         tm_ingest = (ts.tokenize_finish_time - t_conv) * 1e3
         dispatch = (ts.api_server_dispatch_time - ts.tokenize_finish_time) * 1e3
         wait_first = (ts.first_token_time - ts.api_server_dispatch_time) * 1e3
-        total = (ts.first_token_time - base) * 1e3
-        logger.info(
-            "[req-prof] rid=%s total=%.1f http_parse=%.1f template=%.1f "
-            "encode=%.1f convert_other=%.1f tm_ingest=%.1f dispatch=%.1f "
-            "wait_first=%.1f",
-            rid,
-            total,
-            http_parse,
-            template_ms,
-            encode_ms,
-            convert_other,
-            tm_ingest,
-            dispatch,
-            wait_first,
+        total = (ts.first_token_time - t_handler) * 1e3
+        line = (
+            f"[req-prof] rid={rid} total={total:.1f} template={template_ms:.1f} "
+            f"encode={encode_ms:.1f} convert_other={convert_other:.1f} "
+            f"tm_ingest={tm_ingest:.1f} dispatch={dispatch:.1f} "
+            f"wait_first={wait_first:.1f}"
         )
+        if sched_ts is not None:
+            try:
+                recv = sched_ts.scheduler_recv_time
+                wq = sched_ts.wait_queue_entry_time
+                fe = sched_ts.forward_entry_time
+                pf = sched_ts.prefill_finished_time
+                if recv and wq and fe and pf:
+                    line += (
+                        f" | sq_ipc_in={(recv - ts.api_server_dispatch_time) * 1e3:.1f}"
+                        f" sq_recv2wq={(wq - recv) * 1e3:.1f}"
+                        f" sq_wq2fwd={(fe - wq) * 1e3:.1f}"
+                        f" sq_prefill={(pf - fe) * 1e3:.1f}"
+                        f" sq_out={(ts.first_token_time - pf) * 1e3:.1f}"
+                    )
+            except Exception:
+                pass  # sched splits are best-effort garnish
+        logger.info(line)
     except Exception as e:
         logger.info("[req-prof] emit failed rid=%s: %r", rid, e)
-
-
-def emit_sched_line(req) -> None:
-    """req: scheduler Req with SchedulerReqTimeStats (scheduler clock)."""
-    try:
-        ts = req.time_stats
-        recv = ts.scheduler_recv_time
-        wq = ts.wait_queue_entry_time
-        fe = ts.forward_entry_time
-        pf = ts.prefill_finished_time
-        if not (recv and wq and fe and pf):
-            return
-        logger.info(
-            "[req-prof-sched] rid=%s recv_to_wq=%.1f wq_to_fwd=%.1f "
-            "prefill_fwd=%.1f sched_total=%.1f",
-            req.rid,
-            (wq - recv) * 1e3,
-            (fe - wq) * 1e3,
-            (pf - fe) * 1e3,
-            (pf - recv) * 1e3,
-        )
-    except Exception as e:
-        logger.info("[req-prof-sched] emit failed: %r", e)
