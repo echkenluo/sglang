@@ -96,6 +96,10 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.observability.req_prof import (
+    emit_tm_line as emit_req_prof_tm_line,
+    req_prof_enabled,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -2081,6 +2085,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                if req_prof_enabled():
+                    rp = getattr(state.obj, "req_prof", None)
+                    if rp:
+                        emit_req_prof_tm_line(rid, rp, state.time_stats)
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:

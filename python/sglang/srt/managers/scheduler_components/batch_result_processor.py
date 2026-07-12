@@ -17,6 +17,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.observability.req_prof import (
+    emit_sched_line as emit_req_prof_sched_line,
+    req_prof_enabled,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -226,6 +230,8 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    if req_prof_enabled() and self.ps.tp_rank == 0:
+                        emit_req_prof_sched_line(req)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)

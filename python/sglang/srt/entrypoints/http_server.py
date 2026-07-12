@@ -411,6 +411,19 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+# Per-request TTFT profiling (SGLANG_REQUEST_PROF=1): stamp ASGI arrival so
+# [req-prof] can attribute body read + pydantic validation (http_parse).
+# Middleware only registered when enabled — zero default overhead.
+from sglang.srt.observability.req_prof import req_prof_enabled as _req_prof_enabled
+
+if _req_prof_enabled():
+
+    @app.middleware("http")
+    async def _req_prof_arrival_middleware(request: Request, call_next):
+        request.state.req_prof_t_asgi = time.perf_counter()
+        return await call_next(request)
+
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
