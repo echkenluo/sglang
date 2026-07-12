@@ -861,6 +861,16 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+        # Temporary diagnostic (SGLANG_BOOT_MODE_PROBE=1): classify this
+        # boot's CUDA API service-latency ticket. Runs after ALL graph
+        # captures (target cap-width above, then NGRAM per-tier graphs via
+        # draft_worker.init_cuda_graphs) so the probe sees steady state.
+        from sglang.srt.observability.boot_mode_probe import (
+            maybe_run_boot_mode_probe,
+        )
+
+        maybe_run_boot_mode_probe(self.ps.tp_rank)
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
