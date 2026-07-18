@@ -193,6 +193,19 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class SpecDecodingDetails(BaseModel):
+    """Per-request speculative decoding stats (SGLang extension).
+
+    Mirrors the per-request metrics already computed into meta_info by
+    TokenizerManager._calculate_spec_decoding_metrics; absent (None) when the
+    request ran without speculative verify steps.
+    """
+
+    accept_length: Optional[float] = None  # completion_tokens / verify_ct (incl. bonus)
+    accept_rate: Optional[float] = None  # correct_drafts / proposed_drafts (no bonus)
+    verify_ct: Optional[int] = None  # number of verify forward passes
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -200,6 +213,9 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    # SGLang extension: per-request speculative decoding stats; None unless the
+    # request ran speculative verify steps (keeps JSON identical otherwise)
+    sglang_spec_details: Optional[SpecDecodingDetails] = None
 
 
 class StreamOptions(BaseModel):
