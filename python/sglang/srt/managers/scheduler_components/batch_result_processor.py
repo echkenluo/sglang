@@ -55,6 +55,11 @@ if TYPE_CHECKING:
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.speculative.ngram_accept_trace import (
+    align_ngram_accept_trace_prefix,
+    append_ngram_accept_trace,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,6 +234,9 @@ class SchedulerBatchResultProcessor:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+
+                    if batch.spec_algorithm.is_ngram():
+                        align_ngram_accept_trace_prefix(req)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -578,6 +586,13 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+                if batch.spec_algorithm.is_ngram():
+                    append_ngram_accept_trace(
+                        req,
+                        accept_tokens,
+                        num_correct_drafts,
+                    )
 
             predict_tokens.append(accept_tokens)
 
