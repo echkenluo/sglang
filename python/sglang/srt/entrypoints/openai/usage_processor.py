@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    PromptTokensDetails,
+    SpecDecodingDetails,
+    UsageInfo,
+)
 
 
 @final
@@ -13,6 +17,27 @@ class UsageProcessor:
     def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
         """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
         return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+
+    @staticmethod
+    def _spec_details_from_metas(
+        metas: List[Mapping[str, Any]],
+    ) -> Optional[SpecDecodingDetails]:
+        """Aggregate per-request spec metrics from meta_info dicts; None if no verify ran."""
+        verify_ct = sum(m.get("spec_verify_ct", 0) for m in metas)
+        if verify_ct <= 0:
+            return None
+        completion = sum(
+            m.get("completion_tokens", 0)
+            for m in metas
+            if m.get("spec_verify_ct", 0) > 0
+        )
+        correct = sum(m.get("spec_num_correct_drafts", 0) for m in metas)
+        proposed = sum(m.get("spec_num_proposed_drafts", 0) for m in metas)
+        return SpecDecodingDetails(
+            accept_length=completion / verify_ct if completion else None,
+            accept_rate=correct / proposed if proposed > 0 else None,
+            verify_ct=verify_ct,
+        )
 
     @staticmethod
     def calculate_response_usage(
@@ -44,6 +69,10 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        spec_details = UsageProcessor._spec_details_from_metas(
+            [r["meta_info"] for r in responses]
+        )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             reasoning_tokens=reasoning_tokens,
@@ -52,6 +81,7 @@ class UsageProcessor:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
+            spec_details=spec_details,
         )
 
     @staticmethod
@@ -65,6 +95,7 @@ class UsageProcessor:
         image_tokens: int = 0,
         audio_tokens: int = 0,
         video_tokens: int = 0,
+        spec_metas: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -81,6 +112,12 @@ class UsageProcessor:
             else None
         )
 
+        spec_details = (
+            UsageProcessor._spec_details_from_metas(list(spec_metas.values()))
+            if spec_metas
+            else None
+        )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
             reasoning_tokens=total_reasoning_tokens,
@@ -89,6 +126,7 @@ class UsageProcessor:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
+            spec_details=spec_details,
         )
 
     @staticmethod
@@ -100,6 +138,7 @@ class UsageProcessor:
         image_tokens: int = 0,
         audio_tokens: int = 0,
         video_tokens: int = 0,
+        spec_details: Optional[SpecDecodingDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         # `cached_tokens` is already a PromptTokensDetails (or None) carrying the
@@ -123,4 +162,5 @@ class UsageProcessor:
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=details,
             reasoning_tokens=reasoning_tokens,
+            sglang_spec_details=spec_details,
         )

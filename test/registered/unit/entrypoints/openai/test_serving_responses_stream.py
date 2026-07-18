@@ -52,6 +52,9 @@ def _engine_chunk(
     finish=False,
     finish_reason=None,
     reasoning_tokens=0,
+    spec_verify_ct=0,
+    spec_num_correct_drafts=0,
+    spec_num_proposed_drafts=0,
 ):
     if finish_reason is None and finish:
         finish_reason = "stop"
@@ -63,6 +66,9 @@ def _engine_chunk(
             "completion_tokens": completion_tokens,
             "cached_tokens": 0,
             "reasoning_tokens": reasoning_tokens,
+            "spec_verify_ct": spec_verify_ct,
+            "spec_num_correct_drafts": spec_num_correct_drafts,
+            "spec_num_proposed_drafts": spec_num_proposed_drafts,
             "finish_reason": (
                 {"type": finish_reason} if finish_reason is not None else None
             ),
@@ -137,6 +143,35 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertEqual(response["usage"]["output_tokens"], 5)
         self.assertEqual(
             response["usage"]["output_tokens_details"]["reasoning_tokens"], 5
+        )
+
+    def test_final_event_preserves_spec_decoding_usage(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        events = _StreamFixture(serving, request).run(
+            [
+                _engine_chunk(
+                    "Hello",
+                    12,
+                    finish=True,
+                    spec_verify_ct=4,
+                    spec_num_correct_drafts=8,
+                    spec_num_proposed_drafts=12,
+                )
+            ]
+        )
+
+        completed = find_completed_event(events)
+        self.assertEqual(
+            completed["response"]["usage"]["sglang_spec_details"],
+            {
+                "accept_length": 3.0,
+                "accept_rate": 8 / 12,
+                "verify_ct": 4,
+            },
         )
 
     def test_required_tool_choice_emits_function_call_events(self):
