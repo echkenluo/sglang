@@ -66,6 +66,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -598,6 +599,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.enable_prompt_tokens_details and num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
+            )
+        if meta_info is not None:
+            usage.sglang_spec_details = UsageProcessor._spec_details_from_metas(
+                [meta_info]
             )
         request_metadata.final_usage_info = usage
 
@@ -1726,6 +1731,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
+            if usage_info.get("sglang_spec_details"):
+                response_dict["usage"]["sglang_spec_details"] = usage_info[
+                    "sglang_spec_details"
+                ]
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -1853,6 +1862,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         cached_tokens = 0
         total_tokens_meta = 0
         reasoning_tokens_meta = 0
+        last_spec_meta: Optional[dict[str, Any]] = None
         finish_reason: Optional[dict[str, Any]] = None
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
@@ -2051,6 +2061,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 reasoning_tokens_meta = meta.get(
                     "reasoning_tokens", reasoning_tokens_meta
                 )
+                last_spec_meta = meta or last_spec_meta
                 finish_reason = meta.get("finish_reason") or finish_reason
 
                 text = chunk.get("text", "") or ""
@@ -2293,6 +2304,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.enable_prompt_tokens_details and cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
+            )
+        if last_spec_meta is not None:
+            usage.sglang_spec_details = UsageProcessor._spec_details_from_metas(
+                [last_spec_meta]
             )
         request_metadata.final_usage_info = usage
 
