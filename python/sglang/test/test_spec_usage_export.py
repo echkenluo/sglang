@@ -149,6 +149,50 @@ def test_multi_choice_aggregation():
     assert abs(d.accept_rate - 40 / 300) < 1e-9
 
 
+def test_nonstream_multichoice_shares_prompt_but_sums_spec():
+    """n>1: choices share the prompt (counted once) but each does its own
+    decode/verify, so spec aggregates across all choices while prompt_tokens
+    does not. Locks the index%n_choices semantics verified against the code."""
+    responses = [
+        {"meta_info": _meta(completion=60, verify=12, correct=30, proposed=180) | {"prompt_tokens": 1000}},
+        {"meta_info": _meta(completion=40, verify=12, correct=10, proposed=180) | {"prompt_tokens": 1000}},
+    ]
+    usage = UsageProcessor.calculate_response_usage(responses, n_choices=2)
+    assert usage.prompt_tokens == 1000  # counted once, not 2000
+    assert usage.completion_tokens == 100  # both choices
+    d = usage.sglang_spec_details
+    assert d.verify_ct == 24
+    assert abs(d.accept_length - 100 / 24) < 1e-9  # token-weighted across choices
+    assert abs(d.accept_rate - 40 / 360) < 1e-9
+
+
+def test_streaming_last_chunk_cumulative_semantics():
+    """Streaming stores last-chunk meta per index (cumulative final totals),
+    mirroring how completion_tokens itself is overwritten each chunk. Passing
+    only the final meta must yield the same accept_length as the non-stream
+    path with that meta."""
+    final_meta = _meta(completion=120, verify=30, correct=72, proposed=450)
+    stream_usage = UsageProcessor.calculate_streaming_usage(
+        prompt_tokens={0: 1000}, reasoning_tokens={0: 0},
+        completion_tokens={0: 120}, cached_tokens={0: 0}, n_choices=1,
+        spec_metas={0: final_meta})
+    resp_usage = UsageProcessor.calculate_response_usage(
+        [{"meta_info": final_meta}], n_choices=1)
+    assert stream_usage.sglang_spec_details.accept_length == \
+        resp_usage.sglang_spec_details.accept_length
+    assert stream_usage.sglang_spec_details.verify_ct == 30
+
+
+def test_verify_positive_but_zero_completion_is_none_length():
+    """Defensive: verify ran but no completion -> accept_length None, verify_ct
+    still reported (never divide by a falsy completion)."""
+    d = UsageProcessor._spec_details_from_metas(
+        [{"spec_verify_ct": 5, "completion_tokens": 0,
+          "spec_num_correct_drafts": 0, "spec_num_proposed_drafts": 75}])
+    assert d.accept_length is None
+    assert d.verify_ct == 5
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
