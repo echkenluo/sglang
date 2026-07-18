@@ -1079,6 +1079,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        spec_metas = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -1106,6 +1107,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                spec_metas[index] = content["meta_info"]
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -1277,6 +1279,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
+                    spec_metas=spec_metas,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
