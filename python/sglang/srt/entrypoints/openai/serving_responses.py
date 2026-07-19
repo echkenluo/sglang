@@ -484,7 +484,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        # Text prompts force two extra full-context tokenizations downstream
+        # (length budgeting here + TokenizerManager re-encode), which dominates
+        # late-session TTFT on append-only agent traffic. Only pay that when the
+        # request actually carries media; pure-text requests on multimodal-capable
+        # checkpoints keep the already-computed prompt_ids.
+        has_media = bool(
+            getattr(processed_messages, "image_data", None)
+            or getattr(processed_messages, "video_data", None)
+            or getattr(processed_messages, "audio_data", None)
+        )
+        if (is_multimodal and has_media) or isinstance(
+            processed_messages.prompt_ids, str
+        ):
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
