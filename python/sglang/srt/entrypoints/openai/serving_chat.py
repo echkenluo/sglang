@@ -601,9 +601,18 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # Text prompts force a TokenizerManager-side re-encode of the full
+        # context; only pay that when the request actually carries media
+        # (pure-text requests on multimodal-capable checkpoints keep the
+        # already-computed prompt_ids). Mirrors the serving_responses fix.
+        has_media = bool(
+            getattr(processed_messages, "image_data", None)
+            or getattr(processed_messages, "video_data", None)
+            or getattr(processed_messages, "audio_data", None)
+        )
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
+        elif is_multimodal and has_media:
             prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
