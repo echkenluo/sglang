@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.prompt_input import should_use_text_prompt
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -484,7 +485,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        # A multimodal-capable checkpoint serving a text-only request does not need
+        # the text prompt path: passing text here discards the already-computed
+        # prompt_ids and costs two extra full-context tokenizations downstream (the
+        # max_output_tokens budget below re-encodes the prompt, and TokenizerManager
+        # re-encodes it again). That is O(context) per request and dominates
+        # late-session TTFT on long append-only conversations.
+        if should_use_text_prompt(is_multimodal, processed_messages):
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:

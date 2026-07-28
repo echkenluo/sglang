@@ -25,6 +25,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai.prompt_input import should_use_text_prompt
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -708,20 +709,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
-            # Standard VLMs render a text prompt (with placeholder strings) for the MM
-            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
-            # input_ids with single placeholders; pass those through so the MM processor
-            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
-            # encoding spec so every other model keeps the standard text path.
-            if (
-                self.chat_encoding_spec == "inkling"
-                and isinstance(processed_messages.prompt_ids, list)
-                and processed_messages.prompt_ids
-            ):
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"text": processed_messages.prompt}
+        elif is_multimodal and should_use_text_prompt(
+            is_multimodal,
+            processed_messages,
+            # Inkling produces pre-rendered input_ids with media placeholders.
+            # Preserve that upstream exception while standard VLM media requests
+            # continue through the text prompt path.
+            prefer_prompt_ids=self.chat_encoding_spec == "inkling",
+        ):
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
