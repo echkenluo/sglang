@@ -17,11 +17,10 @@ Modes (env):
 
 Correctness design (BPE boundary red line):
   * A splice point must be a provably char<->token aligned position:
-      one synthetic near-tail checkpoint per store, built by decoding the
-      last ~TOK_MARGIN tokens, verifying ``text.endswith(decoded)``, and then
-      proving token-level seam closure against the original full encode.
-      Request-end boundaries are not checkpoints: BPE can merge across an
-      append boundary, invalidating both their char and token offsets.
+      (a) store-boundary checkpoints (previous requests' exact encode ends);
+      (b) one synthetic near-tail checkpoint per store, built by decoding the
+          last ~TOK_MARGIN tokens and verifying ``text.endswith(decoded)``
+          (slides +-4 tokens to dodge multi-byte splits; skipped if unstable).
   * The split additionally backs off MARGIN chars below the char-LCP so that
     a pretokenizer chunk crossing the split would have to exceed MARGIN chars
     to desynchronize the seam (possible only for pathological giant chunks).
@@ -146,7 +145,7 @@ class IncrementalTokenizeCache:
                 ids, reused = full, 0
 
         self.reused_chars += reused
-        self._store(tokenizer, text, ids, reused, encode_kwargs)
+        self._store(tokenizer, text, ids, reused)
         if self.requests % LOG_EVERY == 0:
             self._log_stats()
         return ids
@@ -189,7 +188,7 @@ class IncrementalTokenizeCache:
         return best.ids[:ck_tok] + tail_ids, ck_char
 
     def _near_tail_checkpoint(
-        self, tokenizer, text: str, ids: List[int], encode_kwargs: dict
+        self, tokenizer, text: str, ids: List[int]
     ) -> Optional[Tuple[int, int]]:
         """Synthesize a token-aligned checkpoint far enough from the end to
         clear the margin zone on the NEXT pure-append request (target is a
@@ -197,22 +196,14 @@ class IncrementalTokenizeCache:
         e.g. CJK at ~1 char/token). decode() of byte-level BPE is
         concatenative, so char_pos = len(text) - len(decode(tail)) is exact —
         unless the split lands inside a multi-byte char; slide +-4 tokens and
-        verify with text.endswith(decoded).
-
-        ``endswith`` alone is insufficient: independently encoding a suffix
-        can tokenize leading whitespace or a special-token boundary
-        differently from the same characters inside the full prompt. A
-        candidate is accepted only when prefix_ids + encode(suffix) exactly
-        reconstructs the stored full token sequence.
-        """
+        verify with text.endswith(decoded)."""
         n = len(ids)
         need_chars = self.margin_chars + 64
         k = max(self.tok_margin, 8)
-        tail_kwargs = dict(encode_kwargs)
-        tail_kwargs["add_special_tokens"] = False
         while k < n:
             split0 = n - k
-            for delta in (0, -1, 1, -2, 2, -3, 3, -4, 4, -8, 8, -16, 16):
+            found = None
+            for delta in (0, -1, 1, -2, 2, -3, 3, -4, 4):
                 split = split0 + delta
                 if split <= 0 or split >= n:
                     continue
@@ -220,39 +211,28 @@ class IncrementalTokenizeCache:
                     tail_txt = tokenizer.decode(ids[split:])
                 except Exception:
                     continue
-                if not tail_txt or not text.endswith(tail_txt):
-                    continue
-                if len(tail_txt) < need_chars:
-                    continue
-                char_pos = len(text) - len(tail_txt)
-                try:
-                    seam_tail_ids = list(
-                        tokenizer.encode(text[char_pos:], **tail_kwargs)
-                    )
-                except Exception:
-                    continue
-                if ids[:split] + seam_tail_ids == ids:
-                    return (char_pos, split)
+                if tail_txt and text.endswith(tail_txt):
+                    found = (split, tail_txt)
+                    break
+            if found is None:
+                return None
+            split, tail_txt = found
+            if len(tail_txt) >= need_chars:
+                return (len(text) - len(tail_txt), split)
             k *= 2
         return None
 
-    def _store(
-        self,
-        tokenizer,
-        text: str,
-        ids: List[int],
-        reused: int,
-        encode_kwargs: dict,
-    ) -> None:
+    def _store(self, tokenizer, text: str, ids: List[int], reused: int) -> None:
         try:
             best, lcp = self._find_best(text)
             checkpoints: List[Tuple[int, int]] = []
             if best is not None and lcp == len(best.text) and reused:
                 # pure append on the matched conversation: inherit its points
                 checkpoints = [c for c in best.checkpoints if c[0] < len(text)]
-            ck = self._near_tail_checkpoint(tokenizer, text, ids, encode_kwargs)
+            ck = self._near_tail_checkpoint(tokenizer, text, ids)
             if ck is not None and (not checkpoints or ck[0] > checkpoints[-1][0]):
                 checkpoints.append(ck)
+            checkpoints.append((len(text), len(ids)))
             checkpoints = checkpoints[-64:]
 
             entry = _Entry(text, list(ids), checkpoints)

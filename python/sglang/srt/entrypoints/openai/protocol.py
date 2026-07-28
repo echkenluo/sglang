@@ -1324,6 +1324,21 @@ class ResponseReasoningParam(BaseModel):
         default=None,
         description="Include a summary of the model's reasoning trace on the response.",
     )
+    thinking_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "SGLang extension: hard upper bound for tokens generated inside the "
+            "current thinking segment. Overrides the effort-to-budget mapping."
+        ),
+    )
+
+
+RESPONSES_REASONING_EFFORT_BUDGETS = {
+    "low": 128,
+    "medium": 512,
+    "high": 2048,
+}
 
 
 # Only ``function`` / ``web_search*`` / ``code_interpreter`` are wired to
@@ -1397,7 +1412,16 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
     reasoning: Optional[ResponseReasoningParam] = None
+    thinking_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "SGLang/Qwen-compatible hard thinking-token budget. Takes precedence "
+            "over reasoning.thinking_budget and reasoning.effort."
+        ),
+    )
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
+    seed: Optional[int] = None
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
@@ -1456,6 +1480,18 @@ class ResponsesRequest(BaseModel):
         ]
         return values
 
+    def resolved_thinking_budget(self) -> Optional[int]:
+        """Resolve exact budget first, then the OpenAI-style effort tier."""
+        if self.thinking_budget is not None:
+            return self.thinking_budget
+        if self.reasoning is None:
+            return None
+        if self.reasoning.thinking_budget is not None:
+            return self.reasoning.thinking_budget
+        if self.reasoning.effort is None:
+            return None
+        return RESPONSES_REASONING_EFFORT_BUDGETS[self.reasoning.effort]
+
     @staticmethod
     def _normalize_input_item_for_validation(item):
         if not isinstance(item, dict):
@@ -1478,6 +1514,11 @@ class ResponsesRequest(BaseModel):
             return part
 
         part_type = part.get("type")
+        if part_type == "output_text" and part.get("logprobs") is None:
+            part = part.copy()
+            part.pop("logprobs", None)
+            return part
+
         if part_type != "input_image" or part.get("detail") is not None:
             return part
 
@@ -1524,6 +1565,7 @@ class ResponsesRequest(BaseModel):
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop if stop is None else stop,
+            "sampling_seed": self.seed,
         }
         if self.top_k is not None:
             params["top_k"] = self.top_k
@@ -1580,7 +1622,9 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "failed", "cancelled", "incomplete"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"
@@ -1618,6 +1662,7 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
+        incomplete_details: Optional[dict] = None,
     ) -> ResponsesResponse:
         """Create a response from a request."""
 
@@ -1671,13 +1716,14 @@ class ResponsesResponse(BaseModel):
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
-            incomplete_details=None,
+            incomplete_details=incomplete_details,
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
                 "effort": request.reasoning.effort if request.reasoning else None,
                 "summary": None,  # unused
+                "thinking_budget": request.resolved_thinking_budget(),
             },
             store=request.store,
             temperature=request.temperature,

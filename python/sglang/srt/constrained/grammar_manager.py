@@ -85,6 +85,7 @@ class GrammarManager:
             return
         if isinstance(req.grammar, ReasonerGrammarObject):
             req.grammar.max_think_tokens = thinking_budget
+            req.grammar.enable_token_filter = True
 
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
@@ -133,6 +134,20 @@ class GrammarManager:
             if grammar_obj is not None:
                 req.grammar = grammar_obj
                 self._apply_request_reasoning_budget(req)
+        elif self._get_request_thinking_budget(req) is not None:
+            if self.grammar_backend is None or not hasattr(
+                self.grammar_backend, "init_budget_reasoning_grammar"
+            ):
+                req.set_finish_with_abort(
+                    "Per-request thinking_budget requires a reasoning parser and "
+                    "a grammar backend with token filtering support."
+                )
+            else:
+                grammar_obj = self.grammar_backend.init_budget_reasoning_grammar(
+                    req.require_reasoning,
+                    self._get_request_thinking_budget(req),
+                )
+                req.grammar = grammar_obj
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)

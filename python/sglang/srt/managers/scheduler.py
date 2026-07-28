@@ -1590,6 +1590,16 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
+    def _needs_spec_grammar_sync_before_schedule(self) -> bool:
+        """Whether a speculative grammar result must retire before scheduling."""
+        last_batch = self.last_batch
+        return bool(
+            self.result_queue
+            and last_batch
+            and not last_batch.spec_algorithm.is_none()
+            and last_batch.has_grammar
+        )
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1613,6 +1623,14 @@ class Scheduler(
                 continue
 
             self._apply_war_barrier()
+            processed_last_batch = False
+            # Speculative grammar batches are already a no-overlap path. Drain
+            # their prior result before building the next batch so a completed
+            # request cannot free Mamba state after scheduling selected it.
+            if self._needs_spec_grammar_sync_before_schedule():
+                pop_and_process()
+                processed_last_batch = True
+
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1621,7 +1639,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not processed_last_batch:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1641,7 +1659,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not processed_last_batch
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states

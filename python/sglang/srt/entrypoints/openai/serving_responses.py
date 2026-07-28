@@ -114,6 +114,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
 
+        meta_info = None
+        finish_reason = None
         if self.use_harmony:
             # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
             # We need to add them to the stop token ids.
@@ -186,6 +188,27 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
+
+        # Codex providers can attach static request headers but cannot emit the
+        # SGLang ``thinking_budget`` JSON extension. Accept a trusted provider
+        # header as a lower-precedence compatibility path; an explicit JSON
+        # field always wins.
+        if raw_request is not None and request.thinking_budget is None:
+            header_value = raw_request.headers.get("x-sglang-thinking-budget")
+            if header_value is not None:
+                try:
+                    header_budget = int(header_value)
+                except ValueError:
+                    return self.create_error_response(
+                        "x-sglang-thinking-budget must be a positive integer"
+                    )
+                if header_budget < 1:
+                    return self.create_error_response(
+                        "x-sglang-thinking-budget must be a positive integer"
+                    )
+                request = request.model_copy(
+                    update={"thinking_budget": header_budget}
+                )
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
@@ -320,6 +343,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    thinking_budget_params = self._thinking_budget_sampling_params(request)
+                    if thinking_budget_params is not None:
+                        sampling_params["custom_params"] = thinking_budget_params
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -362,6 +388,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         session_id=request.session_id,
+                        require_reasoning=(
+                            self._is_thinking_enabled_for_request(request)
+                        ),
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
@@ -467,6 +496,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        thinking_budget = request.resolved_thinking_budget()
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -479,12 +509,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
+            chat_template_kwargs=(
+                {"enable_thinking": True} if thinking_budget is not None else None
+            ),
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        has_media = bool(
+            processed_messages.image_data
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        )
+        has_usable_prompt_ids = isinstance(
+            processed_messages.prompt_ids, list
+        ) and bool(processed_messages.prompt_ids)
+        if (is_multimodal and has_media) or not has_usable_prompt_ids:
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
@@ -492,6 +534,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             engine_prompts = [processed_messages.prompt_ids]
 
         return messages, request_prompts, engine_prompts, processed_messages
+
+    @staticmethod
+    def _thinking_budget_sampling_params(request):
+        """Build request-local parameters for reasoner-grammar enforcement."""
+        thinking_budget = request.resolved_thinking_budget()
+        if thinking_budget is None:
+            return None
+        return {"thinking_budget": thinking_budget}
 
     def _make_request_with_harmony(
         self,
@@ -548,7 +598,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
-            meta_info = None
             if isinstance(final_res, dict) and isinstance(
                 final_res.get("meta_info"), dict
             ):
@@ -557,6 +606,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 meta_info = final_res.meta_info
 
             if meta_info is not None:
+                finish_reason = meta_info.get("finish_reason")
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
@@ -590,6 +640,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+        num_reasoning_tokens = min(num_reasoning_tokens, num_generated_tokens)
+        incomplete = (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "length"
+        )
+        if incomplete:
+            for item in output:
+                if hasattr(item, "status"):
+                    item.status = "incomplete"
+
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
@@ -612,8 +672,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=output,
-            status="completed",
+            status="incomplete" if incomplete else "completed",
             usage=usage,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if incomplete else None
+            ),
         )
 
         if request.store:
@@ -944,6 +1007,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 
         content = message.get("content")
+        if content is not None and not isinstance(
+            content, (list, str, bytes, dict)
+        ):
+            try:
+                content = list(content)
+            except TypeError:
+                pass
         if not isinstance(content, list):
             return {
                 k: v
@@ -1736,13 +1806,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "sglang_spec_details"
                 ]
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+        if final_response.status == "incomplete":
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
             )
-        )
+        else:
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
 
     async def responses_stream_generator_non_harmony(
         self,
@@ -1878,7 +1957,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         wants_summary = self._wants_reasoning_summary(request)
 
-        def _close_reasoning_item():
+        def _close_reasoning_item(status: str = "completed"):
             if not reasoning_state["open"]:
                 return []
             text = reasoning_state["text"]
@@ -1893,7 +1972,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 content=[
                     ResponseReasoningTextContent(type="reasoning_text", text=text),
                 ],
-                status="completed",
+                status=status,
             )
             events: list = []
             if wants_summary:
@@ -1959,7 +2038,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(status: str = "completed"):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -1971,7 +2050,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
                 role="assistant",
                 content=[text_content],
-                status="completed",
+                status=status,
             )
             events = [
                 _send_event(
@@ -2008,7 +2087,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             message_state["open"] = False
             return events
 
-        def _close_tool_call_state(tool_index: int):
+        def _close_tool_call_state(tool_index: int, status: str = "completed"):
             state = tool_call_states.get(tool_index)
             if state is None or state.get("done"):
                 return []
@@ -2019,7 +2098,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 name=state["name"] or "",
                 type="function_call",
                 id=state["item_id"],
-                status="completed",
+                status=status,
             )
             events = [
                 _send_event(
@@ -2285,16 +2364,22 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return
 
-        for ev in _close_reasoning_item():
+        incomplete = (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "length"
+        )
+        terminal_item_status = "incomplete" if incomplete else "completed"
+        for ev in _close_reasoning_item(terminal_item_status):
             yield ev
-        for ev in _close_message_item():
+        for ev in _close_message_item(terminal_item_status):
             yield ev
         for tool_index in list(tool_call_states):
-            for ev in _close_tool_call_state(tool_index):
+            for ev in _close_tool_call_state(tool_index, terminal_item_status):
                 yield ev
 
         final_output_items = list(emitted_items)
 
+        reasoning_tokens_meta = min(reasoning_tokens_meta, completion_tokens)
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -2317,8 +2402,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
-            status="completed",
+            status="incomplete" if incomplete else "completed",
             usage=usage,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if incomplete else None
+            ),
         )
         if request.store:
             async with self.response_store_lock:
@@ -2340,14 +2428,27 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
+            if usage_info.get("sglang_spec_details"):
+                response_dict["usage"]["sglang_spec_details"] = usage_info[
+                    "sglang_spec_details"
+                ]
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+        if incomplete:
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
             )
-        )
+        else:
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
 
     async def _generate_with_builtin_tools(
         self,

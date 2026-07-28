@@ -604,7 +604,18 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
+            has_media = bool(
+                processed_messages.image_data
+                or processed_messages.video_data
+                or processed_messages.audio_data
+            )
+            has_usable_prompt_ids = isinstance(
+                processed_messages.prompt_ids, list
+            ) and bool(processed_messages.prompt_ids)
+            if has_media or not has_usable_prompt_ids:
+                prompt_kwargs = {"text": processed_messages.prompt}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}

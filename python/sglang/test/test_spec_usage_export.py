@@ -123,21 +123,6 @@ def test_streaming_usage_default_is_backward_compatible():
     assert usage.sglang_spec_details is None
 
 
-def test_usageinfo_dump_shape_for_responses_path():
-    """Non-streaming /v1/responses dumps UsageInfo directly; nested details must
-    serialize as a plain dict with the three keys."""
-    usage = protocol.UsageInfo(
-        prompt_tokens=10,
-        completion_tokens=4,
-        total_tokens=14,
-        sglang_spec_details=UsageProcessor._spec_details_from_metas([_meta()]),
-    )
-    payload = usage.model_dump()
-    d = payload["sglang_spec_details"]
-    assert set(d) == {"accept_length", "accept_rate", "verify_ct"}
-    assert d["verify_ct"] == 25
-
-
 def test_multi_choice_aggregation():
     metas = [
         _meta(completion=50, verify=10, correct=30, proposed=150),

@@ -146,9 +146,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
             if not self.enable_token_filter:
                 return
             if self._can_think_more():
-                self._do_token_filter(
-                    vocab_mask, self.think_excluded_token_ids, idx, is_allowed=False
-                )
+                if self.think_excluded_token_ids:
+                    self._do_token_filter(
+                        vocab_mask,
+                        self.think_excluded_token_ids,
+                        idx,
+                        is_allowed=False,
+                    )
             else:
                 self._do_token_filter(
                     vocab_mask, self._think_end_id_list, idx, is_allowed=True
@@ -268,8 +272,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             and self.think_excluded_token_ids is not None
             and self.grammar_backend.is_support_token_filter
         )
+        # Keep the backend filter available even when global strict-thinking is
+        # disabled. A request-local thinking budget still needs to force the
+        # tokenizer-derived end token, but should not impose strict filtering on
+        # unrelated requests.
         self._token_filter_fn = (
-            self.grammar_backend.set_token_filter if self.enable_token_filter else None
+            self.grammar_backend.set_token_filter
+            if self.grammar_backend.is_support_token_filter
+            else None
         )
 
     def _get_think_excluded_token_ids(
@@ -294,20 +304,41 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return excluded_ids
 
     def _make_grammar_object(
-        self, grammar: Optional[BaseGrammarObject], reasoning: bool
+        self,
+        grammar: Optional[BaseGrammarObject],
+        reasoning: bool,
+        *,
+        enable_token_filter: Optional[bool] = None,
     ) -> ReasonerGrammarObject:
+        if enable_token_filter is None:
+            enable_token_filter = self.enable_token_filter
         obj = ReasonerGrammarObject(
             grammar=grammar,
             think_end_id=self.think_end_id,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
-            enable_token_filter=self.enable_token_filter,
+            enable_token_filter=enable_token_filter,
             token_filter_fn=self._token_filter_fn,
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
         )
         obj.maybe_init_reasoning(reasoning)
+        return obj
+
+    def init_budget_reasoning_grammar(
+        self, reasoning: bool, thinking_budget: int
+    ) -> ReasonerGrammarObject:
+        """Create a lightweight grammar wrapper for one budgeted request."""
+        if not self.grammar_backend.is_support_token_filter:
+            raise ValueError(
+                "Per-request thinking_budget requires a grammar backend with "
+                "token filtering support (for example xgrammar)."
+            )
+        obj = self._make_grammar_object(
+            None, reasoning, enable_token_filter=True
+        )
+        obj.max_think_tokens = thinking_budget
         return obj
 
     def init_strict_reasoning_grammar(

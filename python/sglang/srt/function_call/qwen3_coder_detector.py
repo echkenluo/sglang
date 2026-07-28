@@ -36,6 +36,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
         )
+        # Qwen3.5 can occasionally fuse a closing parameter tag and the next
+        # parameter name, for example ``</parameter instruction>`` instead of
+        # ``</parameter><parameter=instruction>``.  Keep the recovery
+        # schema-bound so literal text with the same shape is not rewritten
+        # unless the suffix names a declared tool parameter.
+        self.fused_parameter_boundary_regex = re.compile(
+            r"</parameter\s+([A-Za-z_][A-Za-z0-9_.-]*)>"
+        )
 
         # Streaming State
         # Base class already initializes _buffer, we just use it directly
@@ -56,6 +64,38 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _normalize_fused_parameter_boundaries(
+        self, text: str, tools: Optional[list[Tool]]
+    ) -> str:
+        if not text or tools is None:
+            return text
+
+        known_parameters: set[str] = set()
+        for tool in tools:
+            try:
+                parameters = tool.function.parameters
+            except AttributeError:
+                continue
+            if not isinstance(parameters, dict):
+                continue
+            properties = parameters.get("properties", parameters)
+            if isinstance(properties, dict):
+                known_parameters.update(str(name) for name in properties)
+
+        if not known_parameters:
+            return text
+
+        def replace(match: re.Match[str]) -> str:
+            parameter_name = match.group(1)
+            if parameter_name not in known_parameters:
+                return match.group(0)
+            return (
+                f"{self.parameter_end_token}\n"
+                f"{self.parameter_prefix}{parameter_name}>"
+            )
+
+        return self.fused_parameter_boundary_regex.sub(replace, text)
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -171,6 +211,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
+        text = self._normalize_fused_parameter_boundaries(text, tools)
         if self.tool_call_start_token not in text:
             return StreamingParseResult(normal_text=text)
 
@@ -244,6 +285,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         Robust cursor-based streaming parser.
         """
         self._buffer += new_text
+        normalized_suffix = self._normalize_fused_parameter_boundaries(
+            self._buffer[self.parsed_pos :], tools
+        )
+        self._buffer = self._buffer[: self.parsed_pos] + normalized_suffix
 
         # Guard against empty buffer
         if not self._buffer:
