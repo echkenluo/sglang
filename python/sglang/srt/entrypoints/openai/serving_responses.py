@@ -578,6 +578,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        meta_info = None
+        finish_reason = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)

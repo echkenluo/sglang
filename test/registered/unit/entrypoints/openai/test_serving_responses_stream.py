@@ -45,7 +45,16 @@ class _StreamFixture:
         return asyncio.run(collect())
 
 
-def _engine_chunk(text, completion_tokens, *, finish=False):
+def _engine_chunk(
+    text,
+    completion_tokens,
+    *,
+    finish=False,
+    finish_reason=None,
+    reasoning_tokens=0,
+):
+    if finish_reason is None and finish:
+        finish_reason = "stop"
     return {
         "text": text,
         "meta_info": {
@@ -53,8 +62,10 @@ def _engine_chunk(text, completion_tokens, *, finish=False):
             "prompt_tokens": 5,
             "completion_tokens": completion_tokens,
             "cached_tokens": 0,
-            "reasoning_tokens": 0,
-            "finish_reason": {"type": "stop"} if finish else None,
+            "reasoning_tokens": reasoning_tokens,
+            "finish_reason": (
+                {"type": finish_reason} if finish_reason is not None else None
+            ),
         },
     }
 
@@ -91,6 +102,42 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
 
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
+
+    def test_length_finish_emits_incomplete_and_bounds_reasoning_usage(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            max_output_tokens=5,
+        )
+        events = _StreamFixture(serving, request).run(
+            [
+                _engine_chunk(
+                    "unfinished",
+                    5,
+                    finish_reason="length",
+                    reasoning_tokens=9,
+                )
+            ]
+        )
+
+        self.assertEqual(event_types(events)[-1], "response.incomplete")
+        payload = event_payloads(events)[-1]
+        response = payload["response"]
+        self.assertEqual(response["status"], "incomplete")
+        self.assertEqual(
+            response["incomplete_details"], {"reason": "max_output_tokens"}
+        )
+        self.assertEqual(response["output"][0]["status"], "incomplete")
+        self.assertEqual(response["usage"]["output_tokens"], 5)
+        self.assertEqual(
+            response["usage"]["output_tokens_details"]["reasoning_tokens"], 5
+        )
 
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()
