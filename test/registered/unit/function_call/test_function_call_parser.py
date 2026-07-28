@@ -2248,6 +2248,21 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(len(result.calls), 0)
 
+    def test_fused_parameter_boundary_recovery(self):
+        """Recover Qwen3.5's fused close-and-next-parameter tag."""
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT * FROM users</parameter dry_run>
+true</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "SELECT * FROM users")
+        self.assertIs(params["dry_run"], True)
+
     def test_single_tool_call_with_text_prefix(self):
         """
         Test parsing of tool call with preceding text.
@@ -2338,6 +2353,25 @@ class TestQwen3CoderDetector(unittest.TestCase):
             params = json.loads(collected_params)
             self.assertEqual(params["location"], "Boston")
             self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_fused_parameter_boundary_recovery(self):
+        chunks = [
+            "<tool_call><function=sql_interpreter>",
+            "<parameter=query>SELECT 1</parameter dry",
+            "_run>\ntrue</parameter></function></tool_call>",
+        ]
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertEqual(params["query"], "SELECT 1")
+        self.assertIs(params["dry_run"], True)
 
     def test_streaming_with_text_and_tool(self):
         """
