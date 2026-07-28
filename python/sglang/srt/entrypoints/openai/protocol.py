@@ -1663,7 +1663,9 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "failed", "cancelled", "incomplete"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"
@@ -1701,6 +1703,7 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
+        incomplete_details: Optional[dict] = None,
     ) -> ResponsesResponse:
         """Create a response from a request."""
 
@@ -1754,7 +1757,7 @@ class ResponsesResponse(BaseModel):
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
-            incomplete_details=None,
+            incomplete_details=incomplete_details,
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store

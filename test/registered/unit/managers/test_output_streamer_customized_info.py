@@ -13,7 +13,15 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    def __init__(self, rid, output_ids, customized_info=None):
+    def __init__(
+        self,
+        rid,
+        output_ids,
+        customized_info=None,
+        *,
+        output_ids_through_stop=None,
+        reasoning_tokens=0,
+    ):
         self.rid = rid
         self.http_worker_ipc = None
         self.finished_reason = None
@@ -27,13 +35,17 @@ class _FakeReq:
             no_stop_trim=False,
         )
         self.output_ids = output_ids
-        self.output_ids_through_stop = output_ids
+        self.output_ids_through_stop = (
+            output_ids
+            if output_ids_through_stop is None
+            else output_ids_through_stop
+        )
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
         self.send_decode_id_offset = 0
         self.decoded_text = ""
         self.origin_input_ids = []
-        self.reasoning_tokens = 0
+        self.reasoning_tokens = reasoning_tokens
         self.cached_tokens = 0
         self.retraction_count = 0
         self.time_stats = None
@@ -54,8 +66,9 @@ class _FakeReq:
 
 
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
-    def test_customized_info_is_padded_for_mixed_batches(self):
-        accumulator = _GenerationStreamAccumulator(
+    @staticmethod
+    def _accumulator():
+        return _GenerationStreamAccumulator(
             return_logprob=False,
             return_hidden_states=False,
             return_routed_experts=False,
@@ -66,6 +79,9 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             default_force_stream_interval=1,
             get_cached_tokens_details=lambda req: None,
         )
+
+    def test_customized_info_is_padded_for_mixed_batches(self):
+        accumulator = self._accumulator()
 
         accumulator.accept(req=_FakeReq("r0", [10, 11]))
         accumulator.accept(
@@ -89,6 +105,21 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
         )
+
+    def test_reasoning_tokens_follow_stop_trimmed_completion_boundary(self):
+        accumulator = self._accumulator()
+        accumulator.accept(
+            req=_FakeReq(
+                "trimmed",
+                [10, 11, 12, 13, 14, 15],
+                output_ids_through_stop=[10, 11, 12, 13],
+                reasoning_tokens=6,
+            )
+        )
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(payload.completion_tokens, [4])
+        self.assertEqual(payload.reasoning_tokens, [4])
 
 
 if __name__ == "__main__":

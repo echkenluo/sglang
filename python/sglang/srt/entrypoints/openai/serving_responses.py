@@ -536,6 +536,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        meta_info = None
+        finish_reason = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
@@ -555,7 +557,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
-            meta_info = None
             if isinstance(final_res, dict) and isinstance(
                 final_res.get("meta_info"), dict
             ):
@@ -564,6 +565,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 meta_info = final_res.meta_info
 
             if meta_info is not None:
+                finish_reason = meta_info.get("finish_reason")
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
@@ -597,6 +599,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+        num_reasoning_tokens = min(num_reasoning_tokens, num_generated_tokens)
+        incomplete = (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "length"
+        )
+        if incomplete:
+            for item in output:
+                if hasattr(item, "status"):
+                    item.status = "incomplete"
+
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
@@ -615,8 +627,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=output,
-            status="completed",
+            status="incomplete" if incomplete else "completed",
             usage=usage,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if incomplete else None
+            ),
         )
 
         if request.store:
@@ -1735,13 +1750,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+        if final_response.status == "incomplete":
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
             )
-        )
+        else:
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
 
     async def responses_stream_generator_non_harmony(
         self,
@@ -1876,7 +1900,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         wants_summary = self._wants_reasoning_summary(request)
 
-        def _close_reasoning_item():
+        def _close_reasoning_item(status: str = "completed"):
             if not reasoning_state["open"]:
                 return []
             text = reasoning_state["text"]
@@ -1891,7 +1915,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 content=[
                     ResponseReasoningTextContent(type="reasoning_text", text=text),
                 ],
-                status="completed",
+                status=status,
             )
             events: list = []
             if wants_summary:
@@ -1957,7 +1981,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(status: str = "completed"):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -1969,7 +1993,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
                 role="assistant",
                 content=[text_content],
-                status="completed",
+                status=status,
             )
             events = [
                 _send_event(
@@ -2006,7 +2030,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             message_state["open"] = False
             return events
 
-        def _close_tool_call_state(tool_index: int):
+        def _close_tool_call_state(tool_index: int, status: str = "completed"):
             state = tool_call_states.get(tool_index)
             if state is None or state.get("done"):
                 return []
@@ -2017,7 +2041,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 name=state["name"] or "",
                 type="function_call",
                 id=state["item_id"],
-                status="completed",
+                status=status,
             )
             events = [
                 _send_event(
@@ -2282,16 +2306,22 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return
 
-        for ev in _close_reasoning_item():
+        incomplete = (
+            isinstance(finish_reason, dict)
+            and finish_reason.get("type") == "length"
+        )
+        terminal_item_status = "incomplete" if incomplete else "completed"
+        for ev in _close_reasoning_item(terminal_item_status):
             yield ev
-        for ev in _close_message_item():
+        for ev in _close_message_item(terminal_item_status):
             yield ev
         for tool_index in list(tool_call_states):
-            for ev in _close_tool_call_state(tool_index):
+            for ev in _close_tool_call_state(tool_index, terminal_item_status):
                 yield ev
 
         final_output_items = list(emitted_items)
 
+        reasoning_tokens_meta = min(reasoning_tokens_meta, completion_tokens)
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -2310,8 +2340,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
-            status="completed",
+            status="incomplete" if incomplete else "completed",
             usage=usage,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if incomplete else None
+            ),
         )
         if request.store:
             async with self.response_store_lock:
@@ -2334,13 +2367,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+        if incomplete:
+            yield _send_event(
+                openai_responses_types.ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
             )
-        )
+        else:
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
 
     async def _generate_with_builtin_tools(
         self,

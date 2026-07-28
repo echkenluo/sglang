@@ -389,7 +389,10 @@ class _GenerationStreamAccumulator:
         )
         self.no_stop_trim.append(req.sampling_params.no_stop_trim)
         self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
+        # ``output_ids_through_stop`` is the completion-token accounting
+        # boundary. Reasoning is a subset of output usage, so tokens trimmed by
+        # a stop condition must not survive only in the reasoning counter.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         self.completion_tokens.append(len(output_ids_))
         self.cached_tokens.append(req.cached_tokens)
 
