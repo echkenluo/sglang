@@ -25,6 +25,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai.prompt_input import should_use_text_prompt
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -603,19 +604,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
-            has_media = bool(
-                processed_messages.image_data
-                or processed_messages.video_data
-                or processed_messages.audio_data
-            )
-            has_usable_prompt_ids = isinstance(
-                processed_messages.prompt_ids, list
-            ) and bool(processed_messages.prompt_ids)
-            if has_media or not has_usable_prompt_ids:
-                prompt_kwargs = {"text": processed_messages.prompt}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif is_multimodal and should_use_text_prompt(
+            is_multimodal,
+            processed_messages,
+            # Inkling produces pre-rendered input_ids with media placeholders.
+            # Preserve that upstream exception while standard VLM media requests
+            # continue through the text prompt path.
+            prefer_prompt_ids=self.chat_encoding_spec == "inkling",
+        ):
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
