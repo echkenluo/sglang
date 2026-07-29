@@ -12,6 +12,7 @@ from utils import make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -253,6 +254,39 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             normalized,
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
+
+    def test_function_call_output_normalizes_input_image_for_chat(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_image",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "high",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "tool",
+                "tool_call_id": "call_image",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,AAAA",
+                            "detail": "high",
+                        },
+                    }
+                ],
+            },
+        )
+        parsed = ChatCompletionRequest(model="x", messages=[normalized])
+        self.assertEqual(parsed.messages[0].role, "tool")
 
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
