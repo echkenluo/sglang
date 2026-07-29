@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -166,13 +166,23 @@ class NGRAMWorker(BaseSpecWorker):
     def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
 
-    def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
+    @staticmethod
+    def _efficient_concat_last_n(
+        seq1: Sequence[int], seq2: Sequence[int], n: int
+    ) -> List[int]:
+        """Materialize only the suffix consumed by the n-gram corpus.
+
+        ``origin_input_ids`` is an ``array("q")`` and can be tens of
+        thousands of tokens long for agent requests. Callers must not convert
+        the whole prompt to a list before entering this helper: the corpus only
+        consumes the final ``n`` tokens.
+        """
         seq2_len = len(seq2)
         if seq2_len >= n:
-            return seq2[-n:]
+            return list(seq2[-n:])
 
         need_from_seq1 = n - seq2_len
-        return seq1[-need_from_seq1:] + seq2
+        return list(seq1[-need_from_seq1:]) + list(seq2)
 
     def _init_preallocated_tensors(self):
         max_total_drafts = self.max_batch_size * self.draft_token_num
@@ -269,7 +279,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             check_token = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
+                req.origin_input_ids,
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
@@ -390,7 +400,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
+                req.origin_input_ids,
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
