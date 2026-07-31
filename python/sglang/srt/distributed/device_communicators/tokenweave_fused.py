@@ -180,6 +180,14 @@ class TokenWeaveFusedCommunicator:
                 graph-mode table (stage B guarantee 5 in the module header).
         """
         self.disabled = True
+        # Round-2 native-mode attrs must exist even on the inert stub: the
+        # dispatcher and the RowParallelLinear producer hook getattr them
+        # before any engagement check.
+        self.native_enabled = False
+        self._native_armed: Optional[Tuple[int, int]] = None  # (tokens, half)
+        self._native_half = 0
+        self._native_arms = 0
+        self._native_claims = 0
 
         if os.environ.get("SGLANG_ENABLE_TOKENWEAVE_FUSION", "0") != "1":
             # Default off: stay an inert stub. No kernel-dir import, no
@@ -252,6 +260,21 @@ class TokenWeaveFusedCommunicator:
         )
         max_ctas_env = os.environ.get("SGLANG_TOKENWEAVE_MAX_CTAS", "").strip()
         self._max_ctas_override = int(max_ctas_env) if max_ctas_env else None
+
+        # Round-2 native mode (plan 2026-07-31-h20-comm-reaudit-native-fusion):
+        # the producer RowParallelLinear writes its partial sums STRAIGHT into
+        # this communicator's region (provide_gemm_out) and the fused site
+        # consumes them in place -- no copy-in and no output copy-out. A
+        # ping-pong pair of regions keeps a returned output view alive while
+        # the NEXT site's gemm writes the other half (a view is consumed by
+        # the immediately following matmul/norm, so two halves suffice).
+        # Residual handling stays stage-A (shard all-gather) until N2
+        # composes with the scattered flow. Op-level numerics + timing for
+        # this exact path: tokenweave-line/kernels/native_fused (gate
+        # NATIVEFUSED-NUM-OK 07-31; wins vs strongest incumbent at M>=4096).
+        self.native_enabled = (
+            os.environ.get("SGLANG_TOKENWEAVE_NATIVE", "0") == "1"
+        )
 
         # hidden_size is unknown at engine init; the workspace is allocated
         # once, on the first eligible call (_ensure_workspace), never freed.
@@ -496,6 +519,187 @@ class TokenWeaveFusedCommunicator:
         input_.copy_(region[:num_tokens])
         return input_, residual
 
+    # ------------------------------------------------------------------
+    # Round-2 native path (plan 2026-07-31): producer writes the region,
+    # the fused site consumes it in place. See the __init__ note.
+    # ------------------------------------------------------------------
+    def _half_view(self, half: int, m_pad: int, hidden: int) -> torch.Tensor:
+        base = half * self.max_tokens_pad * hidden
+        return self._region_buf[base : base + m_pad * hidden].view(m_pad, hidden)
+
+    def provide_gemm_out(self, num_tokens: int, hidden: int) -> Optional[torch.Tensor]:
+        """Hand the producer gemm a region view to write partial sums into.
+
+        Returns a [num_tokens, hidden] bf16 view at the freshly flipped
+        ping-pong half, or None when any guard misses (caller keeps its
+        normal allocation path). CAPTURE AUDIT: slicing + in-place zeroing of
+        preallocated memory + host-side attribute flips only;
+        _ensure_workspace declines inside capture unless already initialized
+        by the eager warmups (stage B guarantee 1).
+        """
+        if (
+            self.disabled
+            or not self.native_enabled
+            or num_tokens <= 0
+            or num_tokens > self.max_tokens
+            or hidden % 8 != 0
+            or (self.hidden is not None and hidden != self.hidden)
+        ):
+            return None
+        if not self._ensure_workspace(hidden):
+            return None
+        half = self._native_half ^ 1
+        self._native_half = half
+        m_pad = -(-num_tokens // self.world_size) * self.world_size
+        region = self._half_view(half, m_pad, hidden)
+        if m_pad > num_tokens:
+            # Pad rows must be zero on every rank's replica so their reduced
+            # sums are exact zeros (same contract as the stage-A impl); the
+            # producer gemm only writes the real rows.
+            region[num_tokens:].zero_()
+        self._native_armed = (num_tokens, half)
+        self._native_arms += 1
+        if self._native_arms == 1 and not torch.cuda.is_current_stream_capturing():
+            logger.info(
+                "[TOKENWEAVE-NATIVE] first direct-write arm "
+                "(tokens=%d hidden=%d half=%d)",
+                num_tokens,
+                hidden,
+                half,
+            )
+        return region[:num_tokens]
+
+    def native_fused_ar_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Fused-site entry for the native path.
+
+        Engages ONLY when input_ IS the armed region view (data_ptr identity
+        -- the producer hook wrote the partials there). Always disarms on
+        entry: an armed-but-unclaimed view (some other consumer took the
+        partials) must never leak to a later site. Returns None on any miss
+        so the caller falls through to the stage-A / composed paths with
+        input_ unmodified."""
+        armed = self._native_armed
+        self._native_armed = None
+        if (
+            armed is None
+            or self.disabled
+            or not self.native_enabled
+            or residual is None
+        ):
+            return None
+        num_tokens, half = armed
+        if (
+            input_.dim() != 2
+            or input_.shape[0] != num_tokens
+            or self.hidden is None
+            or input_.shape[1] != self.hidden
+            or input_.dtype != self.dtype
+            or residual.shape != input_.shape
+            or residual.dtype != self.dtype
+            or weight.dim() != 1
+            or weight.shape[0] != self.hidden
+            or weight.dtype != self.dtype
+        ):
+            return None
+        m_pad = -(-num_tokens // self.world_size) * self.world_size
+        region = self._half_view(half, m_pad, self.hidden)
+        if input_.data_ptr() != region.data_ptr():
+            return None
+        try:
+            out = self._native_impl(
+                region, m_pad, num_tokens, half, residual, weight, eps
+            )
+            self._native_claims += 1
+            if (
+                self._native_claims == 1
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                logger.info(
+                    "[TOKENWEAVE-NATIVE] engaged: first in-place fused "
+                    "AR+RMSNorm claim (tokens=%d half=%d)",
+                    num_tokens,
+                    half,
+                )
+            return out
+        except Exception as exc:  # noqa: BLE001 -- sticky fail-safe
+            self.disabled = True
+            logger.warning(
+                "[TOKENWEAVE-NATIVE] disabled after runtime failure "
+                "(falling back to unfused paths): %s",
+                exc,
+                exc_info=True,
+            )
+            return None
+
+    def _native_impl(
+        self,
+        region: torch.Tensor,
+        m_pad: int,
+        num_tokens: int,
+        half: int,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # CAPTURE AUDIT: identical envelope to _fused_ar_rmsnorm_impl (views,
+        # in-place ops on preallocated buffers, one kernel launch, one
+        # preallocated all-gather) MINUS the region copy-in (the producer
+        # already wrote the partials) and MINUS the output copy-out (the
+        # region view itself is returned; the ping-pong half protects it
+        # until the site after next).
+        hidden = self.hidden
+        world_size = self.world_size
+        blpr = m_pad // world_size
+        start = self.rank * blpr
+        end = start + blpr
+
+        res_shard = self._res_shard[:blpr]
+        copy_rows = min(max(num_tokens - start, 0), blpr)
+        if copy_rows > 0:
+            res_shard[:copy_rows].copy_(residual[start : start + copy_rows])
+        if copy_rows < blpr:
+            res_shard[copy_rows:].zero_()
+
+        if self._max_ctas_override is not None:
+            max_ctas = self._max_ctas_override
+        else:
+            max_ctas = 8 if m_pad * hidden * 2 <= 2 * 1024 * 1024 else 16
+
+        # The multicast offset must address THIS half of the workspace: the
+        # region base sits half * max_tokens_pad * hidden elements into the
+        # rendezvous'd buffer (the round-2 op-level bench validated exactly
+        # this shard/offset math via token_split.chunk_shard).
+        half_base = half * self.max_tokens_pad * hidden
+        self._op(
+            region[start:end],
+            res_shard,
+            weight,
+            self._mc_ptr + (half_base + start * hidden) * region.element_size(),
+            self._signal_pads,
+            self.rank,
+            world_size,
+            max_ctas,
+            eps,
+        )
+
+        res_stage = self._res_stage[:m_pad]
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(res_stage, res_shard)
+        else:
+            dist.all_gather_into_tensor(
+                res_stage, res_shard, group=self.device_group
+            )
+
+        residual.copy_(res_stage[:num_tokens])
+        return region[:num_tokens], residual
+
     def _agree_all_ranks(self, local_ok: bool) -> bool:
         """Rank-uniform verdict on an init step (stage B guarantee 4). Eager
         only -- never reached from inside a capture (_ensure_workspace's
@@ -532,8 +736,13 @@ class TokenWeaveFusedCommunicator:
         buf = None
         err = ""
         try:
+            # Native mode ping-pongs two regions (see __init__ note); the
+            # stage-A path keeps using half 0 untouched semantics.
+            num_regions = 2 if self.native_enabled else 1
             buf = torch_symm_mem.empty(
-                self.max_tokens_pad * hidden, dtype=self.dtype, device=self.device
+                num_regions * self.max_tokens_pad * hidden,
+                dtype=self.dtype,
+                device=self.device,
             )
             # Keep-alive immediately: even a not-yet-rendezvous'd symm tensor
             # must never reach GC on a failure path (belt against the
@@ -630,3 +839,19 @@ class TokenWeaveFusedCommunicator:
         # cuMulticastUnbind destructor trap); _KEEPALIVE holds the refs and
         # process exit reclaims the memory.
         pass
+
+
+def native_gemm_out(num_tokens: int, hidden: int) -> Optional["torch.Tensor"]:
+    """Producer-side entry for the round-2 native direct write.
+
+    Called from RowParallelLinear.forward on no-reduce calls at marked-shape
+    sites; returns the fused-site region view to matmul into, or None (caller
+    keeps its normal path). The parallel_state import is lazy to avoid a
+    module cycle (parallel_state imports this module at its top), and every
+    real guard lives in provide_gemm_out."""
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    comm = getattr(get_tp_group(), "tokenweave_comm", None)
+    if comm is None or not getattr(comm, "native_enabled", False):
+        return None
+    return comm.provide_gemm_out(num_tokens, hidden)

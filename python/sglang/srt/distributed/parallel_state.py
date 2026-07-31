@@ -675,6 +675,18 @@ class GroupCoordinator:
         # custom_fused_ar_rms path below, or None (after sticky-disabling) so
         # the caller falls back.
         tokenweave_comm = self.tokenweave_comm
+        # Round-2 native path first: engages ONLY when the producer linear
+        # direct-wrote input_ into the communicator's region (data_ptr
+        # identity inside), in which place the AR+RMSNorm runs with zero
+        # copies. Misses return None and fall through unchanged.
+        if tokenweave_comm is not None and getattr(
+            tokenweave_comm, "native_enabled", False
+        ):
+            native_result = tokenweave_comm.native_fused_ar_rmsnorm(
+                input_, residual_inp_, weight_, eps
+            )
+            if native_result is not None:
+                return native_result
         if tokenweave_comm is not None and tokenweave_comm.should_engage(
             input_, residual_inp_, weight_
         ):

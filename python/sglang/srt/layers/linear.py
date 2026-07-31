@@ -1566,6 +1566,34 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Round-2 tokenweave-native direct write (plan 2026-07-31): on a
+        # no-reduce call (the downstream fused AR+RMSNorm site owns the
+        # reduction) the partial-sum gemm writes STRAIGHT into the tokenweave
+        # communicator's multicast region -- the copy-in half of the round-1
+        # wrapper tax. Guards pin the validated envelope: unquantized bf16,
+        # no fused bias, 2-D tokens; every deeper check (env flag, token cap,
+        # hidden lock, workspace readiness) lives behind native_gemm_out,
+        # which returns None to keep this call on its normal path.
+        if (
+            (skip_all_reduce or not self.reduce_results)
+            and not useFlux
+            and self.tp_size > 1
+            and bias_ is None
+            and input_parallel.dim() == 2
+            and input_parallel.dtype == torch.bfloat16
+            and getattr(self, "weight", None) is not None
+            and self.weight.dtype == torch.bfloat16
+        ):
+            from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+                native_gemm_out,
+            )
+
+            out_view = native_gemm_out(input_parallel.shape[0], self.output_size)
+            if out_view is not None:
+                torch.matmul(input_parallel, self.weight.t(), out=out_view)
+                return out_view, (self.bias if self.skip_bias_add else None)
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
