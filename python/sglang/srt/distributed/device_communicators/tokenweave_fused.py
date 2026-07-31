@@ -275,6 +275,15 @@ class TokenWeaveFusedCommunicator:
         self.native_enabled = (
             os.environ.get("SGLANG_TOKENWEAVE_NATIVE", "0") == "1"
         )
+        # Data-driven engagement floor (roundtwo A/B vs strongest incumbent,
+        # K=1024 N=5120 TP8: -29us at M=1024, ~par at 2560, +89us at 4096,
+        # +234us at 8192): below this token count the native path LOSES to
+        # the incumbent, so it declines and the call falls back. Note the
+        # inherited SGLANG_TOKENWEAVE_MAX_TOKENS is the workspace-sizing
+        # UPPER cap (raise it to cover prefill chunks, e.g. 8192).
+        self._native_min_tokens = int(
+            os.environ.get("SGLANG_TOKENWEAVE_NATIVE_MIN_TOKENS", "2560")
+        )
 
         # hidden_size is unknown at engine init; the workspace is allocated
         # once, on the first eligible call (_ensure_workspace), never freed.
@@ -540,7 +549,7 @@ class TokenWeaveFusedCommunicator:
         if (
             self.disabled
             or not self.native_enabled
-            or num_tokens <= 0
+            or num_tokens < self._native_min_tokens  # loss region: fall back
             or num_tokens > self.max_tokens
             or hidden % 8 != 0
             or (self.hidden is not None and hidden != self.hidden)
