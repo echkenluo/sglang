@@ -184,6 +184,7 @@ class TokenWeaveFusedCommunicator:
         # dispatcher and the RowParallelLinear producer hook getattr them
         # before any engagement check.
         self.native_enabled = False
+        self.stagea_enabled = True
         self._native_armed: Optional[Tuple[int, int]] = None  # (tokens, half)
         self._native_half = 0
         self._native_arms = 0
@@ -284,6 +285,17 @@ class TokenWeaveFusedCommunicator:
         self._native_min_tokens = int(
             os.environ.get("SGLANG_TOKENWEAVE_NATIVE_MIN_TOKENS", "2560")
         )
+        # Single-variable A/B isolation: SGLANG_TOKENWEAVE_STAGEA=0 turns the
+        # stage-A (decode/small-batch copy-in) engagement OFF while native
+        # stays on -- the only behavioral delta vs baseline is then the
+        # native path on prefill chunks >= the floor. Stage-A's ULP-level
+        # reduction differences flip greedy argmax ties on short prompts
+        # (07-31 gate: 2/3 probes differed with coherent continuations),
+        # which is why the July quality gate is teacher-forced logprob, not
+        # token identity.
+        self.stagea_enabled = (
+            os.environ.get("SGLANG_TOKENWEAVE_STAGEA", "1") != "0"
+        )
 
         # hidden_size is unknown at engine init; the workspace is allocated
         # once, on the first eligible call (_ensure_workspace), never freed.
@@ -358,6 +370,10 @@ class TokenWeaveFusedCommunicator:
         # 1. Flag / capability / sticky-runtime disable, all folded into one
         #    bit set at init or on first failure.
         if self.disabled:
+            return False
+        # 1b. Stage-A engagement can be disabled independently of native
+        #     (SGLANG_TOKENWEAVE_STAGEA=0) for single-variable serving A/Bs.
+        if not self.stagea_enabled:
             return False
         # 2. The fused op needs the residual stream (it is the AR+add+norm).
         if residual is None:
