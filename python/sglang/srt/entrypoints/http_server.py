@@ -1818,6 +1818,9 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             result,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            background=_global_state.tokenizer_manager.create_abort_task_for_rids(
+                request.request_id
+            ),
         )
 
     return result

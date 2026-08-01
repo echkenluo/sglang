@@ -1809,19 +1809,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         freeze_gc("Tokenizer Manager")
         return None
 
-    def create_abort_task(self, obj: GenerateReqInput):
-        # Abort the request if the client is disconnected.
+    def create_abort_task_for_rids(self, rids: Union[str, List[str]]):
+        """Create response cleanup that aborts the given scheduler request IDs.
+
+        Starlette runs response background tasks both after normal completion and
+        after a streaming client disconnect.  The short delay lets the normal
+        scheduler completion remove its request state first, making the common
+        completed-response path a no-op while still reclaiming disconnected work.
+        """
+        normalized_rids = [rids] if isinstance(rids, str) else list(rids)
+
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+            for rid in normalized_rids:
+                self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
         return background_tasks
+
+    def create_abort_task(self, obj: GenerateReqInput):
+        # Abort the request if the client is disconnected.
+        return self.create_abort_task_for_rids(obj.rid)
 
     def auto_create_handle_loop(self):
         if self.event_loop is not None:
