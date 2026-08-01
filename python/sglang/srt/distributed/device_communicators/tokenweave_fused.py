@@ -741,6 +741,7 @@ class TokenWeaveFusedCommunicator:
         residual_scattered: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        site: str = "?",
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """N2a fused-site entry for the SCATTERED flow.
 
@@ -806,16 +807,22 @@ class TokenWeaveFusedCommunicator:
                 eps,
             )
             self._native_claims += 1
-            if (
-                self._native_claims == 1
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                logger.info(
-                    "[TOKENWEAVE-NATIVE] engaged (scattered): first zero-copy "
-                    "RS+norm claim (tokens=%d half=%d)",
-                    num_tokens,
-                    half,
-                )
+            if not torch.cuda.is_current_stream_capturing():
+                # Per-site first-claim evidence: the N1 lesson was that only
+                # one of the two sites engaged and nothing made that visible.
+                claimed = getattr(self, "_scattered_claim_sites", None)
+                if claimed is None:
+                    claimed = set()
+                    self._scattered_claim_sites = claimed
+                if site not in claimed:
+                    claimed.add(site)
+                    logger.info(
+                        "[TOKENWEAVE-NATIVE] engaged (scattered, site=%s): "
+                        "zero-copy RS+norm claim (tokens=%d half=%d)",
+                        site,
+                        num_tokens,
+                        half,
+                    )
             # Scattered contract: hand back this rank's normed rows; the
             # residual shard was updated in place by the kernel.
             return region[start:end], residual_scattered

@@ -552,6 +552,7 @@ def _tokenweave_native_rs_norm_scattered(
     residual: torch.Tensor,
     norm_module: torch.nn.Module,
     post_residual_addition: Optional[torch.Tensor] = None,
+    site: str = "?",
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Try the TokenWeave native fused RS+residual-add+RMSNorm+AG at a
     scattered-flow site, replacing _tp_reduce_scatter plus the norm that
@@ -567,7 +568,9 @@ def _tokenweave_native_rs_norm_scattered(
     eps = getattr(norm_module, "variance_epsilon", None)
     if weight is None or eps is None:
         return None
-    return comm.native_fused_rs_norm_scattered(hidden_states, residual, weight, eps)
+    return comm.native_fused_rs_norm_scattered(
+        hidden_states, residual, weight, eps, site=site
+    )
 
 
 class LayerCommunicator:
@@ -672,6 +675,7 @@ class LayerCommunicator:
                     residual,
                     self.input_layernorm,
                     post_residual_addition,
+                    site="attn",
                 )
                 if _tw is not None:
                     # Fused kernel consumed the site (RS+add+norm+AG); the
@@ -843,6 +847,7 @@ class LayerCommunicator:
                     hidden_states,
                     residual,
                     self.post_attention_layernorm,
+                    site="mlp",
                 )
                 if _tw is not None:
                     hidden_states, residual = _tw
