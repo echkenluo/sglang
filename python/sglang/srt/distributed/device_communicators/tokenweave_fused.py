@@ -184,6 +184,7 @@ class TokenWeaveFusedCommunicator:
         # dispatcher and the RowParallelLinear producer hook getattr them
         # before any engagement check.
         self.native_enabled = False
+        self.native_scattered_enabled = False
         self.stagea_enabled = True
         self._native_armed: Optional[Tuple[int, int]] = None  # (tokens, half)
         self._native_half = 0
@@ -295,6 +296,15 @@ class TokenWeaveFusedCommunicator:
         # token identity.
         self.stagea_enabled = (
             os.environ.get("SGLANG_TOKENWEAVE_STAGEA", "1") != "0"
+        )
+        # N2a: scattered-flow fusion. In attn-tp-input-scattered mode the
+        # layer keeps its residual resident-sharded ([M/tp, H] per rank) and
+        # does RS -> add+norm (scattered) -> AG-on-fetch. The fused kernel is
+        # that whole triple in one launch, and the scattered residual IS the
+        # kernel's residual-shard argument (it only reads/writes its own
+        # shard rows) -- no staging, no residual all-gather, no copies.
+        self.native_scattered_enabled = (
+            os.environ.get("SGLANG_TOKENWEAVE_NATIVE_SCATTERED", "0") == "1"
         )
 
         # hidden_size is unknown at engine init; the workspace is allocated
@@ -724,6 +734,100 @@ class TokenWeaveFusedCommunicator:
 
         residual.copy_(res_stage[:num_tokens])
         return region[:num_tokens], residual
+
+    def native_fused_rs_norm_scattered(
+        self,
+        input_: torch.Tensor,
+        residual_scattered: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """N2a fused-site entry for the SCATTERED flow.
+
+        input_ must be the armed full-M region view (producer direct-write);
+        residual_scattered is this rank's resident shard [M/world, H] and is
+        passed to the kernel AS the residual arg -- the kernel reads and
+        updates exactly its own shard rows, so the scattered layout satisfies
+        the replication contract by construction (each rank sees only rows it
+        owns). Returns (scattered normed view [M/world, H], residual_scattered)
+        or None on any miss (caller runs the composed RS+norm path). The
+        full normed output also lands in the region on every rank (kernel's
+        built-in AG) -- N2b will let the latent fetch short-circuit to it.
+        """
+        armed = self._native_armed
+        self._native_armed = None
+        if (
+            armed is None
+            or self.disabled
+            or not self.native_scattered_enabled
+            or residual_scattered is None
+        ):
+            return None
+        num_tokens, half = armed
+        if (
+            input_.dim() != 2
+            or input_.shape[0] != num_tokens
+            or self.hidden is None
+            or input_.shape[1] != self.hidden
+            or input_.dtype != self.dtype
+            or num_tokens % self.world_size != 0  # scattered flow pads upstream
+            or residual_scattered.dim() != 2
+            or residual_scattered.shape[0] != num_tokens // self.world_size
+            or residual_scattered.shape[1] != self.hidden
+            or residual_scattered.dtype != self.dtype
+            or weight.dim() != 1
+            or weight.shape[0] != self.hidden
+            or weight.dtype != self.dtype
+        ):
+            return None
+        m_pad = num_tokens  # divisible by world_size: no pad rows here
+        region = self._half_view(half, m_pad, self.hidden)
+        if input_.data_ptr() != region.data_ptr():
+            return None
+        try:
+            hidden = self.hidden
+            blpr = m_pad // self.world_size
+            start = self.rank * blpr
+            end = start + blpr
+            if self._max_ctas_override is not None:
+                max_ctas = self._max_ctas_override
+            else:
+                max_ctas = 8 if m_pad * hidden * 2 <= 2 * 1024 * 1024 else 16
+            half_base = half * self.max_tokens_pad * hidden
+            self._op(
+                region[start:end],
+                residual_scattered,
+                weight,
+                self._mc_ptr + (half_base + start * hidden) * region.element_size(),
+                self._signal_pads,
+                self.rank,
+                self.world_size,
+                max_ctas,
+                eps,
+            )
+            self._native_claims += 1
+            if (
+                self._native_claims == 1
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                logger.info(
+                    "[TOKENWEAVE-NATIVE] engaged (scattered): first zero-copy "
+                    "RS+norm claim (tokens=%d half=%d)",
+                    num_tokens,
+                    half,
+                )
+            # Scattered contract: hand back this rank's normed rows; the
+            # residual shard was updated in place by the kernel.
+            return region[start:end], residual_scattered
+        except Exception as exc:  # noqa: BLE001 -- sticky fail-safe
+            self.disabled = True
+            logger.warning(
+                "[TOKENWEAVE-NATIVE] disabled after scattered-path failure "
+                "(falling back to composed RS+norm): %s",
+                exc,
+                exc_info=True,
+            )
+            return None
 
     def _agree_all_ranks(self, local_ok: bool) -> bool:
         """Rank-uniform verdict on an init step (stage B guarantee 4). Eager

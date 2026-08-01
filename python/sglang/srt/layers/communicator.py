@@ -547,6 +547,29 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
+def _tokenweave_native_rs_norm_scattered(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_module: torch.nn.Module,
+    post_residual_addition: Optional[torch.Tensor] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Try the TokenWeave native fused RS+residual-add+RMSNorm+AG at a
+    scattered-flow site, replacing _tp_reduce_scatter plus the norm that
+    follows it. Engages only when the producer GEMM direct-wrote the armed
+    symm region (data_ptr identity, checked inside the communicator).
+    Returns None to run the incumbent composed path."""
+    if residual is None or post_residual_addition is not None:
+        return None
+    comm = getattr(get_tp_group(), "tokenweave_comm", None)
+    if comm is None or not getattr(comm, "native_scattered_enabled", False):
+        return None
+    weight = getattr(norm_module, "weight", None)
+    eps = getattr(norm_module, "variance_epsilon", None)
+    if weight is None or eps is None:
+        return None
+    return comm.native_fused_rs_norm_scattered(hidden_states, residual, weight, eps)
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -631,6 +654,7 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        _tw_normed = False
         if get_attn_tp_context().input_scattered:
             if (
                 residual is not None
@@ -643,11 +667,25 @@ class LayerCommunicator:
                 # the fused GemmRS o_proj.
                 pass
             else:
-                hidden_states, residual = self._tp_reduce_scatter(
+                _tw = _tokenweave_native_rs_norm_scattered(
                     hidden_states,
                     residual,
+                    self.input_layernorm,
+                    post_residual_addition,
                 )
-        if hidden_states.shape[0] == 0:
+                if _tw is not None:
+                    # Fused kernel consumed the site (RS+add+norm+AG); the
+                    # norm block below must not run again.
+                    hidden_states, residual = _tw
+                    _tw_normed = True
+                else:
+                    hidden_states, residual = self._tp_reduce_scatter(
+                        hidden_states,
+                        residual,
+                    )
+        if _tw_normed:
+            pass
+        elif hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
             if (
@@ -791,6 +829,7 @@ class LayerCommunicator:
                 get_attn_tp_context().set_mlp_inputs(mlp_inputs)
             return hidden_states, residual
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
+            _tw_normed = False
             if (
                 residual is not None
                 and hidden_states.shape[0] == residual.shape[0]
@@ -800,11 +839,22 @@ class LayerCommunicator:
                 # shard (rows match the scattered residual); skip the RS.
                 pass
             else:
-                hidden_states, residual = self._tp_reduce_scatter(
+                _tw = _tokenweave_native_rs_norm_scattered(
                     hidden_states,
                     residual,
+                    self.post_attention_layernorm,
                 )
-            if hidden_states.shape[0] == 0:
+                if _tw is not None:
+                    hidden_states, residual = _tw
+                    _tw_normed = True
+                else:
+                    hidden_states, residual = self._tp_reduce_scatter(
+                        hidden_states,
+                        residual,
+                    )
+            if _tw_normed:
+                pass
+            elif hidden_states.shape[0] == 0:
                 residual = hidden_states
             else:
                 hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
