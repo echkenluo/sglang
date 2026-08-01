@@ -1060,3 +1060,62 @@ def native_gemm_out(num_tokens: int, hidden: int) -> Optional["torch.Tensor"]:
     if comm is None or not getattr(comm, "native_enabled", False):
         return None
     return comm.provide_gemm_out(num_tokens, hidden)
+
+
+# --- N3 fp8 true direct-write: gemm-output redirect slot -----------------
+# The fp8 quant wrappers allocate their own output (C = A.new_empty in
+# prepare_block_fp8_matmul_inputs) and the gemm writes it as an out-param,
+# so redirecting that single allocation to the armed region removes the
+# staging copy (~40us/site at M=4096). linear.py parks the region view here
+# right before quant_method.apply; the allocation site consumes it when the
+# geometry matches. Consume-once, cleared by linear.py in a finally. The
+# scheduler is single-threaded per TP rank process, so a module slot is safe
+# (same pattern as the communicator's _native_armed).
+_GEMM_OUT_REDIRECT: Optional["torch.Tensor"] = None
+_FP8_DIRECT_WRITE_LOGGED = False
+
+
+def set_gemm_out_redirect(view: "torch.Tensor") -> None:
+    global _GEMM_OUT_REDIRECT
+    _GEMM_OUT_REDIRECT = view
+
+
+def clear_gemm_out_redirect() -> None:
+    global _GEMM_OUT_REDIRECT
+    _GEMM_OUT_REDIRECT = None
+
+
+def consume_gemm_out_redirect(
+    shape, dtype: "torch.dtype"
+) -> Optional["torch.Tensor"]:
+    """Return the parked region view iff it matches the gemm's output
+    geometry exactly; otherwise None and the caller allocates normally
+    (linear.py then falls back to the staging copy)."""
+    global _GEMM_OUT_REDIRECT
+    view = _GEMM_OUT_REDIRECT
+    if view is None:
+        return None
+    if (
+        tuple(view.shape) != tuple(shape)
+        or view.dtype != dtype
+        or not view.is_contiguous()
+    ):
+        return None
+    _GEMM_OUT_REDIRECT = None
+    return view
+
+
+def note_fp8_direct_write(num_tokens: int) -> None:
+    """First-time evidence log for the fp8 direct-write path (greppable in
+    server logs the same way as the site/fetch engagement lines)."""
+    global _FP8_DIRECT_WRITE_LOGGED
+    if _FP8_DIRECT_WRITE_LOGGED:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    _FP8_DIRECT_WRITE_LOGGED = True
+    logger.info(
+        "[TOKENWEAVE-NATIVE] fp8 direct-write engaged: gemm output "
+        "redirected into the region, staging copy eliminated (tokens=%d)",
+        num_tokens,
+    )

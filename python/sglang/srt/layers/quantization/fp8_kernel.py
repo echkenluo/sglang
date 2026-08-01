@@ -1086,7 +1086,17 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    # Round-2 tokenweave-native fp8 direct-write: when linear.py parked the
+    # armed region view for this gemm, hand it out as C instead of a fresh
+    # allocation -- deepgemm/triton write C as an out-param, so this removes
+    # the staging copy entirely. No-op (None) unless the geometry matches.
+    from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+        consume_gemm_out_redirect,
+    )
+
+    C = consume_gemm_out_redirect(C_shape, output_dtype)
+    if C is None:
+        C = A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 

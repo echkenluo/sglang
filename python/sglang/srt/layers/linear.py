@@ -1594,17 +1594,30 @@ class RowParallelLinear(LinearBase):
                     torch.matmul(input_parallel, self.weight.t(), out=out_view)
                     return out_view, (self.bias if self.skip_bias_add else None)
             elif self.weight.dtype == torch.float8_e4m3fn:
-                # N3 fp8 staging variant: the quant kernels allocate their
-                # own output, so stage it into the region with one M x N
-                # bf16 copy (~40us at M=4096) -- still net-positive against
-                # the ~150us fetch-AG the claim removes per site. True
-                # direct-write needs out= plumbing through the fp8 gemm
-                # wrappers; deferred until this variant proves the domain.
+                # N3 fp8 direct-write: park the region view in the redirect
+                # slot; the block-fp8 gemm's output-allocation site
+                # (prepare_block_fp8_matmul_inputs) hands it to deepgemm /
+                # triton as the out-param, eliminating the staging copy.
+                # Backends that allocate internally (cutlass) never consume
+                # the slot and fall back to the one-copy staging path below.
                 out_view = native_gemm_out(input_parallel.shape[0], self.output_size)
                 if out_view is not None:
-                    output_parallel = self.quant_method.apply(
-                        self, input_parallel, bias=bias_
+                    from sglang.srt.distributed.device_communicators.tokenweave_fused import (
+                        clear_gemm_out_redirect,
+                        note_fp8_direct_write,
+                        set_gemm_out_redirect,
                     )
+
+                    set_gemm_out_redirect(out_view)
+                    try:
+                        output_parallel = self.quant_method.apply(
+                            self, input_parallel, bias=bias_
+                        )
+                    finally:
+                        clear_gemm_out_redirect()
+                    if output_parallel.data_ptr() == out_view.data_ptr():
+                        note_fp8_direct_write(input_parallel.shape[0])
+                        return out_view, (self.bias if self.skip_bias_add else None)
                     if (
                         output_parallel.shape == out_view.shape
                         and output_parallel.dtype == out_view.dtype
