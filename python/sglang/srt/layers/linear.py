@@ -1583,16 +1583,39 @@ class RowParallelLinear(LinearBase):
             and input_parallel.dim() == 2
             and input_parallel.dtype == torch.bfloat16
             and getattr(self, "weight", None) is not None
-            and self.weight.dtype == torch.bfloat16
         ):
             from sglang.srt.distributed.device_communicators.tokenweave_fused import (
                 native_gemm_out,
             )
 
-            out_view = native_gemm_out(input_parallel.shape[0], self.output_size)
-            if out_view is not None:
-                torch.matmul(input_parallel, self.weight.t(), out=out_view)
-                return out_view, (self.bias if self.skip_bias_add else None)
+            if self.weight.dtype == torch.bfloat16:
+                out_view = native_gemm_out(input_parallel.shape[0], self.output_size)
+                if out_view is not None:
+                    torch.matmul(input_parallel, self.weight.t(), out=out_view)
+                    return out_view, (self.bias if self.skip_bias_add else None)
+            elif self.weight.dtype == torch.float8_e4m3fn:
+                # N3 fp8 staging variant: the quant kernels allocate their
+                # own output, so stage it into the region with one M x N
+                # bf16 copy (~40us at M=4096) -- still net-positive against
+                # the ~150us fetch-AG the claim removes per site. True
+                # direct-write needs out= plumbing through the fp8 gemm
+                # wrappers; deferred until this variant proves the domain.
+                out_view = native_gemm_out(input_parallel.shape[0], self.output_size)
+                if out_view is not None:
+                    output_parallel = self.quant_method.apply(
+                        self, input_parallel, bias=bias_
+                    )
+                    if (
+                        output_parallel.shape == out_view.shape
+                        and output_parallel.dtype == out_view.dtype
+                    ):
+                        out_view.copy_(output_parallel)
+                        return out_view, (self.bias if self.skip_bias_add else None)
+                    # Geometry miss: keep normal semantics (the stale arm is
+                    # disarmed by the next claim's data_ptr identity check).
+                    return output_parallel, (
+                        self.bias if self.skip_bias_add else None
+                    )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
