@@ -188,6 +188,17 @@ _FP8_AG_ENGAGED_LOGGED = False
 
 def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
     total_tokens = forward_batch.input_ids.shape[0]
+    _tw_comm = getattr(get_tp_group(), "tokenweave_comm", None)
+    if _tw_comm is not None and getattr(
+        _tw_comm, "native_scattered_enabled", False
+    ):
+        # N2b: when hidden_states is the rank slice a fused scattered claim
+        # just handed out, the full normed rows already sit in the symm
+        # region on every rank (kernel multicast AG) -- hand out that view
+        # and skip this gather entirely.
+        _tw_full = _tw_comm.native_scattered_full_view(hidden_states, total_tokens)
+        if _tw_full is not None:
+            return _tw_full
     if (
         _ENABLE_FP8_AG
         and (_FP8_AG_SIDE == "all" or _FP8_AG_SIDE == side)

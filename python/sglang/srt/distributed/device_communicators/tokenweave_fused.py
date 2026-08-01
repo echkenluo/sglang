@@ -306,6 +306,22 @@ class TokenWeaveFusedCommunicator:
         self.native_scattered_enabled = (
             os.environ.get("SGLANG_TOKENWEAVE_NATIVE_SCATTERED", "0") == "1"
         )
+        # N2b: fetch short-circuit. The fused kernel's built-in multicast AG
+        # already left the FULL normed output in the region, but the
+        # scattered flow re-gathers the rank slice at the next latent fetch
+        # (a full M x H NCCL AG per site) -- which is why N2a alone measured
+        # PAR: the kernel pays for an AG whose benefit is only realized when
+        # the fetch consumes the region view instead of re-gathering. Kill
+        # switch for single-variable A/Bs.
+        self.native_scattered_fetch_enabled = (
+            os.environ.get("SGLANG_TOKENWEAVE_NATIVE_SCATTERED_FETCH", "1") == "1"
+        )
+        # (full_region_view, rank_slice_data_ptr, num_tokens, hidden) of the
+        # most recent scattered claim; consume-once, invalidated by the next
+        # arm (the fetch always lands between its claim and the next
+        # producer GEMM on the python timeline).
+        self._native_scattered_full: Optional[Tuple[Any, int, int, int]] = None
+        self._native_fetch_hits = 0
 
         # hidden_size is unknown at engine init; the workspace is allocated
         # once, on the first eligible call (_ensure_workspace), never freed.
@@ -592,6 +608,10 @@ class TokenWeaveFusedCommunicator:
             # sums are exact zeros (same contract as the stage-A impl); the
             # producer gemm only writes the real rows.
             region[num_tokens:].zero_()
+        # N2b: a new arm invalidates the previous claim's full-region stash
+        # (its fetch, if any, already ran on the python timeline -- the
+        # fetch sits between a claim and the next producer GEMM).
+        self._native_scattered_full = None
         self._native_armed = (num_tokens, half)
         self._native_arms += 1
         if self._native_arms == 1 and not torch.cuda.is_current_stream_capturing():
@@ -825,9 +845,21 @@ class TokenWeaveFusedCommunicator:
                     )
             # Scattered contract: hand back this rank's normed rows; the
             # residual shard was updated in place by the kernel.
-            return region[start:end], residual_scattered
+            out = region[start:end]
+            if self.native_scattered_fetch_enabled:
+                # N2b: the kernel's multicast AG already left the FULL normed
+                # output in region[:num_tokens] on every rank -- stash it so
+                # the next latent fetch can skip its M x H all-gather.
+                self._native_scattered_full = (
+                    region[:num_tokens],
+                    out.data_ptr(),
+                    num_tokens,
+                    hidden,
+                )
+            return out, residual_scattered
         except Exception as exc:  # noqa: BLE001 -- sticky fail-safe
             self.disabled = True
+            self._native_scattered_full = None
             logger.warning(
                 "[TOKENWEAVE-NATIVE] disabled after scattered-path failure "
                 "(falling back to composed RS+norm): %s",
@@ -835,6 +867,43 @@ class TokenWeaveFusedCommunicator:
                 exc_info=True,
             )
             return None
+
+    def native_scattered_full_view(
+        self, latent: torch.Tensor, total_tokens: int
+    ) -> Optional[torch.Tensor]:
+        """N2b consumer: if latent IS the rank slice handed out by the most
+        recent scattered claim (data_ptr identity) and the requested gather
+        matches its geometry, return the full-region view instead of letting
+        the caller run its M x H all-gather. Bit-identical to that gather:
+        the region rows ARE the multicast copies of every rank's slice.
+        Consume-once; the view stays valid until the claimed half is
+        re-armed, which is two producer GEMMs away on the same stream --
+        every consumer (qkv / gate_up) has read it by then."""
+        stash = self._native_scattered_full
+        if stash is None:
+            return None
+        full, slice_ptr, num_tokens, hidden = stash
+        if (
+            latent.dim() != 2
+            or latent.data_ptr() != slice_ptr
+            or latent.shape[0] * self.world_size != num_tokens
+            or latent.shape[1] != hidden
+            or latent.dtype != self.dtype
+            or total_tokens != num_tokens
+        ):
+            return None
+        self._native_scattered_full = None
+        self._native_fetch_hits += 1
+        if (
+            self._native_fetch_hits == 1
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            logger.info(
+                "[TOKENWEAVE-NATIVE] fetch short-circuit engaged: full "
+                "region view replaces the latent all-gather (tokens=%d)",
+                num_tokens,
+            )
+        return full
 
     def _agree_all_ranks(self, local_ok: bool) -> bool:
         """Rank-uniform verdict on an init step (stage B guarantee 4). Eager
