@@ -85,6 +85,10 @@ _FLUX_ENGAGED_BATCHES = 0
 _FLUX_SKIPPED_BATCHES = 0
 _FLUX_ENGAGED_TOKENS = 0
 _FLUX_SKIPPED_TOKENS = 0
+_FLUX_SKIPPED_SMALL_BATCHES = 0
+_FLUX_SKIPPED_NON_PURE_PREFILL_BATCHES = 0
+_FLUX_SMALL_SKIP_LOGGED = False
+_FLUX_NON_PURE_PREFILL_SKIP_LOGGED = False
 
 
 class ForwardMode(IntEnum):
@@ -644,17 +648,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def useFluxFunc(self):
         if get_int_env_var("SGLANG_USE_FUSED_OVERLAP", 0) == 1:
+            self.useFlux = False
             # Opportunistic engagement: flux GemmRS/AG-GEMM needs the token
             # count to be a TP multiple. The 0.5.5 patch padded the batch
             # (tp_align), but the padded rows break flashinfer's ragged
             # qo_indptr validation and pollute KV slot 0. Large prefill
             # chunks (where flux pays off) are virtually always divisible;
             # odd batches just take the standard unfused path.
+            # Optional gates keep the default behavior unchanged while allowing
+            # L20 experiments to exclude small or non-pure-prefill batches.
             global _FLUX_ENGAGED_BATCHES, _FLUX_SKIPPED_BATCHES, _FLUX_ENGAGED_TOKENS, _FLUX_SKIPPED_TOKENS
+            global _FLUX_SKIPPED_SMALL_BATCHES, _FLUX_SKIPPED_NON_PURE_PREFILL_BATCHES
+            global _FLUX_SMALL_SKIP_LOGGED, _FLUX_NON_PURE_PREFILL_SKIP_LOGGED
             tokens = 0 if self.input_ids is None else self.input_ids.shape[0]
+            min_tokens = max(0, get_int_env_var("SGLANG_FLUX_MIN_TOKENS", 0))
+            prefill_only = get_int_env_var("SGLANG_FLUX_PREFILL_ONLY", 0) == 1
+            non_pure_prefill_blocked = (
+                prefill_only and self.forward_mode != ForwardMode.EXTEND
+            )
+            small_batch_blocked = tokens < min_tokens
             if (
                 tokens > 0
                 and tokens % get_tensor_model_parallel_world_size() == 0
+                and not small_batch_blocked
+                and not non_pure_prefill_blocked
             ):
                 self.useFlux = True
                 _FLUX_ENGAGED_BATCHES += 1
@@ -662,10 +679,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global _FLUX_ENGAGED_LOGGED
                 if not _FLUX_ENGAGED_LOGGED:
                     _FLUX_ENGAGED_LOGGED = True
-                    logging.info(f"[FLUX] useFlux engaged: tokens={tokens}")
+                    logging.info(
+                        f"[FLUX] useFlux engaged: tokens={tokens} "
+                        f"mode={self.forward_mode.name} min_tokens={min_tokens} "
+                        f"prefill_only={prefill_only}"
+                    )
             else:
                 _FLUX_SKIPPED_BATCHES += 1
                 _FLUX_SKIPPED_TOKENS += tokens
+                if small_batch_blocked:
+                    _FLUX_SKIPPED_SMALL_BATCHES += 1
+                    if not _FLUX_SMALL_SKIP_LOGGED:
+                        _FLUX_SMALL_SKIP_LOGGED = True
+                        logging.info(
+                            f"[FLUX] useFlux skipped: tokens={tokens} "
+                            f"mode={self.forward_mode.name} "
+                            f"reason=below_min_tokens min_tokens={min_tokens}"
+                        )
+                if non_pure_prefill_blocked:
+                    _FLUX_SKIPPED_NON_PURE_PREFILL_BATCHES += 1
+                    if not _FLUX_NON_PURE_PREFILL_SKIP_LOGGED:
+                        _FLUX_NON_PURE_PREFILL_SKIP_LOGGED = True
+                        logging.info(
+                            f"[FLUX] useFlux skipped: tokens={tokens} "
+                            f"mode={self.forward_mode.name} "
+                            "reason=non_pure_prefill"
+                        )
             # Periodic engagement-rate evidence: quantifies how much extend
             # traffic the opportunistic policy actually covers.
             total = _FLUX_ENGAGED_BATCHES + _FLUX_SKIPPED_BATCHES
@@ -675,7 +714,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     f"[FLUX] engagement: batches {_FLUX_ENGAGED_BATCHES}/{total} "
                     f"({100.0 * _FLUX_ENGAGED_BATCHES / max(total, 1):.1f}%), "
                     f"tokens {_FLUX_ENGAGED_TOKENS}/{tok_total} "
-                    f"({100.0 * _FLUX_ENGAGED_TOKENS / max(tok_total, 1):.1f}%)"
+                    f"({100.0 * _FLUX_ENGAGED_TOKENS / max(tok_total, 1):.1f}%), "
+                    f"skipped_small={_FLUX_SKIPPED_SMALL_BATCHES}, "
+                    f"skipped_non_pure_prefill="
+                    f"{_FLUX_SKIPPED_NON_PURE_PREFILL_BATCHES}, "
+                    f"min_tokens={min_tokens}, prefill_only={prefill_only}"
                 )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
