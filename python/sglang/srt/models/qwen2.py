@@ -64,6 +64,13 @@ logger = logging.getLogger(__name__)
 # Flux fused GemmRS/AG-GEMM contexts are only built when explicitly enabled,
 # so the patch can stay resident without a flux install or extra VRAM.
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+# Default-off research discriminator for the MLP row-parallel site.  When it
+# is enabled, down_proj uses the ordinary Torch GEMM + TP AllReduce path and
+# forward() slices the token rows afterward, preserving the surrounding Flux
+# token-shard ownership without using GemmRS/ReduceScatter at this site.
+_FLUX_DISABLE_DOWN_PROJ = (
+    os.environ.get("SGLANG_FLUX_DISABLE_DOWN_PROJ", "0") == "1"
+)
 
 
 class Qwen2MLP(nn.Module):
@@ -90,9 +97,12 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            fuse_gemm_rs=(_FLUX_FUSE and not last_layer),
+            fuse_gemm_rs=(
+                _FLUX_FUSE and not last_layer and not _FLUX_DISABLE_DOWN_PROJ
+            ),
             prefix=add_prefix("down_proj", prefix),
         )
+        self.last_layer = last_layer
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -107,6 +117,13 @@ class Qwen2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x, useFlux=useFlux)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, useFlux=useFlux)
+        if useFlux and _FLUX_DISABLE_DOWN_PROJ and not self.last_layer:
+            # With GemmRS construction disabled, RowParallelLinear performs
+            # the ordinary TP AllReduce.  Keep only this rank's token rows so
+            # the next Flux layer sees the same ownership contract as before.
+            tp_size = get_tensor_model_parallel_world_size()
+            assert x.shape[0] % tp_size == 0
+            x = x.tensor_split(tp_size)[get_tensor_model_parallel_rank()]
         return x
 
 
