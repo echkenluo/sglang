@@ -51,6 +51,7 @@ _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 # allocating an unused GemmRS context; forward() supplies an explicit collective
 # and token shard so the surrounding Flux ownership contract stays unchanged.
 _FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
+_FLUX_DISABLE_QKV = os.environ.get("SGLANG_FLUX_DISABLE_QKV", "0") == "1"
 _FLUX_O_PROJ_FALLBACK = os.environ.get(
     "SGLANG_FLUX_O_PROJ_FALLBACK", "reduce_scatter"
 )
@@ -145,7 +146,9 @@ class Qwen3Attention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
-            fuse_ag_gemm=(_FLUX_FUSE and not first_layer),
+            fuse_ag_gemm=(
+                _FLUX_FUSE and not first_layer and not _FLUX_DISABLE_QKV
+            ),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -158,6 +161,7 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
             fuse_gemm_rs=(_FLUX_FUSE and not _FLUX_DISABLE_O_PROJ),
         )
+        self.first_layer = first_layer
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -310,6 +314,16 @@ class Qwen3Attention(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
+            if (
+                forward_batch.useFlux
+                and _FLUX_DISABLE_QKV
+                and not self.first_layer
+            ):
+                # Flux AG-GEMM normally gathers the token rows internally.
+                # Recreate that input contract before the ordinary Torch qkv GEMM.
+                hidden_states = get_attention_tp_group().all_gather(
+                    hidden_states, dim=0
+                )
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
