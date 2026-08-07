@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -47,9 +48,16 @@ logger = logging.getLogger(__name__)
 # so the patch can stay resident without a flux install or extra VRAM.
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 # Default-off research ablation. Keeping the construction gate here avoids
-# allocating an unused GemmRS context; forward() supplies the matching ordinary
-# ReduceScatter so the surrounding Flux token-shard contract stays unchanged.
+# allocating an unused GemmRS context; forward() supplies an explicit collective
+# and token shard so the surrounding Flux ownership contract stays unchanged.
 _FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
+_FLUX_O_PROJ_FALLBACK = os.environ.get(
+    "SGLANG_FLUX_O_PROJ_FALLBACK", "reduce_scatter"
+)
+if _FLUX_O_PROJ_FALLBACK not in ("reduce_scatter", "allreduce_slice"):
+    raise ValueError(
+        "SGLANG_FLUX_O_PROJ_FALLBACK must be reduce_scatter or allreduce_slice"
+    )
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -323,16 +331,20 @@ class Qwen3Attention(nn.Module):
         if forward_batch.useFlux and _FLUX_DISABLE_O_PROJ:
             # The surrounding Flux schedule owns a token shard after o_proj.
             # Reproduce that contract with the unfused Torch GEMM plus the
-            # ordinary TP ReduceScatter; returning the full partial tensor here
-            # would mismatch the already-scattered residual at prepare_mlp.
+            # selected standard collective; returning the full partial tensor
+            # would mismatch the scattered residual at prepare_mlp.
             assert output.shape[0] % self.tp_size == 0
-            scattered_output = output.new_empty(
-                output.shape[0] // self.tp_size, *output.shape[1:]
-            )
-            get_attention_tp_group().reduce_scatter_tensor(
-                scattered_output, output
-            )
-            output = scattered_output
+            if _FLUX_O_PROJ_FALLBACK == "allreduce_slice":
+                output = attention_tensor_model_parallel_all_reduce(output)
+                output = output.tensor_split(self.tp_size)[self.tp_rank]
+            else:
+                scattered_output = output.new_empty(
+                    output.shape[0] // self.tp_size, *output.shape[1:]
+                )
+                get_attention_tp_group().reduce_scatter_tensor(
+                    scattered_output, output
+                )
+                output = scattered_output
         return output
 
 
