@@ -1553,7 +1553,17 @@ class RowParallelLinear(LinearBase):
                     self, input_parallel, bias=bias_
                 )
 
-        if self.reduce_results and not useFlux and self.tp_size > 1 and not skip_all_reduce:
+        # Skip the standard reduction only when this invocation actually ran
+        # the Flux GemmRS path.  Some layers (notably the final MLP down_proj)
+        # deliberately use the regular GEMM even while the surrounding batch
+        # is in Flux mode, so they still require the normal all-reduce.
+        used_flux_gemm_rs = useFlux and self.fuse_gemm_rs
+        if (
+            self.reduce_results
+            and not used_flux_gemm_rs
+            and self.tp_size > 1
+            and not skip_all_reduce
+        ):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
