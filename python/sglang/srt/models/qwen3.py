@@ -13,7 +13,11 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -42,9 +46,9 @@ logger = logging.getLogger(__name__)
 # Flux fused GemmRS/AG-GEMM contexts are only built when explicitly enabled,
 # so the patch can stay resident without a flux install or extra VRAM.
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
-# Default-off research ablation.  Keeping the construction gate here avoids
-# allocating an unused GemmRS context and makes the standard RowParallelLinear
-# path perform the required AllReduce when the rest of the batch still uses Flux.
+# Default-off research ablation. Keeping the construction gate here avoids
+# allocating an unused GemmRS context; forward() supplies the matching ordinary
+# ReduceScatter so the surrounding Flux token-shard contract stays unchanged.
 _FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -316,6 +320,19 @@ class Qwen3Attention(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output, useFlux=forward_batch.useFlux)
+        if forward_batch.useFlux and _FLUX_DISABLE_O_PROJ:
+            # The surrounding Flux schedule owns a token shard after o_proj.
+            # Reproduce that contract with the unfused Torch GEMM plus the
+            # ordinary TP ReduceScatter; returning the full partial tensor here
+            # would mismatch the already-scattered residual at prepare_mlp.
+            assert output.shape[0] % self.tp_size == 0
+            scattered_output = output.new_empty(
+                output.shape[0] // self.tp_size, *output.shape[1:]
+            )
+            get_attention_tp_group().reduce_scatter_tensor(
+                scattered_output, output
+            )
+            output = scattered_output
         return output
 
 
