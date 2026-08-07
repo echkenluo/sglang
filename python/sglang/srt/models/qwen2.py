@@ -71,6 +71,11 @@ _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 _FLUX_DISABLE_DOWN_PROJ = (
     os.environ.get("SGLANG_FLUX_DISABLE_DOWN_PROJ", "0") == "1"
 )
+# Default-off column-parallel discriminator.  The ordinary gate/up GEMM needs
+# the full token rows that Flux AG-GEMM normally gathers internally.
+_FLUX_DISABLE_GATE_UP = (
+    os.environ.get("SGLANG_FLUX_DISABLE_GATE_UP", "0") == "1"
+)
 
 
 class Qwen2MLP(nn.Module):
@@ -89,7 +94,7 @@ class Qwen2MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            fuse_ag_gemm=_FLUX_FUSE,
+            fuse_ag_gemm=(_FLUX_FUSE and not _FLUX_DISABLE_GATE_UP),
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -114,6 +119,8 @@ class Qwen2MLP(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
+        if useFlux and _FLUX_DISABLE_GATE_UP:
+            x = tensor_model_parallel_all_gather(x, 0)
         gate_up, _ = self.gate_up_proj(x, useFlux=useFlux)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, useFlux=useFlux)
