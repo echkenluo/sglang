@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 # Flux fused GemmRS/AG-GEMM contexts are only built when explicitly enabled,
 # so the patch can stay resident without a flux install or extra VRAM.
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+# Default-off research ablation.  Keeping the construction gate here avoids
+# allocating an unused GemmRS context and makes the standard RowParallelLinear
+# path perform the required AllReduce when the rest of the batch still uses Flux.
+_FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -140,7 +144,7 @@ class Qwen3Attention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            fuse_gemm_rs=_FLUX_FUSE,
+            fuse_gemm_rs=(_FLUX_FUSE and not _FLUX_DISABLE_O_PROJ),
         )
 
         self.rotary_emb = get_rope(
