@@ -156,10 +156,19 @@ class ScatterMode(Enum):
 # SGLANG_FP8_AG_V1=1     legacy two-collective path (payload + scale gathered
 #                        separately) for A/B comparison
 # SGLANG_FP8_AG_SIDE     all (default) | mlp | attn — quantize only that AG site
+# SGLANG_FP8_AG_GROUP_SIZE  32 | 64 | 128 (default); smaller groups carry more
+#                           scales but can reduce activation quantization error
 _ENABLE_FP8_AG = get_bool_env_var("SGLANG_FP8_AG")
 _FP8_AG_V1 = get_bool_env_var("SGLANG_FP8_AG_V1")
 _FP8_AG_SIDE = os.environ.get("SGLANG_FP8_AG_SIDE", "all").lower()
-_FP8_AG_GROUP_SIZE = 128
+try:
+    _FP8_AG_GROUP_SIZE = int(os.environ.get("SGLANG_FP8_AG_GROUP_SIZE", "128"))
+except ValueError as exc:
+    raise ValueError(
+        "SGLANG_FP8_AG_GROUP_SIZE must be one of 32, 64, or 128"
+    ) from exc
+if _FP8_AG_GROUP_SIZE not in (32, 64, 128):
+    raise ValueError("SGLANG_FP8_AG_GROUP_SIZE must be one of 32, 64, or 128")
 
 
 @triton.jit
@@ -196,7 +205,8 @@ def _tp_all_gather_hidden_states(hidden_states, forward_batch, side="all"):
             _FP8_AG_ENGAGED_LOGGED = True
             logging.info(
                 f"[FP8-AG] engaged: side={side} tokens={total_tokens} "
-                f"hidden={hidden_states.shape[-1]}"
+                f"hidden={hidden_states.shape[-1]} "
+                f"group_size={_FP8_AG_GROUP_SIZE}"
             )
         # Packing overhead beats the saved collective launch only at larger
         # gathers (L1: v2 wins >=4k total tokens, loses at ~1k).
