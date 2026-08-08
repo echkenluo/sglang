@@ -17,13 +17,16 @@
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import json
 import logging
-import os
 import math
+import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -35,6 +38,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -116,6 +120,10 @@ logger = logging.getLogger(__name__)
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 _FLUX_DISABLE_QKV = os.environ.get("SGLANG_FLUX_DISABLE_QKV", "0") == "1"
 _FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
+_FLUX_SITE_AUDIT_DIR = os.environ.get("SGLANG_FLUX_SITE_AUDIT_DIR", "")
+_FLUX_SITE_AUDIT = os.environ.get("SGLANG_FLUX_SITE_AUDIT", "").lower()
+_FLUX_SITE_AUDIT_TOKENS = int(os.environ.get("SGLANG_FLUX_SITE_AUDIT_TOKENS", "0"))
+_FLUX_SITE_AUDIT_DONE: set[tuple[str, int]] = set()
 # Flux fused AG + grouped GEMM1 on the MoE FFN (M3 slice 1; scattered flow,
 # TP-only, bf16). Orthogonal to _FLUX_FUSE. See layers/moe/flux_moe.py.
 _FLUX_MOE = os.environ.get("SGLANG_FLUX_MOE", "0") == "1"
@@ -124,6 +132,75 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def _audit_flux_site(
+    site: str,
+    layer_id: int,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    token_count: int,
+) -> None:
+    key = (site, layer_id)
+    if (
+        _FLUX_SITE_AUDIT != site
+        or not _FLUX_SITE_AUDIT_DIR
+        or token_count != _FLUX_SITE_AUDIT_TOKENS
+        or key in _FLUX_SITE_AUDIT_DONE
+    ):
+        return
+    _FLUX_SITE_AUDIT_DONE.add(key)
+    if actual.shape != reference.shape:
+        record = {
+            "site": site,
+            "layer_id": layer_id,
+            "rank": get_tensor_model_parallel_rank(),
+            "token_count": token_count,
+            "shape_match": False,
+            "actual_shape": list(actual.shape),
+            "reference_shape": list(reference.shape),
+        }
+    else:
+        actual_float = actual.detach().float()
+        reference_float = reference.detach().float()
+        diff = (actual_float - reference_float).abs()
+        count = diff.numel()
+        reference_norm = torch.linalg.vector_norm(reference_float)
+        diff_norm = torch.linalg.vector_norm(diff)
+        record = {
+            "site": site,
+            "layer_id": layer_id,
+            "rank": get_tensor_model_parallel_rank(),
+            "token_count": token_count,
+            "shape_match": True,
+            "shape": list(actual.shape),
+            "dtype": str(actual.dtype),
+            "count": count,
+            "bitwise_equal": torch.equal(actual, reference),
+            "finite": bool(torch.isfinite(actual_float).all().item())
+            and bool(torch.isfinite(reference_float).all().item()),
+            "nonzero_count": int(torch.count_nonzero(diff).item()),
+            "count_over_0_01": int(torch.count_nonzero(diff > 0.01).item()),
+            "count_over_0_05": int(torch.count_nonzero(diff > 0.05).item()),
+            "mean_abs": float(diff.mean().item()),
+            "max_abs": float(diff.max().item()),
+            "relative_l2": float(
+                (diff_norm / reference_norm).item()
+                if reference_norm.item() != 0
+                else diff_norm.item()
+            ),
+        }
+    directory = Path(_FLUX_SITE_AUDIT_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (
+        f"{site}-layer{layer_id:02d}-rank{get_tensor_model_parallel_rank()}.json"
+    )
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def compute_yarn_parameters(
@@ -718,6 +795,24 @@ class Qwen3MoeAttention(nn.Module):
             # kernel performs the all-gather inside the GEMM.
             hidden_states = ctx.attn_inputs_.hidden_states_local
             qkv, _ = self.qkv_proj(hidden_states, useFlux=True)
+            token_count = int(forward_batch.input_ids.shape[0])
+            if (
+                _FLUX_SITE_AUDIT == "qkv"
+                and token_count == _FLUX_SITE_AUDIT_TOKENS
+            ):
+                native_input = ctx.fetch_qkv_latent()
+                native_qkv = F.linear(
+                    native_input,
+                    self.qkv_proj.weight,
+                    self.qkv_proj.bias,
+                )
+                _audit_flux_site(
+                    "qkv",
+                    self.attn.layer_id,
+                    qkv,
+                    native_qkv,
+                    token_count,
+                )
         else:
             hidden_states = ctx.fetch_qkv_latent()
             qkv, _ = self.qkv_proj(hidden_states)
@@ -843,6 +938,34 @@ class Qwen3MoeAttention(nn.Module):
             # Fused GEMM+reduce-scatter: output is the scattered-reduced
             # shard; prepare_mlp detects the row count and skips its RS.
             output, _ = self.o_proj(attn_output, useFlux=True)
+            token_count = int(fb.input_ids.shape[0])
+            if (
+                _FLUX_SITE_AUDIT == "o_proj"
+                and token_count == _FLUX_SITE_AUDIT_TOKENS
+            ):
+                native_partial = F.linear(
+                    attn_output,
+                    self.o_proj.weight,
+                    self.o_proj.bias,
+                )
+                local_tokens = (
+                    native_partial.shape[0]
+                    // get_tensor_model_parallel_world_size()
+                )
+                native_reduced = native_partial.new_empty(
+                    local_tokens, native_partial.shape[1]
+                )
+                get_tp_group().reduce_scatter_tensor(
+                    native_reduced,
+                    native_partial,
+                )
+                _audit_flux_site(
+                    "o_proj",
+                    self.attn.layer_id,
+                    output,
+                    native_reduced,
+                    token_count,
+                )
         else:
             output, _ = self.o_proj(attn_output)
         return output
