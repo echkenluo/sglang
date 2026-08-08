@@ -114,6 +114,8 @@ logger = logging.getLogger(__name__)
 
 # Flux fused AG-GEMM/GemmRS on the attention projections (MoE FFN untouched).
 _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
+_FLUX_DISABLE_QKV = os.environ.get("SGLANG_FLUX_DISABLE_QKV", "0") == "1"
+_FLUX_DISABLE_O_PROJ = os.environ.get("SGLANG_FLUX_DISABLE_O_PROJ", "0") == "1"
 # Flux fused AG + grouped GEMM1 on the MoE FFN (M3 slice 1; scattered flow,
 # TP-only, bf16). Orthogonal to _FLUX_FUSE. See layers/moe/flux_moe.py.
 _FLUX_MOE = os.environ.get("SGLANG_FLUX_MOE", "0") == "1"
@@ -580,7 +582,7 @@ class Qwen3MoeAttention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
-            fuse_ag_gemm=_FLUX_FUSE,
+            fuse_ag_gemm=(_FLUX_FUSE and not _FLUX_DISABLE_QKV),
         )
 
         # Under the scattered residual flow the last layer keeps full rows
@@ -598,11 +600,22 @@ class Qwen3MoeAttention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            fuse_gemm_rs=(_FLUX_FUSE and not (
-                config is not None
-                and layer_id == getattr(config, "num_hidden_layers", -1) - 1
-            )),
+            fuse_gemm_rs=(
+                _FLUX_FUSE
+                and not _FLUX_DISABLE_O_PROJ
+                and not (
+                    config is not None
+                    and layer_id
+                    == getattr(config, "num_hidden_layers", -1) - 1
+                )
+            ),
         )
+        if _FLUX_FUSE and layer_id == 0:
+            logger.info(
+                "[FLUX][MoE Attention] sites qkv=%s o_proj=%s",
+                self.qkv_proj.fuse_ag_gemm,
+                self.o_proj.fuse_gemm_rs,
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
