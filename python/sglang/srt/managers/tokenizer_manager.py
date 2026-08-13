@@ -1817,7 +1817,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         scheduler completion remove its request state first, making the common
         completed-response path a no-op while still reclaiming disconnected work.
         """
-        normalized_rids = [rids] if isinstance(rids, str) else list(rids)
+        if rids is None:
+            normalized_rids = []
+        elif isinstance(rids, str):
+            normalized_rids = [rids]
+        else:
+            normalized_rids = [r for r in rids if r is not None]
 
         async def abort_request():
             await asyncio.sleep(2)
