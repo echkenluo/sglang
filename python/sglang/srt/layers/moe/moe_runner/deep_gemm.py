@@ -208,9 +208,34 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             if unsupported is None:
                 use_mok = True
-            elif unsupported not in _MOK_FP8_CONTIG_REPORTED_REASONS:
-                _MOK_FP8_CONTIG_REPORTED_REASONS.add(unsupported)
-                logger.info("MoK FP8 contiguous backend fallback: %s", unsupported)
+            else:
+                report_key = (
+                    "below configured threshold"
+                    if unsupported.startswith("avg_aligned_m=")
+                    else unsupported
+                )
+                if report_key not in _MOK_FP8_CONTIG_REPORTED_REASONS:
+                    _MOK_FP8_CONTIG_REPORTED_REASONS.add(report_key)
+                    logger.info(
+                        "MoK FP8 contiguous backend fallback: %s", unsupported
+                    )
+
+        if envs.SGLANG_OPT_MOK_FP8_PROFILE_SHAPES.get():
+            rows_per_expert = running_state.get("num_recv_tokens_per_expert")
+            logger.info(
+                "MoK FP8 contiguous shape: E=%d M=%d avg_aligned_m=%d "
+                "active_experts=%s backend=%s rows=%s",
+                quant_info.w13_weight.shape[0],
+                all_tokens,
+                all_tokens // quant_info.w13_weight.shape[0],
+                (
+                    sum(value > 0 for value in rows_per_expert)
+                    if rows_per_expert is not None
+                    else "unavailable"
+                ),
+                "mok" if use_mok else "deepgemm",
+                rows_per_expert,
+            )
 
         gateup_output = torch.empty(
             (all_tokens, N),
@@ -969,6 +994,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+    running_state["num_recv_tokens_per_expert"] = num_recv_tokens_per_expert
 
     input_tensor = torch.empty(
         (all_tokens, K),

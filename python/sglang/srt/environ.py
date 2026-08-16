@@ -880,6 +880,7 @@ class Envs:
     # Small expected-M shapes (normally decode) keep the DeepGEMM fallback.
     SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP = EnvBool(False)
     SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M = EnvInt(256)
+    SGLANG_OPT_MOK_FP8_PROFILE_SHAPES = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
