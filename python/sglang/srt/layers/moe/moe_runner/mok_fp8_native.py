@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -258,10 +259,30 @@ def _conservative_route_capacity_factor(
         raise ValueError("expert_padding must be positive")
     max_destination_rows = ep_size * base_rows
     max_padding_rows = num_local_experts * (expert_padding - 1)
-    return max(
+    minimum_factor = max(
         2,
         (max_destination_rows + max_padding_rows + base_rows - 1) // base_rows,
     )
+    # The scheduler owns M256-aligned metadata buffers.  Small Decode shapes
+    # no longer make base_rows itself M256, so align the integer multiplier
+    # instead while preserving the same worst-case row bound.
+    factor_alignment = 256 // math.gcd(base_rows, 256)
+    return (
+        (minimum_factor + factor_alignment - 1) // factor_alignment
+    ) * factor_alignment
+
+
+def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
+    """Return the padded token count and route-gather chunk size."""
+    if num_tokens <= 0 or topk <= 0:
+        raise ValueError("token and top-k counts must be positive")
+    if num_tokens <= 4:
+        route_token_alignment = math.lcm(2, 4 // math.gcd(topk, 4))
+        padded_tokens = (
+            (num_tokens + route_token_alignment - 1) // route_token_alignment
+        ) * route_token_alignment
+        return padded_tokens, 16
+    return max(256, ((num_tokens + 255) // 256) * 256), 1024
 
 
 def _required_route_capacity_factor(
@@ -357,11 +378,10 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
 
     num_tokens, hidden_size = hidden_states.shape
     topk = topk_output.topk_ids.shape[1]
-    # The caller-owned SM90 route path uses M64 expert segments and its
-    # standalone reduce kernel only needs an even token count.  Keep M256
-    # token padding for now, but do not inherit the old megakernel's T>=512
-    # minimum.
-    padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
+    # Decode only needs enough padding for the even-token reducer and an M16
+    # route-buffer chunk.  Retain M256 token padding for larger batches until
+    # their route-chunk/capacity tradeoff is measured independently.
+    padded_tokens, route_chunk_bytes = _route_padding_config(num_tokens, topk)
     if padded_tokens == num_tokens:
         padded_hidden = hidden_states
         padded_topk_ids = topk_output.topk_ids.to(torch.int32)
@@ -394,13 +414,13 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
 
-    # 1024 divides T*topk*sizeof(int32) for every T padded to 256.  The
-    # library default of 2048 would reject odd top-k at T=768, 1280, ... .
-    # The conservative multiplier also accounts for the scheduler's
-    # per-expert alignment under the worst valid route distribution.
+    # The conservative multiplier accounts for the scheduler's per-expert
+    # alignment under the worst valid route distribution.  Decode uses the
+    # smallest legal chunk; 1024 bytes keeps larger route gathers compact and
+    # divides every T*topk*sizeof(int32) buffer padded to M256.
     config = mok_functional.MoKConfig(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
-        all_gather_top_experts_chunk_bytes=1024,
+        all_gather_top_experts_chunk_bytes=route_chunk_bytes,
     )
     workspace = mok_functional.get_fp8_route_workspace(
         config,

@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _accept_runtime_contract,
     _capacity_factor_from_global_counts,
     _conservative_route_capacity_factor,
+    _route_padding_config,
     native_shape_contract_error,
 )
 
@@ -147,7 +148,35 @@ def test_mok_fp8_native_capacity_includes_expert_padding():
     )
 
 
-@pytest.mark.parametrize("base_rows", [512, 3072, 6144, 12288])
+@pytest.mark.parametrize(
+    ("num_tokens", "topk", "expected_tokens", "expected_chunk_bytes"),
+    [
+        (1, 6, 2, 16),
+        (2, 6, 2, 16),
+        (3, 6, 4, 16),
+        (4, 6, 4, 16),
+        (1, 3, 4, 16),
+        (5, 6, 256, 1024),
+        (257, 6, 512, 1024),
+    ],
+)
+def test_mok_fp8_native_route_padding(
+    num_tokens, topk, expected_tokens, expected_chunk_bytes
+):
+    padded_tokens, chunk_bytes = _route_padding_config(num_tokens, topk)
+    assert padded_tokens == expected_tokens
+    assert chunk_bytes == expected_chunk_bytes
+    assert padded_tokens % 2 == 0
+    assert padded_tokens * topk * 4 % chunk_bytes == 0
+
+
+@pytest.mark.parametrize(("num_tokens", "topk"), [(0, 6), (1, 0)])
+def test_mok_fp8_native_route_padding_rejects_invalid_counts(num_tokens, topk):
+    with pytest.raises(ValueError, match="must be positive"):
+        _route_padding_config(num_tokens, topk)
+
+
+@pytest.mark.parametrize("base_rows", [12, 24, 512, 3072, 6144, 12288])
 def test_mok_fp8_native_conservative_capacity_bounds_routes(base_rows):
     num_local_experts, ep_size, expert_padding = 64, 4, 64
     bound = _conservative_route_capacity_factor(
@@ -156,6 +185,7 @@ def test_mok_fp8_native_conservative_capacity_bounds_routes(base_rows):
         ep_size=ep_size,
         expert_padding=expert_padding,
     )
+    assert bound * base_rows % 256 == 0
     generator = torch.Generator().manual_seed(20260816 + base_rows)
     for _ in range(32):
         destination = int(torch.randint(ep_size, (), generator=generator))
