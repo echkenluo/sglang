@@ -15,6 +15,10 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmRunnerCore,
     DeepGemmRunnerInput,
 )
+from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+    _capacity_factor_from_global_counts,
+    native_shape_contract_error,
+)
 
 
 def _fp8_random(shape, generator, device):
@@ -27,6 +31,84 @@ def _fp8_random(shape, generator, device):
         )
         .clamp(-3, 3)
         .to(torch.float8_e4m3fn)
+    )
+
+
+def test_mok_fp8_native_static_contract():
+    tokens, topk = 17, 3
+    local_experts, ep_size = 2, 4
+    hidden, intermediate = 256, 256
+    hidden_states = torch.empty((tokens, hidden), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((tokens, topk), dtype=torch.int64)
+    topk_weights = torch.empty((tokens, topk), dtype=torch.float32)
+    w13 = torch.empty(
+        (local_experts, 2 * intermediate, hidden), dtype=torch.float8_e4m3fn
+    )
+    w2 = torch.empty((local_experts, hidden, intermediate), dtype=torch.float8_e4m3fn)
+    w13_scale = torch.empty(
+        (local_experts, 2 * intermediate // 128, hidden // 128),
+        dtype=torch.float32,
+    )
+    w2_scale = torch.empty(
+        (local_experts, hidden // 128, intermediate // 128),
+        dtype=torch.float32,
+    )
+
+    args = (
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+    )
+    kwargs = dict(
+        num_local_experts=local_experts,
+        num_global_experts=local_experts * ep_size,
+        ep_size=ep_size,
+    )
+    assert native_shape_contract_error(*args, **kwargs) is None
+    assert "global experts" in native_shape_contract_error(
+        *args, **(kwargs | {"num_global_experts": 7})
+    )
+    assert "block scales" in native_shape_contract_error(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale.to(torch.bfloat16),
+        w2,
+        w2_scale,
+        **kwargs,
+    )
+
+
+def test_mok_fp8_native_capacity_includes_expert_padding():
+    # V4 has 64 local experts.  With light balanced traffic every nonempty
+    # expert still consumes a 256-row segment, so a factor-of-two workspace is
+    # structurally too small even though the raw route count would fit.
+    balanced = torch.full((256,), 48, dtype=torch.int64)
+    assert (
+        _capacity_factor_from_global_counts(
+            balanced,
+            base_rows=512 * 6,
+            num_local_experts=64,
+            ep_size=4,
+        )
+        == 6
+    )
+
+    concentrated = torch.zeros((256,), dtype=torch.int64)
+    concentrated[0] = 4 * 512 * 6
+    assert (
+        _capacity_factor_from_global_counts(
+            concentrated,
+            base_rows=512 * 6,
+            num_local_experts=64,
+            ep_size=4,
+        )
+        == 4
     )
 
 
@@ -46,28 +128,36 @@ def test_mok_fp8_masked_runner_matches_deepgemm():
     generator = torch.Generator(device=device).manual_seed(20260819)
     experts, max_m, hidden, intermediate = 2, 64, 512, 512
     valid_rows = (64, 32)
-    hidden_states = _fp8_random(
-        (experts, max_m, hidden), generator, device
-    )
-    w13 = _fp8_random(
-        (experts, 2 * intermediate, hidden), generator, device
-    )
+    hidden_states = _fp8_random((experts, max_m, hidden), generator, device)
+    w13 = _fp8_random((experts, 2 * intermediate, hidden), generator, device)
     w2 = _fp8_random((experts, hidden, intermediate), generator, device)
-    hidden_scale = torch.rand(
-        (experts, max_m, hidden // 128),
-        generator=generator,
-        device=device,
-    ) * 0.09 + 0.01
-    w13_scale = torch.rand(
-        (experts, 2 * intermediate // 128, hidden // 128),
-        generator=generator,
-        device=device,
-    ) * 0.09 + 0.01
-    w2_scale = torch.rand(
-        (experts, hidden // 128, intermediate // 128),
-        generator=generator,
-        device=device,
-    ) * 0.09 + 0.01
+    hidden_scale = (
+        torch.rand(
+            (experts, max_m, hidden // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
+    w13_scale = (
+        torch.rand(
+            (experts, 2 * intermediate // 128, hidden // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
+    w2_scale = (
+        torch.rand(
+            (experts, hidden // 128, intermediate // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
     masked_m = torch.tensor(valid_rows, dtype=torch.int32, device=device)
 
     config = MoeRunnerConfig(
@@ -108,9 +198,7 @@ def test_mok_fp8_masked_runner_matches_deepgemm():
             runner_input(), quant_info, running_state
         )
         assert reason is None, reason
-        mok_output = core._run_masked_gemm(
-            runner_input(), quant_info, running_state
-        )
+        mok_output = core._run_masked_gemm(runner_input(), quant_info, running_state)
     with envs.SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP.override(False):
         deepgemm_output = core._run_masked_gemm(
             runner_input(), quant_info, running_state
@@ -121,10 +209,7 @@ def test_mok_fp8_masked_runner_matches_deepgemm():
         [mok_output[expert, :rows] for expert, rows in enumerate(valid_rows)]
     ).float()
     reference = torch.cat(
-        [
-            deepgemm_output[expert, :rows]
-            for expert, rows in enumerate(valid_rows)
-        ]
+        [deepgemm_output[expert, :rows] for expert, rows in enumerate(valid_rows)]
     ).float()
     error = (actual - reference).abs()
     rel_maxnorm = error.max() / reference.abs().max().clamp_min(1e-6)
@@ -152,26 +237,31 @@ def test_mok_fp8_contiguous_runner_matches_deepgemm():
     experts, hidden, intermediate = 2, 512, 512
     rows = (128, 256)
     total_m = sum(rows)
-    hidden_states = _fp8_random(
-        (total_m, hidden), generator, device
-    )
-    w13 = _fp8_random(
-        (experts, 2 * intermediate, hidden), generator, device
-    )
+    hidden_states = _fp8_random((total_m, hidden), generator, device)
+    w13 = _fp8_random((experts, 2 * intermediate, hidden), generator, device)
     w2 = _fp8_random((experts, hidden, intermediate), generator, device)
-    hidden_scale = torch.rand(
-        (total_m, hidden // 128), generator=generator, device=device
-    ) * 0.09 + 0.01
-    w13_scale = torch.rand(
-        (experts, 2 * intermediate // 128, hidden // 128),
-        generator=generator,
-        device=device,
-    ) * 0.09 + 0.01
-    w2_scale = torch.rand(
-        (experts, hidden // 128, intermediate // 128),
-        generator=generator,
-        device=device,
-    ) * 0.09 + 0.01
+    hidden_scale = (
+        torch.rand((total_m, hidden // 128), generator=generator, device=device) * 0.09
+        + 0.01
+    )
+    w13_scale = (
+        torch.rand(
+            (experts, 2 * intermediate // 128, hidden // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
+    w2_scale = (
+        torch.rand(
+            (experts, hidden // 128, intermediate // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
     m_indices = torch.repeat_interleave(
         torch.arange(experts, dtype=torch.int32, device=device),
         torch.tensor(rows, dtype=torch.int64, device=device),

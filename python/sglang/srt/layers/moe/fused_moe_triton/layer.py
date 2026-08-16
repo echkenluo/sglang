@@ -1232,23 +1232,36 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        final_hidden_states = None
+        if envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.get():
+            from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+                maybe_run_mok_fp8_native,
+            )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+            final_hidden_states = maybe_run_mok_fp8_native(
+                self, hidden_states, topk_output
+            )
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+        if final_hidden_states is None:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
+
+        # TODO: should we add some conditions here?
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
