@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -59,6 +60,9 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+logger = logging.getLogger(__name__)
+_MOK_FP8_REPORTED_REASONS: set[str] = set()
+_MOK_FP8_REPORTED_ACTIVE = False
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -365,6 +369,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        if envs.SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP.get():
+            unsupported = self._mok_fp8_unsupported_reason(
+                runner_input, quant_info, running_state
+            )
+            if unsupported is None:
+                return self._run_mok_fp8_masked_gemm(
+                    runner_input, quant_info, running_state
+                )
+            if unsupported not in _MOK_FP8_REPORTED_REASONS:
+                _MOK_FP8_REPORTED_REASONS.add(unsupported)
+                logger.info("MoK FP8 expert backend fallback: %s", unsupported)
+
         from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
@@ -493,6 +509,126 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
+        return down_output
+
+    def _mok_fp8_unsupported_reason(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> Optional[str]:
+        if runner_input.masked_m is None or runner_input.expected_m is None:
+            return "masked_m and expected_m are required"
+        min_expected_m = envs.SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M.get()
+        if runner_input.expected_m < min_expected_m:
+            return "expected_m is below the configured MoK threshold"
+        if quant_info.is_fp4_experts:
+            return "FP4 expert weights are unsupported"
+        if tuple(quant_info.block_shape or ()) != (128, 128):
+            return f"block_shape={quant_info.block_shape} is not [128, 128]"
+        if self.swiglu_limit != 10:
+            return f"swiglu_limit={self.swiglu_limit} is not the V4 value 10"
+        if self.use_swizzle:
+            return "swizzled gate/up output is unsupported"
+        if _MASKED_GEMM_FAST_ACT:
+            return "SGLANG_MASKED_GEMM_FAST_ACT is unsupported"
+        if not envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+            return "SGLANG_OPT_USE_JIT_EP_ACTIVATION must be enabled"
+        if not envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+            return "SGLANG_OPT_SWIGLU_CLAMP_FUSION must be enabled"
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            return "UE8M0 scales are unsupported"
+        if running_state.get("down_gemm_overlap_args") is not None:
+            return "down-GEMM overlap is unsupported"
+        if self.config.top_k is None:
+            return "top_k is required"
+        if (
+            runner_input.hidden_states_scale is None
+            or quant_info.w13_scale is None
+            or quant_info.w2_scale is None
+        ):
+            return "FP8 block scales are required"
+
+        from sglang.srt.layers.moe.moe_runner.mok_fp8 import (
+            runtime_contract_error,
+        )
+
+        return runtime_contract_error(
+            runner_input.hidden_states,
+            runner_input.hidden_states_scale,
+            quant_info.w13_weight,
+            quant_info.w13_scale,
+            quant_info.w2_weight,
+            quant_info.w2_scale,
+            runner_input.masked_m,
+        )
+
+    def _run_mok_fp8_masked_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        global _MOK_FP8_REPORTED_ACTIVE
+
+        from sglang.srt.layers.moe.moe_runner.mok_fp8 import grouped_gemm_out
+
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        masked_m = runner_input.masked_m
+        num_groups, max_m, _ = hidden_states.shape
+        hidden_states_device = running_state["hidden_states_device"]
+
+        gate_up = quant_info.w13_weight.shape[1]
+        gateup_output = torch.empty(
+            (num_groups, max_m, gate_up),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_out(
+            hidden_states,
+            quant_info.w13_weight,
+            hidden_states_scale,
+            quant_info.w13_scale,
+            masked_m,
+            gateup_output,
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+            gateup_output,
+            masked_m,
+            group_size=128,
+            topk=self.config.top_k,
+            swiglu_limit=self.swiglu_limit,
+            swizzle=False,
+        )
+        del gateup_output
+
+        hidden = quant_info.w2_weight.shape[1]
+        down_output = torch.empty(
+            (num_groups, max_m, hidden),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_out(
+            down_input,
+            quant_info.w2_weight,
+            down_input_scale,
+            quant_info.w2_scale,
+            masked_m,
+            down_output,
+        )
+        if not _MOK_FP8_REPORTED_ACTIVE:
+            _MOK_FP8_REPORTED_ACTIVE = True
+            logger.info(
+                "MoK FP8 expert backend active: E=%d max_m=%d gate_up=%d hidden=%d",
+                num_groups,
+                max_m,
+                gate_up,
+                hidden,
+            )
         return down_output
 
     def _run_masked_bf16_gemm(

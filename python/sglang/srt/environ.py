@@ -875,6 +875,12 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
+    # H20/SM90 canary: replace only the masked routed-expert FP8 compute with
+    # Mixture-of-Kittens while retaining the production dispatcher/combine.
+    # Small expected-M shapes (normally decode) keep the DeepGEMM fallback.
+    SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M = EnvInt(256)
+
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
