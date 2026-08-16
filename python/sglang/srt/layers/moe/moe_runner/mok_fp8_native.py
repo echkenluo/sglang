@@ -349,7 +349,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         "get_fp8_route_workspace",
         "build_schedule",
         "dispatch_fp8_block",
-        "grouped_gemm_fp8_block_out",
+        "grouped_gemm_fp8_block_dynamic_out",
         "combine_fp8_block",
         "combine_reduce_fp8_block_routes",
         "reduce_fp8_block_routes",
@@ -414,9 +414,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         topk=topk,
         num_local_experts=layer.num_local_experts,
     )
-    from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+    from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant_dynamic
     from sglang.srt.layers.quantization.fp8_kernel import (
-        create_per_token_group_quant_fp8_output_scale,
         sglang_per_token_group_quant_fp8,
     )
 
@@ -439,70 +438,63 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         schedule,
         input_fp8,
         input_scale,
-        trim_to_active_rows=True,
+        trim_to_active_rows=False,
     )
-    active_rows = routed_x.shape[0]
+    capacity_rows = routed_x.shape[0]
 
     gate_up_size = layer.w13_weight.shape[1]
     intermediate_size = layer.w2_weight.shape[2]
-    if active_rows:
-        gate_up = torch.empty(
-            (active_rows, gate_up_size),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-        mok_functional.grouped_gemm_fp8_block_out(
-            routed_x,
-            layer.w13_weight,
-            routed_x_scale,
-            layer.w13_weight_scale_inv,
-            m_indices,
-            gate_up,
-        )
+    gate_up = torch.empty(
+        (capacity_rows, gate_up_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+        routed_x,
+        layer.w13_weight,
+        routed_x_scale,
+        layer.w13_weight_scale_inv,
+        m_indices,
+        schedule.num_tokens,
+        gate_up,
+    )
 
-        down_input = torch.empty(
-            (active_rows, intermediate_size),
-            dtype=torch.float8_e4m3fn,
-            device=hidden_states.device,
-        )
-        down_input_scale = create_per_token_group_quant_fp8_output_scale(
-            x_shape=(active_rows, intermediate_size),
-            device=hidden_states.device,
-            group_size=128,
-            column_major_scales=False,
-            scale_tma_aligned=False,
-            scale_ue8m0=False,
-        )
-        silu_and_mul_contig_post_quant(
-            input=gate_up,
-            output=down_input,
-            output_scale=down_input_scale,
-            quant_group_size=128,
-            scale_ue8m0=False,
-            transposed=False,
-            swiglu_limit=layer.moe_runner_config.swiglu_limit,
-            swizzle=False,
-        )
+    down_input = torch.empty(
+        (capacity_rows, intermediate_size),
+        dtype=torch.float8_e4m3fn,
+        device=hidden_states.device,
+    )
+    down_input_scale = torch.empty(
+        (capacity_rows, intermediate_size // 128),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    silu_and_mul_contig_post_quant_dynamic(
+        input=gate_up,
+        output=down_input,
+        output_scale=down_input_scale,
+        active_tokens=schedule.num_tokens,
+        quant_group_size=128,
+        scale_ue8m0=False,
+        transposed=False,
+        swiglu_limit=layer.moe_runner_config.swiglu_limit,
+        swizzle=False,
+    )
 
-        routed_y = torch.empty(
-            (active_rows, hidden_size),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-        mok_functional.grouped_gemm_fp8_block_out(
-            down_input,
-            layer.w2_weight,
-            down_input_scale,
-            layer.w2_weight_scale_inv,
-            m_indices,
-            routed_y,
-        )
-    else:
-        routed_y = torch.empty(
-            (0, hidden_size),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
+    routed_y = torch.empty(
+        (capacity_rows, hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+        down_input,
+        layer.w2_weight,
+        down_input_scale,
+        layer.w2_weight_scale_inv,
+        m_indices,
+        schedule.num_tokens,
+        routed_y,
+    )
     output = mok_functional.combine_reduce_fp8_block_routes(
         workspace,
         schedule,
@@ -515,14 +507,13 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         _REPORTED_ACTIVE = True
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
-            "topk=%d E_local=%d active_rows=%d capacity=%d expert_padding=%d "
-            "strict_contract=%s",
+            "topk=%d E_local=%d capacity=%d device_active_rows=true "
+            "expert_padding=%d strict_contract=%s",
             layer.layer_id,
             num_tokens,
             padded_tokens,
             topk,
             layer.num_local_experts,
-            active_rows,
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
             strict_contract,

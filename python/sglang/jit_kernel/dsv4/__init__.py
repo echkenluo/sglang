@@ -27,6 +27,7 @@ from .moe import (
     mega_moe_pre_dispatch,
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
+    silu_and_mul_contig_post_quant_dynamic,
     silu_and_mul_masked_post_quant,
 )
 from .topk import plan_topk_v2, topk_transform_512, topk_transform_512_v2
@@ -60,4 +61,5 @@ __all__ = [
     "silu_and_mul_clamp",
     "silu_and_mul_masked_post_quant",
     "silu_and_mul_contig_post_quant",
+    "silu_and_mul_contig_post_quant_dynamic",
 ]
