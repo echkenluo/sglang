@@ -351,6 +351,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         "dispatch_fp8_block",
         "grouped_gemm_fp8_block_out",
         "combine_fp8_block",
+        "combine_reduce_fp8_block_routes",
         "reduce_fp8_block_routes",
     )
     missing = [name for name in required_apis if not hasattr(mok_functional, name)]
@@ -497,8 +498,12 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
-    mok_functional.combine_fp8_block(workspace, schedule, routed_y)
-    output = mok_functional.reduce_fp8_block_routes(workspace, padded_topk_weights)
+    output = mok_functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        routed_y,
+        padded_topk_weights,
+    )
 
     global _REPORTED_ACTIVE
     if not _REPORTED_ACTIVE:
