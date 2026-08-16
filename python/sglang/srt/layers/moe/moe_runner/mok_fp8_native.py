@@ -367,7 +367,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
     if padded_tokens == num_tokens:
         padded_hidden = hidden_states
-        padded_topk_ids = topk_output.topk_ids.to(torch.int64)
+        padded_topk_ids = topk_output.topk_ids.to(torch.int32)
         padded_topk_weights = topk_output.topk_weights
     else:
         padded_hidden = hidden_states.new_zeros((padded_tokens, hidden_size))
@@ -375,10 +375,10 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         padded_topk_ids = torch.full(
             (padded_tokens, topk),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=hidden_states.device,
         )
-        padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int64))
+        padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int32))
         padded_topk_weights = torch.zeros(
             (padded_tokens, topk),
             dtype=torch.float32,
@@ -412,6 +412,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         num_local_tokens=padded_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        num_local_experts=layer.num_local_experts,
     )
     from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
     from sglang.srt.layers.quantization.fp8_kernel import (
