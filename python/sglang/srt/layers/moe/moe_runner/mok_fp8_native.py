@@ -147,9 +147,6 @@ def native_runtime_contract_error(layer, hidden_states, topk_output) -> Optional
         return "batch-overlap modes are unsupported"
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return "UE8M0 block scales are unsupported"
-    if torch.cuda.is_current_stream_capturing():
-        return "CUDA graph capture is unsupported"
-
     scales = (
         getattr(layer, "w13_weight_scale_inv", None),
         getattr(layer, "w2_weight_scale_inv", None),

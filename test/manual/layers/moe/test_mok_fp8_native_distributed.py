@@ -42,6 +42,7 @@ def _fake_layer(
     hidden: int,
     intermediate: int,
     local_experts: int,
+    topk: int = 2,
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
     w2: torch.Tensor,
@@ -58,7 +59,7 @@ def _fake_layer(
         hidden_size=hidden,
         intermediate_size_per_partition=intermediate,
         layer_id=4,
-        top_k=2,
+        top_k=topk,
         activation="silu",
         is_gated=True,
         swiglu_limit=10,
@@ -154,6 +155,55 @@ def test_mok_fp8_native_full_chain_matches_deepgemm():
 
     actual = mok_fp8_native.maybe_run_mok_fp8_native(layer, hidden_states, topk_output)
     assert actual is not None
+
+    if os.environ.get("MOK_TEST_CUDA_GRAPH") == "1":
+        # The eager call above creates every shape-dependent route workspace
+        # and JIT kernel before capture.  Capture and replay must then remain
+        # entirely device driven, including the routed-row count and EP
+        # barriers, on all four ranks.
+        eager_actual = actual.clone()
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_actual = mok_fp8_native.maybe_run_mok_fp8_native(
+                layer, hidden_states, topk_output
+            )
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            captured_actual, eager_actual, rtol=0, atol=0
+        )
+
+        # Keep every captured address and shape stable, but route every token
+        # to rank 0 and change the activations/weights in place.  This changes
+        # the replay-time active row count from a balanced distribution to
+        # T * topk * world_size on rank 0 and zero on the other ranks.  The
+        # graph must consume the device-side count produced by this replay,
+        # rather than a host value frozen during capture.
+        hidden_states.mul_(0.5)
+        topk_ids[:, 0].fill_(0)
+        topk_ids[:, 1].fill_(1)
+        topk_weights[:, 0].fill_(0.25)
+        topk_weights[:, 1].fill_(0.75)
+        dynamic_eager = mok_fp8_native.maybe_run_mok_fp8_native(
+            layer, hidden_states, topk_output
+        ).clone()
+        torch.cuda.synchronize(device)
+        assert not torch.equal(dynamic_eager, eager_actual)
+
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        actual = captured_actual.clone()
+        torch.testing.assert_close(actual, dynamic_eager, rtol=0, atol=0)
+        print(
+            f"MOK_CUDA_GRAPH_DYNAMIC|rank={rank}|T={tokens}|"
+            f"expected_active_rows="
+            f"{tokens * topk * world_size if rank == 0 else 0}",
+            flush=True,
+        )
 
     input_fp8, input_scale = sglang_per_token_group_quant_fp8(
         hidden_states,
