@@ -223,8 +223,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_MOK_FP8_PROFILE_SHAPES.get():
             rows_per_expert = running_state.get("num_recv_tokens_per_expert")
             logger.info(
-                "MoK FP8 contiguous shape: E=%d M=%d avg_aligned_m=%d "
+                "MoK FP8 contiguous shape: layer=%s E=%d M=%d avg_aligned_m=%d "
                 "active_experts=%s backend=%s rows=%s",
+                self.config.layer_id,
                 quant_info.w13_weight.shape[0],
                 all_tokens,
                 all_tokens // quant_info.w13_weight.shape[0],
