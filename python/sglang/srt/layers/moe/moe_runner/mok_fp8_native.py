@@ -360,7 +360,11 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
 
     num_tokens, hidden_size = hidden_states.shape
     topk = topk_output.topk_ids.shape[1]
-    padded_tokens = max(512, ((num_tokens + 255) // 256) * 256)
+    # The caller-owned SM90 route path uses M64 expert segments and its
+    # standalone reduce kernel only needs an even token count.  Keep M256
+    # token padding for now, but do not inherit the old megakernel's T>=512
+    # minimum.
+    padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
     if padded_tokens == num_tokens:
         padded_hidden = hidden_states
         padded_topk_ids = topk_output.topk_ids.to(torch.int64)
