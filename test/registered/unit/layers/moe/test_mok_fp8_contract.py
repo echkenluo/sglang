@@ -1,6 +1,8 @@
 import torch
 
 from sglang.srt.layers.moe.moe_runner.mok_fp8 import (
+    contiguous_runtime_contract_error,
+    contiguous_shape_contract_error,
     runtime_contract_error,
     shape_contract_error,
 )
@@ -52,4 +54,45 @@ def test_mok_fp8_shape_contract_rejects_noncontiguous_input():
 def test_mok_fp8_runtime_contract_rejects_cpu_tensors():
     assert runtime_contract_error(*make_inputs()) == (
         "all MoK FP8 inputs must be CUDA tensors"
+    )
+
+
+def make_contiguous_inputs():
+    experts, total_m, hidden, intermediate = 2, 128, 128, 128
+    return (
+        torch.empty((total_m, hidden), dtype=torch.float8_e4m3fn),
+        torch.empty((total_m, hidden // 128), dtype=torch.float32),
+        torch.empty(
+            (experts, 2 * intermediate, hidden), dtype=torch.float8_e4m3fn
+        ),
+        torch.empty(
+            (experts, 2 * intermediate // 128, hidden // 128),
+            dtype=torch.float32,
+        ),
+        torch.empty(
+            (experts, hidden, intermediate), dtype=torch.float8_e4m3fn
+        ),
+        torch.empty(
+            (experts, hidden // 128, intermediate // 128),
+            dtype=torch.float32,
+        ),
+        torch.empty((total_m,), dtype=torch.int32),
+    )
+
+
+def test_mok_fp8_contiguous_shape_contract_accepts_deepep_layout():
+    assert contiguous_shape_contract_error(*make_contiguous_inputs()) is None
+
+
+def test_mok_fp8_contiguous_shape_contract_rejects_bad_index_shape():
+    inputs = list(make_contiguous_inputs())
+    inputs[-1] = inputs[-1][:-1]
+    assert "invalid contiguous scale/index shapes" in (
+        contiguous_shape_contract_error(*inputs)
+    )
+
+
+def test_mok_fp8_contiguous_runtime_contract_rejects_cpu_tensors():
+    assert contiguous_runtime_contract_error(*make_contiguous_inputs()) == (
+        "all MoK FP8 contiguous inputs must be CUDA tensors"
     )

@@ -62,7 +62,9 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 logger = logging.getLogger(__name__)
 _MOK_FP8_REPORTED_REASONS: set[str] = set()
+_MOK_FP8_CONTIG_REPORTED_REASONS: set[str] = set()
 _MOK_FP8_REPORTED_ACTIVE = False
+_MOK_FP8_CONTIG_REPORTED_ACTIVE = False
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -199,22 +201,46 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
 
+        use_mok = False
+        if envs.SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP.get():
+            unsupported = self._mok_fp8_contiguous_unsupported_reason(
+                runner_input, quant_info, running_state
+            )
+            if unsupported is None:
+                use_mok = True
+            elif unsupported not in _MOK_FP8_CONTIG_REPORTED_REASONS:
+                _MOK_FP8_CONTIG_REPORTED_REASONS.add(unsupported)
+                logger.info("MoK FP8 contiguous backend fallback: %s", unsupported)
+
         gateup_output = torch.empty(
             (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if not use_mok and deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+        if use_mok:
+            from sglang.srt.layers.moe.moe_runner.mok_fp8 import (
+                grouped_gemm_contiguous_out,
+            )
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+            grouped_gemm_contiguous_out(
+                hidden_states,
+                quant_info.w13_weight,
+                hidden_states_scale,
+                quant_info.w13_scale,
+                m_indices,
+                gateup_output,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -284,19 +310,90 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if not use_mok and deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
-
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_mok:
+            grouped_gemm_contiguous_out(
+                down_input_fp8,
+                quant_info.w2_weight,
+                down_input_scale,
+                quant_info.w2_scale,
+                m_indices,
+                down_output,
+            )
+            global _MOK_FP8_CONTIG_REPORTED_ACTIVE
+            if not _MOK_FP8_CONTIG_REPORTED_ACTIVE:
+                _MOK_FP8_CONTIG_REPORTED_ACTIVE = True
+                logger.info(
+                    "MoK FP8 contiguous backend active: E=%d M=%d "
+                    "avg_aligned_m=%d gate_up=%d hidden=%d",
+                    quant_info.w13_weight.shape[0],
+                    all_tokens,
+                    all_tokens // quant_info.w13_weight.shape[0],
+                    N,
+                    K,
+                )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         return down_output
+
+    def _mok_fp8_contiguous_unsupported_reason(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> Optional[str]:
+        if runner_input.m_indices is None:
+            return "m_indices are required"
+        experts = quant_info.w13_weight.shape[0]
+        all_tokens = running_state.get("all_tokens")
+        if not isinstance(all_tokens, int) or all_tokens < 1 or experts < 1:
+            return "positive all_tokens and expert count are required"
+        avg_aligned_m = all_tokens // experts
+        min_expected_m = envs.SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M.get()
+        if avg_aligned_m < min_expected_m:
+            return (
+                f"avg_aligned_m={avg_aligned_m} is below the configured "
+                f"MoK threshold={min_expected_m}"
+            )
+        if quant_info.is_fp4_experts:
+            return "FP4 expert weights are unsupported"
+        if tuple(quant_info.block_shape or ()) != (128, 128):
+            return f"block_shape={quant_info.block_shape} is not [128, 128]"
+        if self.swiglu_limit != 10:
+            return f"swiglu_limit={self.swiglu_limit} is not the V4 value 10"
+        if self.use_swizzle:
+            return "swizzled gate/up output is unsupported"
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            return "UE8M0 scales are unsupported"
+        if (
+            runner_input.hidden_states_scale is None
+            or quant_info.w13_scale is None
+            or quant_info.w2_scale is None
+        ):
+            return "FP8 block scales are required"
+
+        from sglang.srt.layers.moe.moe_runner.mok_fp8 import (
+            contiguous_runtime_contract_error,
+        )
+
+        return contiguous_runtime_contract_error(
+            runner_input.hidden_states,
+            runner_input.hidden_states_scale,
+            quant_info.w13_weight,
+            quant_info.w13_scale,
+            quant_info.w2_weight,
+            quant_info.w2_scale,
+            runner_input.m_indices,
+        )
 
     def _run_bf16_contiguous_gemm(
         self,

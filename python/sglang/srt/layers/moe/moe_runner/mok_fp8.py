@@ -125,6 +125,124 @@ def runtime_contract_error(
     return None
 
 
+def contiguous_shape_contract_error(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> Optional[str]:
+    """Return the first unsupported DeepEP-normal tensor-contract reason."""
+
+    if hidden_states.dim() != 2:
+        return "hidden_states must have shape [M,H]"
+    if w13_weight.dim() != 3 or w2_weight.dim() != 3:
+        return "expert weights must be rank-3"
+    total_m, hidden = hidden_states.shape
+    experts = w13_weight.shape[0]
+    if experts < 1 or w2_weight.shape[0] != experts:
+        return "expert weights must have the same positive expert count"
+    gate_up = w13_weight.shape[1]
+    intermediate = w2_weight.shape[2]
+    if gate_up != 2 * intermediate:
+        return "w13 output must be twice the w2 reduction dimension"
+    if w13_weight.shape[2] != hidden:
+        return "w13 reduction dimension must equal hidden size"
+    if w2_weight.shape[1] != hidden:
+        return "w2 output dimension must equal hidden size"
+    if total_m < 64 or total_m % 64 != 0:
+        return "M must be positive and divisible by 64"
+    if hidden % 128 != 0 or intermediate % 128 != 0:
+        return "hidden and intermediate dimensions must be divisible by 128"
+
+    fp8_dtype = torch.float8_e4m3fn
+    if any(
+        tensor.dtype != fp8_dtype
+        for tensor in (hidden_states, w13_weight, w2_weight)
+    ):
+        return "hidden_states and weights must use float8_e4m3fn"
+    if any(
+        tensor.dtype != torch.float32
+        for tensor in (hidden_states_scale, w13_scale, w2_scale)
+    ):
+        return "block scales must use float32"
+    if m_indices.dtype != torch.int32:
+        return "m_indices must use int32"
+
+    expected_shapes = (
+        (total_m, hidden // 128),
+        (experts, gate_up // 128, hidden // 128),
+        (experts, hidden // 128, intermediate // 128),
+        (total_m,),
+    )
+    actual_shapes = (
+        tuple(hidden_states_scale.shape),
+        tuple(w13_scale.shape),
+        tuple(w2_scale.shape),
+        tuple(m_indices.shape),
+    )
+    if actual_shapes != expected_shapes:
+        return (
+            "invalid contiguous scale/index shapes: "
+            f"expected={expected_shapes}, actual={actual_shapes}"
+        )
+
+    tensors = (
+        hidden_states,
+        hidden_states_scale,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        m_indices,
+    )
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        return "all MoK FP8 contiguous inputs must be contiguous"
+    return None
+
+
+def contiguous_runtime_contract_error(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> Optional[str]:
+    error = contiguous_shape_contract_error(
+        hidden_states,
+        hidden_states_scale,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        m_indices,
+    )
+    if error is not None:
+        return error
+    tensors = (
+        hidden_states,
+        hidden_states_scale,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        m_indices,
+    )
+    if not all(tensor.is_cuda for tensor in tensors):
+        return "all MoK FP8 contiguous inputs must be CUDA tensors"
+    if not all(tensor.device == hidden_states.device for tensor in tensors):
+        return "all MoK FP8 contiguous inputs must be on the same CUDA device"
+    if torch.cuda.get_device_capability(hidden_states.device) != (9, 0):
+        return "MoK FP8 block-scale backend currently requires SM90"
+    if torch.cuda.is_current_stream_capturing():
+        return "CUDA graph capture is not supported by the MoK FP8 canary"
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def _extension():
     try:
@@ -156,5 +274,29 @@ def grouped_gemm_out(
         input_scale,
         weight_scale,
         masked_m,
+        output,
+    )
+
+
+def grouped_gemm_contiguous_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    extension = _extension()
+    if not hasattr(extension, "fp8_block_grouped_contiguous_out"):
+        raise RuntimeError(
+            "The loaded MoK extension does not expose "
+            "fp8_block_grouped_contiguous_out"
+        )
+    return extension.fp8_block_grouped_contiguous_out(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        m_indices,
         output,
     )
