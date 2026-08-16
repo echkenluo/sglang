@@ -16,7 +16,9 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmRunnerInput,
 )
 from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+    _accept_runtime_contract,
     _capacity_factor_from_global_counts,
+    _conservative_route_capacity_factor,
     native_shape_contract_error,
 )
 
@@ -84,10 +86,15 @@ def test_mok_fp8_native_static_contract():
     )
 
 
+def test_mok_fp8_native_strict_contract_skips_collective():
+    assert _accept_runtime_contract(None, None, None, strict=True)
+    with pytest.raises(RuntimeError, match="strict full-native MoK contract"):
+        _accept_runtime_contract("unsupported shape", None, None, strict=True)
+
+
 def test_mok_fp8_native_capacity_includes_expert_padding():
-    # V4 has 64 local experts.  With light balanced traffic every nonempty
-    # expert still consumes a 256-row segment, so a factor-of-two workspace is
-    # structurally too small even though the raw route count would fit.
+    # V4 has 64 local experts. Even light balanced traffic consumes one padded
+    # segment per nonempty expert.
     balanced = torch.full((256,), 48, dtype=torch.int64)
     assert (
         _capacity_factor_from_global_counts(
@@ -120,6 +127,55 @@ def test_mok_fp8_native_capacity_includes_expert_padding():
         )
         == 4
     )
+
+    conservative = _conservative_route_capacity_factor(
+        base_rows=512 * 6,
+        num_local_experts=64,
+        ep_size=4,
+        expert_padding=64,
+    )
+    assert conservative == 6
+    assert (
+        _capacity_factor_from_global_counts(
+            concentrated,
+            base_rows=512 * 6,
+            num_local_experts=64,
+            ep_size=4,
+            expert_padding=64,
+        )
+        <= conservative
+    )
+
+
+@pytest.mark.parametrize("base_rows", [512, 3072, 6144, 12288])
+def test_mok_fp8_native_conservative_capacity_bounds_routes(base_rows):
+    num_local_experts, ep_size, expert_padding = 64, 4, 64
+    bound = _conservative_route_capacity_factor(
+        base_rows=base_rows,
+        num_local_experts=num_local_experts,
+        ep_size=ep_size,
+        expert_padding=expert_padding,
+    )
+    generator = torch.Generator().manual_seed(20260816 + base_rows)
+    for _ in range(32):
+        destination = int(torch.randint(ep_size, (), generator=generator))
+        counts = torch.zeros(num_local_experts * ep_size, dtype=torch.int64)
+        routed_experts = torch.randint(
+            num_local_experts,
+            (ep_size * base_rows,),
+            generator=generator,
+        )
+        counts[
+            destination * num_local_experts : (destination + 1) * num_local_experts
+        ] = torch.bincount(routed_experts, minlength=num_local_experts)
+        actual = _capacity_factor_from_global_counts(
+            counts,
+            base_rows=base_rows,
+            num_local_experts=num_local_experts,
+            ep_size=ep_size,
+            expert_padding=expert_padding,
+        )
+        assert actual <= bound
 
 
 def test_mok_fp8_masked_runner_matches_deepgemm():

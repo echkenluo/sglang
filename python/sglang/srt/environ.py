@@ -884,6 +884,7 @@ class Envs:
     # Correctness-first full-native path. Unlike the expert-only canary above,
     # this replaces DeepEP dispatch/combine as well as expert compute.
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

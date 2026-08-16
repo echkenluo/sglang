@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,21 @@ def _consensus_supported(local_supported: bool, device: torch.device, group) -> 
     return bool(flag.item())
 
 
+def _accept_runtime_contract(
+    reason: Optional[str],
+    device: torch.device,
+    group,
+    *,
+    strict: bool,
+) -> bool:
+    """Accept a native contract, optionally without a per-layer collective."""
+    if strict:
+        if reason is not None:
+            raise RuntimeError(f"strict full-native MoK contract rejected: {reason}")
+        return True
+    return _consensus_supported(reason is None, device, group)
+
+
 def _capacity_factor_from_global_counts(
     global_counts: torch.Tensor,
     *,
@@ -220,6 +236,35 @@ def _capacity_factor_from_global_counts(
         padded_counts.view(ep_size, num_local_experts).sum(dim=1).max().item()
     )
     return max(2, (max_required_rows + base_rows - 1) // base_rows)
+
+
+def _conservative_route_capacity_factor(
+    *,
+    base_rows: int,
+    num_local_experts: int,
+    ep_size: int,
+    expert_padding: int,
+) -> int:
+    """Return a collective-free upper bound for one destination rank.
+
+    Every EP rank contributes at most ``base_rows`` valid routes to one
+    destination. Padding can add at most ``expert_padding - 1`` rows to each
+    local expert. The bound therefore covers every valid route distribution,
+    including the fully concentrated case, without inspecting GPU route data
+    or synchronizing it back to the host on every layer.
+    """
+    if base_rows <= 0:
+        raise ValueError("base_rows must be positive")
+    if num_local_experts <= 0 or ep_size <= 0:
+        raise ValueError("expert and EP counts must be positive")
+    if expert_padding <= 0:
+        raise ValueError("expert_padding must be positive")
+    max_destination_rows = ep_size * base_rows
+    max_padding_rows = num_local_experts * (expert_padding - 1)
+    return max(
+        2,
+        (max_destination_rows + max_padding_rows + base_rows - 1) // base_rows,
+    )
 
 
 def _required_route_capacity_factor(
@@ -284,7 +329,13 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     reason = native_runtime_contract_error(layer, hidden_states, topk_output)
     if reason is None and dist.get_world_size(group) != layer.moe_ep_size:
         reason = "the MoK process group must match moe_ep_size"
-    if not _consensus_supported(reason is None, hidden_states.device, group):
+    strict_contract = envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.get()
+    if not _accept_runtime_contract(
+        reason,
+        hidden_states.device,
+        group,
+        strict=strict_contract,
+    ):
         _report_fallback(reason or "another EP rank rejected the native contract")
         return None
 
@@ -330,23 +381,21 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         )
         padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
 
-    capacity_factor = _required_route_capacity_factor(
-        padded_topk_ids,
-        num_global_experts=layer.num_experts,
+    # SGLang's TP/EP model contract gives every rank the same padded shape,
+    # and the MoK workspace validates that invariant when a shape is first
+    # created. Use a worst-case route-distribution bound here instead of an
+    # extra route-count AllReduce plus GPU-to-host synchronization per layer.
+    capacity_factor = _conservative_route_capacity_factor(
+        base_rows=padded_topk_ids.numel(),
         num_local_experts=layer.num_local_experts,
         ep_size=layer.moe_ep_size,
         expert_padding=_ROUTE_EXPERT_PADDING,
-        group=group,
     )
-    if capacity_factor is None:
-        _report_fallback("invalid expert ids or unequal route shapes across EP ranks")
-        return None
 
     # 1024 divides T*topk*sizeof(int32) for every T padded to 256.  The
     # library default of 2048 would reject odd top-k at T=768, 1280, ... .
-    # The dynamic multiplier also accounts for the scheduler's per-expert
-    # alignment; a fixed factor of two can be insufficient for V4's 64 local
-    # experts.
+    # The conservative multiplier also accounts for the scheduler's
+    # per-expert alignment under the worst valid route distribution.
     config = mok_functional.MoKConfig(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=1024,
@@ -456,7 +505,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         _REPORTED_ACTIVE = True
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
-            "topk=%d E_local=%d active_rows=%d capacity=%d expert_padding=%d",
+            "topk=%d E_local=%d active_rows=%d capacity=%d expert_padding=%d "
+            "strict_contract=%s",
             layer.layer_id,
             num_tokens,
             padded_tokens,
@@ -465,5 +515,6 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             active_rows,
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
+            strict_contract,
         )
     return output[:num_tokens].contiguous()
