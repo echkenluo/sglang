@@ -92,6 +92,16 @@ def main():
     assert eager is not None and torch.isfinite(eager).all()
     torch.cuda.synchronize(device)
     dist.barrier()
+    if os.environ.get("MOK_PROFILE_EAGER_ONLY") == "1":
+        if rank == 0:
+            print(
+                "MOK_PROFILE_EAGER_OK|"
+                f"T={tokens}|topk={topk}|E_local={local_experts}|H={hidden}|"
+                f"I={intermediate}",
+                flush=True,
+            )
+        dist.destroy_process_group()
+        return
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = mok_fp8_native.maybe_run_mok_fp8_native(
