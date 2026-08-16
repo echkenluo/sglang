@@ -98,6 +98,16 @@ def test_mok_fp8_native_capacity_includes_expert_padding():
         )
         == 6
     )
+    assert (
+        _capacity_factor_from_global_counts(
+            balanced,
+            base_rows=512 * 6,
+            num_local_experts=64,
+            ep_size=4,
+            expert_padding=64,
+        )
+        == 2
+    )
 
     concentrated = torch.zeros((256,), dtype=torch.int64)
     concentrated[0] = 4 * 512 * 6

@@ -14,6 +14,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 logger = logging.getLogger(__name__)
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
+_ROUTE_EXPERT_PADDING = 64
 
 
 def native_shape_contract_error(
@@ -198,13 +199,23 @@ def _capacity_factor_from_global_counts(
     base_rows: int,
     num_local_experts: int,
     ep_size: int,
+    expert_padding: int = 256,
 ) -> int:
-    """Return the smallest workspace factor that holds 256-padded experts."""
+    """Return the smallest workspace factor that holds padded experts."""
     if global_counts.numel() != num_local_experts * ep_size:
         raise ValueError("global route counts do not match the expert topology")
     if base_rows <= 0:
         raise ValueError("base_rows must be positive")
-    padded_counts = torch.div(global_counts + 255, 256, rounding_mode="floor") * 256
+    if expert_padding <= 0:
+        raise ValueError("expert_padding must be positive")
+    padded_counts = (
+        torch.div(
+            global_counts + expert_padding - 1,
+            expert_padding,
+            rounding_mode="floor",
+        )
+        * expert_padding
+    )
     max_required_rows = int(
         padded_counts.view(ep_size, num_local_experts).sum(dim=1).max().item()
     )
@@ -217,14 +228,15 @@ def _required_route_capacity_factor(
     num_global_experts: int,
     num_local_experts: int,
     ep_size: int,
+    expert_padding: int,
     group,
 ) -> Optional[int]:
-    """Collectively size storage for the scheduler's M256 expert padding.
+    """Collectively size storage for the scheduler's expert padding.
 
     Counting before workspace allocation is necessary for production shapes:
-    64 lightly loaded local experts require 64 * 256 rows even when the raw
-    routed-token count is much smaller.  A fixed multiple of ``T * topk`` can
-    therefore reject every small-batch DeepSeek-V4 layer.
+    lightly loaded local experts each require one aligned segment even when
+    the raw routed-token count is much smaller. A fixed multiple of ``T *
+    topk`` can therefore reject every small-batch DeepSeek-V4 layer.
     """
     valid = (topk_ids >= 0) & (topk_ids < num_global_experts)
     invalid = ((topk_ids < -1) | (topk_ids >= num_global_experts)).any()
@@ -255,6 +267,7 @@ def _required_route_capacity_factor(
         base_rows=common_base_rows,
         num_local_experts=num_local_experts,
         ep_size=ep_size,
+        expert_padding=expert_padding,
     )
 
 
@@ -322,6 +335,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         num_global_experts=layer.num_experts,
         num_local_experts=layer.num_local_experts,
         ep_size=layer.moe_ep_size,
+        expert_padding=_ROUTE_EXPERT_PADDING,
         group=group,
     )
     if capacity_factor is None:
@@ -330,8 +344,9 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
 
     # 1024 divides T*topk*sizeof(int32) for every T padded to 256.  The
     # library default of 2048 would reject odd top-k at T=768, 1280, ... .
-    # The dynamic multiplier also accounts for the scheduler's per-expert M256
-    # padding; a fixed factor of two is insufficient for V4's 64 local experts.
+    # The dynamic multiplier also accounts for the scheduler's per-expert
+    # alignment; a fixed factor of two can be insufficient for V4's 64 local
+    # experts.
     config = mok_functional.MoKConfig(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=1024,
@@ -362,6 +377,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         config,
         padded_topk_ids,
         num_local_experts=layer.num_local_experts,
+        expert_padding=_ROUTE_EXPERT_PADDING,
     )
     routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
         workspace,
@@ -440,7 +456,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         _REPORTED_ACTIVE = True
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
-            "topk=%d E_local=%d active_rows=%d capacity=%d",
+            "topk=%d E_local=%d active_rows=%d capacity=%d expert_padding=%d",
             layer.layer_id,
             num_tokens,
             padded_tokens,
@@ -448,5 +464,6 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             layer.num_local_experts,
             active_rows,
             workspace.schedule_capacity,
+            _ROUTE_EXPERT_PADDING,
         )
     return output[:num_tokens].contiguous()
