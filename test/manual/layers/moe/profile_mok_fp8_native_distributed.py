@@ -169,6 +169,12 @@ def main():
                 + ",".join(f"{sample:.6f}" for sample in ordered),
                 flush=True,
             )
+            print(
+                "MOK_PROFILE_GRAPH_STATE|"
+                f"captured={len(mok_fp8_native._PREFILL_GRAPHS)}|"
+                f"disabled={mok_fp8_native._PREFILL_GRAPH_DISABLED}",
+                flush=True,
+            )
         dist.destroy_process_group()
         return
     graph = torch.cuda.CUDAGraph()
