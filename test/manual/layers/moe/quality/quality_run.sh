@@ -57,7 +57,6 @@ PYTHONPATH=$ROOT/sglang/python:$ROOT/mixture-of-kittens \
   --disable-radix-cache \
   --disable-overlap-schedule \
   --disable-flashinfer-autotune \
-  --enable-deterministic-inference \
   --random-seed 196944571 --host 127.0.0.1 --port "$PORT" \
   --skip-server-warmup > "$LOG" 2>&1 &
 SERVER_PID=$!
@@ -93,6 +92,11 @@ esac
 PATH_OK=1
 grep -aq "prefill=PhaseConfig(backend='disabled'" "$LOG" || { echo "PATH_FAIL|prefill_graph_not_disabled"; PATH_OK=0; }
 grep -aq "disable_radix_cache=True" "$LOG" || { echo "PATH_FAIL|radix_not_disabled"; PATH_OK=0; }
+# Determinism-recipe contract (quality legs only).
+grep -aq "disable_cuda_graph=True" "$LOG" || { echo "PATH_FAIL|cuda_graph_not_disabled"; PATH_OK=0; }
+grep -aq "disable_overlap_schedule=True" "$LOG" || { echo "PATH_FAIL|overlap_not_disabled"; PATH_OK=0; }
+grep -aq "disable_flashinfer_autotune=True" "$LOG" || { echo "PATH_FAIL|autotune_not_disabled"; PATH_OK=0; }
+grep -aq "attention_backend='dsv4'" "$LOG" || { echo "PATH_FAIL|attention_backend_not_dsv4"; PATH_OK=0; }
 case "$MODE" in
   fused)
     grep -aq "MoK full-native FP8 active" "$LOG" || { echo "PATH_FAIL|native_marker_missing"; PATH_OK=0; }
