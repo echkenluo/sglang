@@ -51,9 +51,13 @@ PYTHONPATH=$ROOT/sglang/python:$ROOT/mixture-of-kittens \
   --moe-a2a-backend deepep --deepep-mode auto \
   --attention-backend dsv4 --kv-cache-dtype fp8_e4m3 \
   --mem-fraction-static 0.8 --chunked-prefill-size 4096 \
-  --context-length 32768 --cuda-graph-bs-decode 1 2 4 \
+  --context-length 32768 \
+  --disable-cuda-graph \
   --cuda-graph-backend-prefill disabled \
   --disable-radix-cache \
+  --disable-overlap-schedule \
+  --disable-flashinfer-autotune \
+  --enable-deterministic-inference \
   --random-seed 196944571 --host 127.0.0.1 --port "$PORT" \
   --skip-server-warmup > "$LOG" 2>&1 &
 SERVER_PID=$!
