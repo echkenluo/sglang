@@ -77,4 +77,7 @@ decode=$(request 85 8888 8)
 echo "DECODE_SMOKE|mode=$MODE|out=$decode"
 
 kill $SERVER_PID 2>/dev/null; sleep 5; kill -9 $SERVER_PID 2>/dev/null
-echo SCRIPT_DONE
+# Honest terminal marker: SCRIPT_DONE only prints when every tier actually
+# produced a result line; callers must never rely on an unconditional RC.
+TIER_COUNT=$(set -- $TIERS; echo $#)
+echo "SCRIPT_DONE|mode=$MODE|tiers_expected=$TIER_COUNT"

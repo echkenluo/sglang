@@ -499,6 +499,7 @@ def _capture_prefill_graph(
     if _PREFILL_GRAPH_POOL is None:
         _PREFILL_GRAPH_POOL = torch.cuda.graph_pool_handle()
     graph = torch.cuda.CUDAGraph()
+    captured = True
     try:
         with torch.cuda.graph(graph, pool=_PREFILL_GRAPH_POOL):
             out = _run_native_core(
@@ -511,10 +512,25 @@ def _capture_prefill_graph(
                 in_weights,
             )
     except Exception:
+        captured = False
+        logger.exception("MoK prefill graph capture failed on this rank")
+    # Rank consensus: replaying on some ranks while others run eager would
+    # unbalance the barrier arrive counts and deadlock the flag spins, so a
+    # single capture failure disables graphs everywhere.  Capture records
+    # without executing, so no arrives happened yet and both outcomes leave
+    # every rank with a symmetric arrive history.
+    group = get_tp_group().device_group
+    flag = torch.tensor(
+        [int(captured)], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    if int(flag.item()) == 0:
         _PREFILL_GRAPH_DISABLED = True
-        logger.exception(
-            "MoK prefill graph capture failed; falling back to eager for the "
-            "rest of this process"
+        if captured:
+            graph.reset()
+        logger.warning(
+            "MoK prefill graphs disabled process-wide: capture failed on at "
+            "least one EP rank"
         )
         return None
     return _PrefillGraphEntry(graph, in_hidden, in_ids, in_weights, out)
