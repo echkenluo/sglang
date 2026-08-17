@@ -68,6 +68,8 @@ def main():
     items = build_prompts(args.data)
     if args.limit:
         items = items[: args.limit]
+    else:
+        assert len(items) == 1314, f"expected 1314 questions, got {len(items)}"
     results = {}
     with futures.ThreadPoolExecutor(max_workers=args.wave) as pool:
         futs = {pool.submit(ask, args.port, p): (i, gold)

@@ -48,6 +48,8 @@ def stage_target(args):
         if not 256 <= n_prompt <= 2048:
             continue
         prompt_ids = [t[1] for t in meta["input_token_logprobs"]]
+        assert len(prompt_ids) == n_prompt, (
+            f"prompt id count {len(prompt_ids)} != prompt_tokens {n_prompt}")
         target_ids = r["output_ids"][:64]
         if len(target_ids) < 64:
             continue  # frozen rule: full-length targets only

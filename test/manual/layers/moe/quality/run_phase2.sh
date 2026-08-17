@@ -7,11 +7,14 @@
 #     the path assertions per run).
 # Any stage rc != 0 aborts; the evaluator has the final verdict.
 set -u
-Q=/mok/claude-mok/sglang/test/manual/layers/moe/quality/quality_run.sh
+QSRC=/mok/claude-mok/sglang/test/manual/layers/moe/quality
+Q=$QSRC/quality_run.sh
+export QUALITY_DIR=/mok/claude-mok/quality-run-$(date +%Y%m%d-%H%M%S)
+python3 $QSRC/preflight_manifest.py "$QUALITY_DIR"   6493e22fc90d491ae8da0b88ffcfebae "${EXPECT_MOK_HEAD:?}"   "${EXPECT_SGLANG_HEAD:?}" || { echo P2_ABORT_PREFLIGHT; exit 10; }
 run() {
   local mode=$1 stage=$2 tag=$3
   echo "=== P2 $tag $stage START $(date +%H:%M:%S) ==="
-  bash $Q "$mode" 30061 "$stage" "$tag" 0
+  QUALITY_DIR=$QUALITY_DIR bash $Q "$mode" 30061 "$stage" "$tag" 0
   local rc=$?
   echo "=== P2 $tag $stage END rc=$rc ==="
   [ $rc -ne 0 ] && { echo "P2_ABORT|$tag|$stage|rc=$rc"; exit $rc; }
@@ -24,7 +27,7 @@ for cfg in "deepep d1" "deepep d2" "split s1" "split s2" "fused f1"; do
   run $1 logprob-score $2
   run $1 longgen       $2
 done
-python3 /mok/claude-mok/sglang/test/manual/layers/moe/quality/quality_gate_eval.py /mok/claude-mok/quality
+python3 $QSRC/quality_gate_eval.py "$QUALITY_DIR"
 RC=$?
 echo "P2_ALL_DONE|verdict_rc=$RC"
 exit $RC

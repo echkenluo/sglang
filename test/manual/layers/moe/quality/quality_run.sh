@@ -10,9 +10,9 @@ STAGE=${3:?stage}
 TAG=${4:?tag}
 LIMIT=${5:-0}
 ROOT=/mok/claude-mok
-QDIR=$ROOT/quality
+QDIR=${QUALITY_DIR:-$ROOT/quality}
 mkdir -p $QDIR
-LOG=$QDIR/server-$TAG.log
+LOG=$QDIR/server-$TAG-$STAGE.log
 
 # Environment hygiene: clear every MoK-related switch inherited from the
 # parent, then set exactly the mode's own.
@@ -20,7 +20,10 @@ unset SGLANG_OPT_USE_MOK_FP8_NATIVE SGLANG_OPT_MOK_FP8_NATIVE_STRICT \
       SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH \
       SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM \
       SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE \
-      SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS
+      SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS \
+      SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP \
+      SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M \
+      SGLANG_OPT_MOK_FP8_PROFILE_SHAPES
 export MOK_SM90_EXPERIMENTAL=1
 case "$MODE" in
   split)
@@ -92,11 +95,14 @@ case "$MODE" in
     grep -aq "fused_k1=True fused_k2=True" "$LOG" || { echo "PATH_FAIL|fused_flags_missing"; PATH_OK=0; } ;;
   split)
     grep -aq "MoK full-native FP8 active" "$LOG" || { echo "PATH_FAIL|native_marker_missing"; PATH_OK=0; }
-    grep -aq "fused_k1=True" "$LOG" && { echo "PATH_FAIL|unexpected_fused_flag"; PATH_OK=0; } ;;
+    grep -aq "fused_k1=False fused_k2=False" "$LOG" || { echo "PATH_FAIL|split_flags_not_false"; PATH_OK=0; } ;;
   deepep)
-    grep -aq "MoK full-native FP8 active" "$LOG" && { echo "PATH_FAIL|unexpected_native_marker"; PATH_OK=0; } ;;
+    grep -aq "MoK full-native FP8 active" "$LOG" && { echo "PATH_FAIL|unexpected_native_marker"; PATH_OK=0; }
+    grep -aq "moe_a2a_backend='deepep'" "$LOG" || { echo "PATH_FAIL|deepep_backend_not_resolved"; PATH_OK=0; } ;;
 esac
 [ $PATH_OK = 1 ] || RC=5
 
+printf '{"mode":"%s","stage":"%s","tag":"%s","rc":%d,"path_ok":%d}
+'   "$MODE" "$STAGE" "$TAG" "$RC" "$PATH_OK" > "$QDIR/path-receipt-$TAG-$STAGE.json"
 echo "STAGE_DONE|mode=$MODE|stage=$STAGE|tag=$TAG|rc=$RC|path_ok=$PATH_OK"
 exit $RC

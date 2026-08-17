@@ -35,6 +35,8 @@ def load_gsm8k(tag):
         for row in csv.DictReader(f):
             rows[int(row["idx"])] = (row["pred"], int(row["correct"]))
     summary = json.load(open(f"{QDIR}/gsm8k-{tag}.json"))
+    assert summary["n"] == 1314 and len(rows) == 1314, (
+        f"{tag}: expected 1314 unique questions, got {len(rows)}")
     return rows, summary
 
 
@@ -117,16 +119,17 @@ def main():
          f"split_vs_target={split_matches_target} "
          f"fused_vs_split={fused_matches_split}")
 
-    # --- Leg 3: fused vs deepep (deployment gate) ---
-    worst = None
-    for dtag in ("d1", "d2"):
-        st = score_delta_stats("f1", dtag)
-        if worst is None or st["mean"] > worst["mean"]:
-            worst = st
-    gate("3b-logprob-mean", worst["mean"] <= 0.02, f"{worst['mean']:.6f}")
-    gate("3b-logprob-p95", worst["p95"] <= 0.10, f"{worst['p95']:.6f}")
-    gate("3b-logprob-max", worst["max"] <= 0.20, f"{worst['max']:.6f}")
-    print(f"INFO|top1_flip_rate={worst['flip_rate']:.6f}", flush=True)
+    # --- Leg 3: fused vs deepep (deployment gate); per-metric worse leg ---
+    st1 = score_delta_stats("f1", "d1")
+    st2 = score_delta_stats("f1", "d2")
+    wmean = max(st1["mean"], st2["mean"])
+    wp95 = max(st1["p95"], st2["p95"])
+    wmax = max(st1["max"], st2["max"])
+    gate("3b-logprob-mean", wmean <= 0.02, f"d1={st1['mean']:.6f} d2={st2['mean']:.6f}")
+    gate("3b-logprob-p95", wp95 <= 0.10, f"d1={st1['p95']:.6f} d2={st2['p95']:.6f}")
+    gate("3b-logprob-max", wmax <= 0.20, f"d1={st1['max']:.6f} d2={st2['max']:.6f}")
+    print(f"INFO|top1_flip_rate_d1={st1['flip_rate']:.6f}"
+          f"|d2={st2['flip_rate']:.6f}", flush=True)
     _, sf = load_gsm8k("f1")
     _, sd1 = load_gsm8k("d1")
     _, sd2 = load_gsm8k("d2")
@@ -145,7 +148,24 @@ def main():
         first = next((k for k, (x, y) in enumerate(zip(fa, da)) if x != y), None)
         div.append(first)
     print(f"INFO|fused_vs_deepep_first_divergence={div}", flush=True)
-    gate("4b-batch-determinism", lf["waves_exact"])
+    waves = lf["waves"]
+    recomputed = (len(waves) == 3
+                  and waves[0] == waves[1] and waves[0] == waves[2])
+    gate("4b-batch-determinism", recomputed,
+         f"recomputed={recomputed} recorded={lf['waves_exact']}")
+
+    # --- Path receipts: every session must have asserted its path ---
+    receipts = [n for n in sorted(os.listdir(QDIR))
+                if n.startswith("path-receipt-")]
+    ok = len(receipts) == 16 and all(
+        json.load(open(f"{QDIR}/{n}")).get("path_ok") == 1 for n in receipts)
+    gate("path-receipts-16", ok, f"found={len(receipts)}")
+
+    # --- Preflight manifest must exist (assets verified before T(S)) ---
+    pf = f"{QDIR}/preflight-manifest.json"
+    gate("preflight-manifest", os.path.exists(pf))
+    if os.path.exists(pf):
+        manifest["preflight-manifest.json"] = sha(pf)
 
     report = {"gates": GATES, "manifest": manifest,
               "all_pass": all(g["pass"] for g in GATES)}
