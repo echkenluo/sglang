@@ -473,8 +473,9 @@ def _run_native_core(
         device=padded_hidden.device,
     )
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
-        # Symmetric second cut: combine transport overlaps the down GEMM
-        # tail, and the fused arrive replaces the separate barrier kernel.
+        # Symmetric second cut: the GEMM CTA finishing each M64 block last
+        # pushes it to the peers, and the fused arrive replaces the separate
+        # barrier kernel.  No resident communication CTAs.
         return mok_functional.gemm_combine_fused_fp8_block(
             workspace,
             schedule,
@@ -484,9 +485,6 @@ def _run_native_core(
             layer.w2_weight_scale_inv,
             routed_y,
             padded_topk_weights,
-            push_clusters=(
-                envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_PUSH_CLUSTERS.get()
-            ),
         )
     mok_functional.grouped_gemm_fp8_block_dynamic_out(
         down_input,

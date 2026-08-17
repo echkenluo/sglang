@@ -890,10 +890,10 @@ class Envs:
     # persistent kernel (strict contract only). Off by default.
     SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS = EnvInt(8)
-    # Symmetric second cut: down GEMM + combine push + fused arrive as one
-    # persistent kernel, followed by the fused-wait epilogue. Off by default.
+    # Symmetric second cut: down GEMM with last-arriver combine push and the
+    # fused arrive as one persistent kernel, then the fused-wait epilogue.
+    # Off by default.
     SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE = EnvBool(False)
-    SGLANG_OPT_MOK_FP8_NATIVE_FUSED_PUSH_CLUSTERS = EnvInt(8)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
