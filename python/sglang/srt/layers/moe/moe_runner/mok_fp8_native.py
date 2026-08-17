@@ -456,6 +456,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         input_fp8,
         input_scale,
         trim_to_active_rows=False,
+        prepare_combine=True,
     )
     capacity_rows = routed_x.shape[0]
 
@@ -517,6 +518,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         schedule,
         routed_y,
         padded_topk_weights,
+        combine_precleared=True,
     )
 
     global _REPORTED_ACTIVE
