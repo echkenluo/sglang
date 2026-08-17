@@ -26,11 +26,15 @@ def build_prompts(path):
     shots = rows[:5]
     prefix = ""
     for r in shots:
-        prefix += f"Question: {r[question]}\nAnswer: {r[answer]}\n\n"
+        prefix += (
+            "Question: " + r["question"] + "\nAnswer: " + r["answer"] + "\n\n"
+        )
     items = []
     for i, r in enumerate(rows[5:]):
         gold = norm(ANSWER_RE.search(r["answer"]).group(1))
-        items.append((i, prefix + f"Question: {r[question]}\nAnswer:", gold))
+        items.append(
+            (i, prefix + "Question: " + r["question"] + "\nAnswer:", gold)
+        )
     return items
 
 
