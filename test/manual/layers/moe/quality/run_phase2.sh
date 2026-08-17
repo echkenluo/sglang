@@ -10,7 +10,7 @@ set -u
 QSRC=/mok/claude-mok/sglang/test/manual/layers/moe/quality
 Q=$QSRC/quality_run.sh
 export QUALITY_DIR=/mok/claude-mok/quality-run-$(date +%Y%m%d-%H%M%S)
-python3 $QSRC/preflight_manifest.py "$QUALITY_DIR"   6493e22fc90d491ae8da0b88ffcfebae "${EXPECT_MOK_HEAD:?}"   "${EXPECT_SGLANG_HEAD:?}" || { echo P2_ABORT_PREFLIGHT; exit 10; }
+python3 $QSRC/preflight_manifest.py "$QUALITY_DIR" "${EXPECT_SGLANG_HEAD:?}" || { echo P2_ABORT_PREFLIGHT; exit 10; }
 run() {
   local mode=$1 stage=$2 tag=$3
   echo "=== P2 $tag $stage START $(date +%H:%M:%S) ==="

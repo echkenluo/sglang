@@ -154,17 +154,45 @@ def main():
     gate("4b-batch-determinism", recomputed,
          f"recomputed={recomputed} recorded={lf['waves_exact']}")
 
-    # --- Path receipts: every session must have asserted its path ---
-    receipts = [n for n in sorted(os.listdir(QDIR))
-                if n.startswith("path-receipt-")]
-    ok = len(receipts) == 16 and all(
-        json.load(open(f"{QDIR}/{n}")).get("path_ok") == 1 for n in receipts)
-    gate("path-receipts-16", ok, f"found={len(receipts)}")
+    # --- Path receipts: the exact frozen 16-session set, field-matched ---
+    expected_receipts = {("split", "t-s", "logprob-target")}
+    for mode, tag in (("deepep", "d1"), ("deepep", "d2"),
+                      ("split", "s1"), ("split", "s2"), ("fused", "f1")):
+        for stage in ("gsm8k", "logprob-score", "longgen"):
+            expected_receipts.add((mode, tag, stage))
+    seen = set()
+    receipt_bad = []
+    for n in sorted(os.listdir(QDIR)):
+        if not n.startswith("path-receipt-"):
+            continue
+        r = json.load(open(f"{QDIR}/{n}"))
+        key = (r.get("mode"), r.get("tag"), r.get("stage"))
+        want_name = f"path-receipt-{r.get('tag')}-{r.get('stage')}.json"
+        if (n != want_name or r.get("rc") != 0 or r.get("path_ok") != 1
+                or key not in expected_receipts):
+            receipt_bad.append(n)
+        seen.add(key)
+    ok = not receipt_bad and seen == expected_receipts
+    gate("path-receipts-16", ok,
+         f"seen={len(seen)}/16 bad={receipt_bad[:3]} "
+         f"missing={sorted(expected_receipts - seen)[:3]}")
 
-    # --- Preflight manifest must exist (assets verified before T(S)) ---
+    # --- Preflight manifest: must exist, be verified, and match key values ---
     pf = f"{QDIR}/preflight-manifest.json"
-    gate("preflight-manifest", os.path.exists(pf))
-    if os.path.exists(pf):
+    if not os.path.exists(pf):
+        gate("preflight-manifest", False, "missing")
+    else:
+        pm = json.load(open(pf))
+        exp = json.load(open(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "expected_assets.json")))
+        ok = (pm.get("verified") is True
+              and pm.get("mok_head") == exp["mok_head"]
+              and pm.get("so_content_md5s") == exp["so_content_md5s"]
+              and pm.get("image_id") == exp["image_id"]
+              and pm.get("sharegpt_sha256") == exp["sharegpt_sha256"])
+        gate("preflight-manifest", ok,
+             f"verified={pm.get('verified')} failures={pm.get('failures')}")
         manifest["preflight-manifest.json"] = sha(pf)
 
     report = {"gates": GATES, "manifest": manifest,

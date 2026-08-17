@@ -1,10 +1,13 @@
-"""Phase 2 preflight: verify and record every frozen asset BEFORE T(S).
+"""Phase 2 preflight: STRONG verification of every frozen asset BEFORE T(S).
 
-Aborts (non-zero) on any mismatch with the expected values passed on the
-command line; writes preflight-manifest.json into the run directory.  The
-manifest carries full SHA256 digests (not truncations) for the datasets,
-the harness scripts, both repo HEADs, the SO fingerprint, the container
-image digest, and the tokenizer/chat-template source directory listing.
+Every expectation lives in expected_assets.json (versioned with the harness;
+script integrity is covered by the sglang HEAD + clean-worktree assertions).
+Any mismatch is a non-zero exit -- nothing is merely recorded when a frozen
+value exists.  Writes preflight-manifest.json with verified flags into the
+(empty) run directory.
+
+Args: <run_dir> <expect_sglang_head_full> ; env IMAGE_ID from the launcher
+(docker inspect on the host) is compared against the frozen image id.
 """
 
 import hashlib
@@ -12,6 +15,17 @@ import json
 import os
 import subprocess
 import sys
+
+ROOT = "/mok/claude-mok"
+QSRC = f"{ROOT}/sglang/test/manual/layers/moe/quality"
+MODEL_DIR = "/data2/pubulic-models/DeepSeek-V4-Flash-FP8-fixed"
+SHAREGPT = "/data2/pubulic-models/ShareGPT_V3_unfiltered_cleaned_split.json"
+FAILS = []
+
+
+def fail(kind, detail):
+    FAILS.append(kind)
+    print(f"PREFLIGHT_FAIL|{kind}|{detail}", flush=True)
 
 
 def sha256(path):
@@ -22,84 +36,102 @@ def sha256(path):
     return h.hexdigest()
 
 
-def git_head(repo):
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git(repo, *args):
     return subprocess.run(
-        ["git", "-C", repo, "rev-parse", "HEAD"],
-        capture_output=True, text=True, env={**os.environ,
-                                             "GIT_CONFIG_GLOBAL": "/dev/null"},
+        ["git", "-C", repo, *args], capture_output=True, text=True,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"},
     ).stdout.strip()
 
 
 def main():
     qdir = sys.argv[1]
-    expect_gsm8k_md5 = sys.argv[2]
-    expect_mok_head = sys.argv[3]
-    expect_sglang_head = sys.argv[4]
+    expect_sglang_head = sys.argv[2]
+    exp = json.load(open(f"{QSRC}/expected_assets.json"))
+
     os.makedirs(qdir, exist_ok=True)
-    leftovers = [n for n in os.listdir(qdir)
-                 if not n.startswith("preflight")]
+    leftovers = [n for n in os.listdir(qdir) if not n.startswith("preflight")]
     if leftovers:
-        print(f"PREFLIGHT_FAIL|run_dir_not_empty|{leftovers[:5]}", flush=True)
-        return 1
+        fail("run_dir_not_empty", leftovers[:5])
 
-    root = "/mok/claude-mok"
-    gsm8k = f"{root}/gsm8k_test.jsonl"
-    sharegpt = "/data2/pubulic-models/ShareGPT_V3_unfiltered_cleaned_split.json"
-    model_dir = "/data2/pubulic-models/DeepSeek-V4-Flash-FP8-fixed"
-    qsrc = f"{root}/sglang/test/manual/layers/moe/quality"
+    # Datasets.
+    g_md5 = md5(f"{ROOT}/gsm8k_test.jsonl")
+    if g_md5 != exp["gsm8k_md5"]:
+        fail("gsm8k_md5", g_md5)
+    sg_sha = sha256(SHAREGPT)
+    if sg_sha != exp["sharegpt_sha256"]:
+        fail("sharegpt_sha256", sg_sha)
 
-    import hashlib as _h
-    gsm8k_md5 = _h.md5(open(gsm8k, "rb").read()).hexdigest()
-    if gsm8k_md5 != expect_gsm8k_md5:
-        print(f"PREFLIGHT_FAIL|gsm8k_md5|{gsm8k_md5}", flush=True)
-        return 1
-    mok_head = git_head(f"{root}/mixture-of-kittens")
-    sglang_head = git_head(f"{root}/sglang")
-    if not mok_head.startswith(expect_mok_head):
-        print(f"PREFLIGHT_FAIL|mok_head|{mok_head}", flush=True)
-        return 1
-    if not sglang_head.startswith(expect_sglang_head):
-        print(f"PREFLIGHT_FAIL|sglang_head|{sglang_head}", flush=True)
-        return 1
+    # Repos: full-SHA equality plus clean worktrees (covers script content).
+    mok_head = git(f"{ROOT}/mixture-of-kittens", "rev-parse", "HEAD")
+    if mok_head != exp["mok_head"]:
+        fail("mok_head", mok_head)
+    sglang_head = git(f"{ROOT}/sglang", "rev-parse", "HEAD")
+    if len(expect_sglang_head) != 40 or sglang_head != expect_sglang_head:
+        fail("sglang_head", f"{sglang_head} vs {expect_sglang_head}")
+    for repo in (f"{ROOT}/mixture-of-kittens", f"{ROOT}/sglang"):
+        dirty = git(repo, "status", "--porcelain")
+        if dirty:
+            fail("worktree_dirty", f"{repo}: {dirty.splitlines()[:3]}")
 
-    so_files = sorted(
-        f"{root}/mixture-of-kittens/mok/{n}"
-        for n in os.listdir(f"{root}/mixture-of-kittens/mok")
-        if n.endswith(".so")
+    # SO fingerprint: path-independent content md5 set.
+    so_dir = f"{ROOT}/mixture-of-kittens/mok"
+    so_files = sorted(n for n in os.listdir(so_dir) if n.endswith(".so"))
+    so_md5s = [md5(f"{so_dir}/{n}") for n in so_files]
+    if not so_files or so_md5s != exp["so_content_md5s"]:
+        fail("so_fingerprint", f"{so_files}: {so_md5s}")
+
+    # Container image (host launcher passes docker inspect .Image).
+    image_id = os.environ.get("IMAGE_ID", "")
+    if image_id != exp["image_id"]:
+        fail("image_id", image_id or "MISSING")
+
+    # Tokenizer / chat template files.
+    tok = {}
+    for name, want in exp["tokenizer_files"].items():
+        got = sha256(f"{MODEL_DIR}/{name}")
+        tok[name] = got
+        if got != want:
+            fail("tokenizer_file", f"{name}: {got}")
+
+    # Exact harness script set with recorded SHAs (content already pinned by
+    # the clean-worktree + HEAD assertions above).
+    present = sorted(
+        n for n in os.listdir(QSRC)
+        if n.endswith((".py", ".sh", ".json")) and n != "__pycache__"
     )
-    so_fp = hashlib.md5(
-        "".join(sha256(f) for f in so_files).encode()
-    ).hexdigest()[:12]
-
-    image = subprocess.run(
-        ["cat", "/proc/self/cgroup"], capture_output=True, text=True
-    ).stdout.strip()[:200]
-    scripts = {}
-    for n in sorted(os.listdir(qsrc)):
-        if n.endswith((".py", ".sh")):
-            scripts[n] = sha256(f"{qsrc}/{n}")
-    tokenizer_files = {
-        n: sha256(f"{model_dir}/{n}")
-        for n in sorted(os.listdir(model_dir))
-        if "token" in n.lower() or n.endswith(".json") and "config" in n
-    }
+    if present != exp["script_set"]:
+        fail("script_set", f"{present}")
+    scripts = {n: sha256(f"{QSRC}/{n}") for n in present}
 
     manifest = {
-        "gsm8k_md5": gsm8k_md5,
-        "gsm8k_sha256": sha256(gsm8k),
-        "sharegpt_sha256": sha256(sharegpt),
+        "verified": not FAILS,
+        "failures": FAILS,
+        "gsm8k_md5": g_md5,
+        "gsm8k_sha256": sha256(f"{ROOT}/gsm8k_test.jsonl"),
+        "sharegpt_sha256": sg_sha,
         "mok_head": mok_head,
         "sglang_head": sglang_head,
-        "so_fingerprint": so_fp,
-        "container_cgroup": image,
+        "so_content_md5s": so_md5s,
+        "image_id": image_id,
+        "tokenizer_files": tok,
         "harness_scripts": scripts,
-        "tokenizer_files": tokenizer_files,
-        "model_dir": model_dir,
+        "model_dir": MODEL_DIR,
     }
     out = f"{qdir}/preflight-manifest.json"
     json.dump(manifest, open(out, "w"), indent=1)
+    if FAILS:
+        print(f"PREFLIGHT_FAILED|{FAILS}", flush=True)
+        return 1
     print(f"PREFLIGHT_OK|mok={mok_head[:9]}|sglang={sglang_head[:9]}"
-          f"|so={so_fp}", flush=True)
+          f"|so={so_md5s[0][:12]}", flush=True)
     return 0
 
 
