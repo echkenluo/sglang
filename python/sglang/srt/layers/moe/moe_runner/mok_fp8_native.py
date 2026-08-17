@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
+import time
 from typing import Optional
 
 import torch
@@ -15,6 +17,42 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
+
+
+_TRAP_WATCHDOG_LOCK = threading.Lock()
+_TRAP_WATCHDOG_ENTRIES: list = []
+_TRAP_WATCHDOG_STARTED = False
+
+
+def _trap_watchdog_loop() -> None:
+    """Async production endpoint of the MoK trap contract: kernel launches
+    and graph replays are asynchronous, so a device trap may never surface
+    as a RuntimeError inside the local try/except boundaries.  This daemon
+    thread polls the host-mapped pinned records with pure CPU reads (never
+    a CUDA call) and performs the log-and-exit contract the moment any
+    record turns non-zero."""
+    while True:
+        for workspace, mok_functional in list(_TRAP_WATCHDOG_ENTRIES):
+            record = mok_functional.format_trap_record(workspace)
+            if record is not None:
+                logger.error(record)
+                logging.shutdown()
+                os._exit(70)
+        time.sleep(0.05)
+
+
+def _register_trap_watchdog(workspace, mok_functional) -> None:
+    global _TRAP_WATCHDOG_STARTED
+    with _TRAP_WATCHDOG_LOCK:
+        if not any(w is workspace for w, _ in _TRAP_WATCHDOG_ENTRIES):
+            _TRAP_WATCHDOG_ENTRIES.append((workspace, mok_functional))
+        if not _TRAP_WATCHDOG_STARTED:
+            threading.Thread(
+                target=_trap_watchdog_loop,
+                name="mok-trap-watchdog",
+                daemon=True,
+            ).start()
+            _TRAP_WATCHDOG_STARTED = True
 
 
 def _die_if_trapped(workspace, mok_functional) -> None:
@@ -695,6 +733,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         topk=topk,
         num_local_experts=layer.num_local_experts,
     )
+    _register_trap_watchdog(workspace, mok_functional)
 
     _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
 
@@ -731,12 +770,17 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
                 entry.in_weights[num_tokens:].zero_()
             try:
                 entry.graph.replay()
-                result = entry.out[:num_tokens].contiguous()
-                if not envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
-                    # Combine-path graphs record the acquire but no release;
-                    # release outside the graph, after the materializing
-                    # copy from workspace-backed entry.out.
-                    mok_functional.release_workspace_lease(workspace)
+                if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+                    # entry.out is the caller-owned K2 output tensor.
+                    return entry.out[:num_tokens].contiguous()
+                # Combine-path graphs record the acquire but no release,
+                # and entry.out aliases workspace.output: force a
+                # new-storage copy (contiguous() would alias), then
+                # release outside the graph.
+                result = entry.out[:num_tokens].clone(
+                    memory_format=torch.contiguous_format
+                )
+                mok_functional.release_workspace_lease(workspace)
                 return result
             except RuntimeError:
                 _die_if_trapped(workspace, mok_functional)
@@ -773,11 +817,16 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             padded_topk_ids,
             padded_topk_weights,
         )
-        result = output[:num_tokens].contiguous()
-        if not envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
-            # Combine path leaves the result in workspace.output: release
-            # only after the materializing copy above.
-            mok_functional.release_workspace_lease(workspace)
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+            # K2 path already wrote a caller-owned tensor; slicing it is safe.
+            return output[:num_tokens]
+        # Combine path: the result lives in workspace.output and
+        # .contiguous() on a contiguous slice is a NO-OP alias -- force a
+        # new-storage copy, then release (stream-ordered after the copy).
+        result = output[:num_tokens].clone(
+            memory_format=torch.contiguous_format
+        )
+        mok_functional.release_workspace_lease(workspace)
         return result
     except RuntimeError:
         _die_if_trapped(workspace, mok_functional)
