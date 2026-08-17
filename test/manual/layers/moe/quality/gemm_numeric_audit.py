@@ -38,9 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--active-experts",
         type=int,
-        help="experts receiving rows; defaults to min(experts, m / 64)",
+        help="experts receiving rows; defaults to the maximum aligned count",
     )
-    parser.add_argument("--m", type=int, default=64)
+    parser.add_argument(
+        "--expert-alignment",
+        type=int,
+        choices=(64, 128),
+        default=128,
+        help="rows per expert segment; production DeepEP uses 128",
+    )
+    parser.add_argument("--m", type=int, default=128)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=20260818)
@@ -51,8 +58,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.experts < 1:
         raise ValueError("experts must be positive")
-    if args.m < 64 or args.m % 64:
-        raise ValueError("m must be at least 64 and divisible by 64")
+    if args.m < args.expert_alignment or args.m % args.expert_alignment:
+        raise ValueError("m must be a positive multiple of expert-alignment")
     if args.n < BLOCK or args.n % BLOCK:
         raise ValueError(f"n must be divisible by {BLOCK}")
     if args.k < BLOCK or args.k % BLOCK:
@@ -60,12 +67,12 @@ def validate_args(args: argparse.Namespace) -> None:
     active_experts = (
         args.active_experts
         if args.active_experts is not None
-        else min(args.experts, args.m // 64)
+        else min(args.experts, args.m // args.expert_alignment)
     )
     if active_experts < 1 or active_experts > args.experts:
         raise ValueError("active-experts must be in [1, experts]")
-    if active_experts > args.m // 64:
-        raise ValueError("each active expert must receive at least one 64-row tile")
+    if active_experts > args.m // args.expert_alignment:
+        raise ValueError("each active expert must receive one aligned segment")
     args.active_experts = active_experts
 
 
@@ -101,16 +108,17 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
         * 0.09
         + 0.01
     )
-    # Production dispatch pads every active expert segment to a 64-row tile.
+    # Production DeepEP dispatch pads every active expert segment to 128 rows.
+    # A 64-row mode is retained only to audit MoK's wider kernel contract.
     # Keep segments contiguous; the remaining experts are intentionally empty.
-    num_tiles = args.m // 64
+    num_tiles = args.m // args.expert_alignment
     tile_experts = (
         torch.arange(num_tiles, dtype=torch.int64, device=device)
         .mul_(args.active_experts)
         .div_(num_tiles, rounding_mode="floor")
         .to(torch.int32)
     )
-    m_indices = torch.repeat_interleave(tile_experts, 64)
+    m_indices = torch.repeat_interleave(tile_experts, args.expert_alignment)
     return a, b, a_scale, b_scale, m_indices
 
 
@@ -209,6 +217,7 @@ def main() -> int:
         "shape": {
             "experts": args.experts,
             "active_experts": args.active_experts,
+            "expert_alignment": args.expert_alignment,
             "m": args.m,
             "n": args.n,
             "k": args.k,
