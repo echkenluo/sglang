@@ -472,6 +472,22 @@ def _run_native_core(
         dtype=torch.bfloat16,
         device=padded_hidden.device,
     )
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+        # Symmetric second cut: combine transport overlaps the down GEMM
+        # tail, and the fused arrive replaces the separate barrier kernel.
+        return mok_functional.gemm_combine_fused_fp8_block(
+            workspace,
+            schedule,
+            down_input,
+            down_input_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            routed_y,
+            padded_topk_weights,
+            push_clusters=(
+                envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_PUSH_CLUSTERS.get()
+            ),
+        )
     mok_functional.grouped_gemm_fp8_block_dynamic_out(
         down_input,
         layer.w2_weight,
@@ -593,6 +609,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     )
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
         required_apis = required_apis + ("dispatch_gemm_fused_fp8_block",)
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+        required_apis = required_apis + ("gemm_combine_fused_fp8_block",)
     missing = [name for name in required_apis if not hasattr(mok_functional, name)]
     if missing:
         raise RuntimeError(f"loaded MoK package lacks native APIs: {missing}")
