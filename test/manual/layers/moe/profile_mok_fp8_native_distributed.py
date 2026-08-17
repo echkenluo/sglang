@@ -112,6 +112,22 @@ def main():
         graph.replay()
     torch.cuda.synchronize(device)
 
+    trace_dir = os.environ.get("MOK_PROFILE_TORCH_TRACE_DIR")
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+        dist.barrier()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            graph.replay()
+            torch.cuda.synchronize(device)
+        profiler.export_chrome_trace(
+            os.path.join(trace_dir, f"rank{rank}.trace.json")
+        )
+        dist.barrier()
+        if rank == 0:
+            print(f"MOK_PROFILE_TRACE|dir={trace_dir}", flush=True)
+
     events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         for _ in range(iterations)
