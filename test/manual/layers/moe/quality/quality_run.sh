@@ -1,6 +1,7 @@
 #!/bin/bash
 # Phase 2 quality harness driver: start one server config, run the requested
-# stage (gsm8k | logprob-target | logprob-score | longgen), tear down.
+# stage, assert path engagement from the server log, tear down.  The script
+# exit code is the stage's real result (trap-based cleanup never masks it).
 # Usage: quality_run.sh <mode> <port> <stage> <tag> [limit]
 set -u
 MODE=${1:?mode}
@@ -13,16 +14,34 @@ QDIR=$ROOT/quality
 mkdir -p $QDIR
 LOG=$QDIR/server-$TAG.log
 
-ENV_COMMON="MOK_SM90_EXPERIMENTAL=1"
+# Environment hygiene: clear every MoK-related switch inherited from the
+# parent, then set exactly the mode's own.
+unset SGLANG_OPT_USE_MOK_FP8_NATIVE SGLANG_OPT_MOK_FP8_NATIVE_STRICT \
+      SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH \
+      SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM \
+      SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE \
+      SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS
+export MOK_SM90_EXPERIMENTAL=1
 case "$MODE" in
-  split)  ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1" ;;
-  fused)  ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE=1" ;;
-  deepep) ENV_MODE="" ;;
+  split)
+    export SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 ;;
+  fused)
+    export SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 \
+           SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM=1 \
+           SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE=1 ;;
+  deepep) : ;;
   *) echo "BAD_MODE"; exit 2 ;;
 esac
 
-env PYTHONPATH=$ROOT/sglang/python:$ROOT/mixture-of-kittens \
-  $ENV_COMMON $ENV_MODE \
+SERVER_PID=""
+cleanup() {
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  sleep 3
+  [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
+}
+trap cleanup EXIT
+
+PYTHONPATH=$ROOT/sglang/python:$ROOT/mixture-of-kittens \
   python3 -m sglang.launch_server \
   --model-path /data2/pubulic-models/DeepSeek-V4-Flash-FP8-fixed \
   --trust-remote-code --tp-size 4 --ep-size 4 \
@@ -30,6 +49,7 @@ env PYTHONPATH=$ROOT/sglang/python:$ROOT/mixture-of-kittens \
   --attention-backend dsv4 --kv-cache-dtype fp8_e4m3 \
   --mem-fraction-static 0.8 --chunked-prefill-size 4096 \
   --context-length 32768 --cuda-graph-bs-decode 1 2 4 \
+  --cuda-graph-backend-prefill disabled \
   --disable-radix-cache \
   --random-seed 196944571 --host 127.0.0.1 --port "$PORT" \
   --skip-server-warmup > "$LOG" 2>&1 &
@@ -39,27 +59,44 @@ for _ in $(seq 1 180); do
   kill -0 $SERVER_PID 2>/dev/null || { echo SERVER_DIED; tail -5 "$LOG"; exit 3; }
   curl -sf -m 4 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
 done
-curl -sf -m 4 "http://127.0.0.1:$PORT/health" > /dev/null || { echo SERVER_TIMEOUT; kill $SERVER_PID; exit 4; }
+curl -sf -m 4 "http://127.0.0.1:$PORT/health" > /dev/null || { echo SERVER_TIMEOUT; exit 4; }
 echo "SERVER_READY|mode=$MODE|stage=$STAGE|tag=$TAG"
 
 cd $ROOT/sglang/test/manual/layers/moe/quality
+RC=1
 case "$STAGE" in
   gsm8k)
     python3 gsm8k_client.py --port $PORT --data $ROOT/gsm8k_test.jsonl \
-      --tag $TAG --limit $LIMIT --out-dir $QDIR ;;
+      --tag $TAG --limit $LIMIT --out-dir $QDIR; RC=$? ;;
   logprob-target)
     python3 logprob_client.py --port $PORT --stage target --tag $TAG \
       --sharegpt /data2/pubulic-models/ShareGPT_V3_unfiltered_cleaned_split.json \
-      --out-dir $QDIR ;;
+      --out-dir $QDIR; RC=$? ;;
   logprob-score)
     python3 logprob_client.py --port $PORT --stage score --tag $TAG \
-      --targets $QDIR/logprob-targets.json --out-dir $QDIR ;;
+      --targets $QDIR/logprob-targets.json --out-dir $QDIR; RC=$? ;;
   longgen)
     python3 longgen_client.py --port $PORT --tag $TAG \
       --sharegpt /data2/pubulic-models/ShareGPT_V3_unfiltered_cleaned_split.json \
-      --out-dir $QDIR ;;
-  *) echo BAD_STAGE ;;
+      --out-dir $QDIR; RC=$? ;;
+  *) echo BAD_STAGE; exit 2 ;;
 esac
-RC=$?
-kill $SERVER_PID 2>/dev/null; sleep 5; kill -9 $SERVER_PID 2>/dev/null
-echo "STAGE_DONE|mode=$MODE|stage=$STAGE|tag=$TAG|rc=$RC"
+
+# Path-engagement assertions (frozen regexes; any miss invalidates the run).
+PATH_OK=1
+grep -aq "prefill=PhaseConfig(backend='disabled'" "$LOG" || { echo "PATH_FAIL|prefill_graph_not_disabled"; PATH_OK=0; }
+grep -aq "disable_radix_cache=True" "$LOG" || { echo "PATH_FAIL|radix_not_disabled"; PATH_OK=0; }
+case "$MODE" in
+  fused)
+    grep -aq "MoK full-native FP8 active" "$LOG" || { echo "PATH_FAIL|native_marker_missing"; PATH_OK=0; }
+    grep -aq "fused_k1=True fused_k2=True" "$LOG" || { echo "PATH_FAIL|fused_flags_missing"; PATH_OK=0; } ;;
+  split)
+    grep -aq "MoK full-native FP8 active" "$LOG" || { echo "PATH_FAIL|native_marker_missing"; PATH_OK=0; }
+    grep -aq "fused_k1=True" "$LOG" && { echo "PATH_FAIL|unexpected_fused_flag"; PATH_OK=0; } ;;
+  deepep)
+    grep -aq "MoK full-native FP8 active" "$LOG" && { echo "PATH_FAIL|unexpected_native_marker"; PATH_OK=0; } ;;
+esac
+[ $PATH_OK = 1 ] || RC=5
+
+echo "STAGE_DONE|mode=$MODE|stage=$STAGE|tag=$TAG|rc=$RC|path_ok=$PATH_OK"
+exit $RC

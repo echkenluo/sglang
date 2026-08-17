@@ -59,15 +59,17 @@ def stage_target(args):
         })
         if len(selected) == 128:
             break
+    assert len(selected) == 128, (
+        f"target selection exhausted ShareGPT with only {len(selected)}")
     out = f"{args.out_dir}/logprob-targets.json"
     json.dump(selected, open(out, "w"))
-    print(f"LOGPROB_TARGETS|n={len(selected)}"
-          f"|sha={hashlib.sha256(open(out,rb).read()).hexdigest()[:16]}",
-          flush=True)
+    sha = hashlib.sha256(open(out, "rb").read()).hexdigest()[:16]
+    print(f"LOGPROB_TARGETS|n={len(selected)}|sha={sha}", flush=True)
 
 
 def stage_score(args):
     targets = json.load(open(args.targets))
+    assert len(targets) == 128, f"expected 128 targets, got {len(targets)}"
     rows = []
     for t in targets:
         ids = t["prompt_ids"] + t["target_ids"]
@@ -86,10 +88,15 @@ def stage_score(args):
         lps = [float(x[0]) for x in tail]
         assert all(l == l and abs(l) != float("inf") for l in lps), (
             f"non-finite logprob for {t['text_sha']}")
-        top1 = None
-        if meta.get("input_top_logprobs"):
-            ttail = meta["input_top_logprobs"][-len(t["target_ids"]):]
-            top1 = [x[0][1] if x else None for x in ttail]
+        ttop = meta.get("input_top_logprobs")
+        assert ttop, f"missing input_top_logprobs for {t['text_sha']}"
+        ttail = ttop[-len(t["target_ids"]):]
+        assert len(ttail) == 64, f"top-logprob slice short for {t['text_sha']}"
+        top1 = []
+        for pos, x in enumerate(ttail):
+            assert x and len(x) >= 1 and isinstance(x[0][1], int), (
+                f"malformed top-1 at {t['text_sha']}:{pos}")
+            top1.append(x[0][1])
         rows.append({
             "text_sha": t["text_sha"],
             "logprobs": lps,
@@ -97,13 +104,11 @@ def stage_score(args):
             "top1_ids": top1,
         })
     total = sum(len(r["logprobs"]) for r in rows)
-    assert total == len(targets) * 64, (
-        f"expected {len(targets) * 64} positions, got {total}")
+    assert total == 128 * 64, f"expected 8192 positions, got {total}"
     out = f"{args.out_dir}/logprob-score-{args.tag}.json"
     json.dump(rows, open(out, "w"))
-    print(f"LOGPROB_SCORE|tag={args.tag}|n={len(rows)}"
-          f"|sha={hashlib.sha256(open(out,rb).read()).hexdigest()[:16]}",
-          flush=True)
+    sha = hashlib.sha256(open(out, "rb").read()).hexdigest()[:16]
+    print(f"LOGPROB_SCORE|tag={args.tag}|n={len(rows)}|sha={sha}", flush=True)
 
 
 if __name__ == "__main__":

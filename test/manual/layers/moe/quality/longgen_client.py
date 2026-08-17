@@ -44,14 +44,19 @@ def main():
     targets = json.load(open(f"{args.out_dir}/logprob-targets.json"))[:16]
     prompts = [t["text"] for t in targets]
 
+    assert len(prompts) == 16, f"expected 16 prompts, got {len(prompts)}"
     serial = [gen(args.port, p) for p in prompts]
+    assert all(len(ids) == 512 for ids in serial), "serial not 512 tokens"
     waves = [gen(args.port, prompts) for _ in range(3)]
+    for w, wave in enumerate(waves):
+        assert len(wave) == 16, f"wave {w} returned {len(wave)} outputs"
+        assert all(len(ids) == 512 for ids in wave), f"wave {w} not 512"
     wave_exact = all(waves[0] == waves[k] for k in (1, 2))
     out = f"{args.out_dir}/longgen-{args.tag}.json"
     json.dump({"serial": serial, "waves_exact": wave_exact,
-               "wave0": waves[0]}, open(out, "w"))
-    print(f"LONGGEN|tag={args.tag}|waves_exact={wave_exact}"
-          f"|sha={hashlib.sha256(open(out,rb).read()).hexdigest()[:16]}",
+               "waves": waves}, open(out, "w"))
+    sha = hashlib.sha256(open(out, "rb").read()).hexdigest()[:16]
+    print(f"LONGGEN|tag={args.tag}|waves_exact={wave_exact}|sha={sha}",
           flush=True)
 
 

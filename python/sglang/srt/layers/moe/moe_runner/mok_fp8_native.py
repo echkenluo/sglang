@@ -842,7 +842,8 @@ def _report_active(
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
             "topk=%d E_local=%d capacity=%d device_active_rows=true "
-            "expert_padding=%d strict_contract=%s prefill_graph=%s",
+            "expert_padding=%d strict_contract=%s prefill_graph=%s "
+            "fused_k1=%s fused_k2=%s",
             layer.layer_id,
             num_tokens,
             padded_tokens,
@@ -852,4 +853,6 @@ def _report_active(
             _ROUTE_EXPERT_PADDING,
             strict_contract,
             envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get(),
+            envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get(),
+            envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get(),
         )
