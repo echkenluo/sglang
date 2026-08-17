@@ -15,6 +15,20 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _die_if_trapped(workspace, mok_functional) -> None:
+    """CPU-only fatal boundary of the MoK trap contract: after a CUDA error,
+    read the host-mapped pinned record WITHOUT issuing any CUDA call; a
+    non-zero record means a device trap poisoned the context -- log the
+    structured MOK_TRAP line and exit so the supervisor restarts us.  Callers
+    invoke this from every exception path (eager, graph warmup, capture,
+    replay) before doing anything else."""
+    record = mok_functional.format_trap_record(workspace)
+    if record is not None:
+        logger.error(record)
+        logging.shutdown()
+        os._exit(70)
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
 _ROUTE_EXPERT_PADDING = 64
@@ -484,6 +498,10 @@ def _run_native_core(
         # Symmetric second cut: the GEMM CTA finishing each M64 block last
         # pushes it to the peers, and the fused arrive replaces the separate
         # barrier kernel.  No resident communication CTAs.
+        # Caller-owned output: the epilogue writes here BEFORE its last CTA
+        # releases the lease, so a subsequent acquirer overwriting workspace
+        # state cannot corrupt this result (safe in-graph release).
+        core_out = torch.empty_like(workspace.output)
         return mok_functional.gemm_combine_fused_fp8_block(
             workspace,
             schedule,
@@ -494,6 +512,7 @@ def _run_native_core(
             routed_y,
             padded_topk_weights,
             release_lease=True,
+            output=core_out,
         )
     mok_functional.grouped_gemm_fp8_block_dynamic_out(
         down_input,
@@ -504,17 +523,16 @@ def _run_native_core(
         schedule.num_tokens,
         routed_y,
     )
-    out = mok_functional.combine_reduce_fp8_block_routes(
+    # Combine path: the result lives in workspace.output, so the lease is
+    # NOT released here -- the outer boundary releases it after the caller's
+    # materializing copy (see _finish_native_output).
+    return mok_functional.combine_reduce_fp8_block_routes(
         workspace,
         schedule,
         routed_y,
         padded_topk_weights,
         combine_precleared=True,
     )
-    # Combine-path end of pipeline: stream-ordered trailing release (the
-    # release kernel launches after every consumer of the workspace).
-    mok_functional.release_workspace_lease(workspace)
-    return out
 
 
 def _capture_prefill_graph(
@@ -542,10 +560,19 @@ def _capture_prefill_graph(
     # Flush lazy JIT/init on the exact capture shape.  This runs for real and
     # is rank-synchronous: every EP rank reaches capture for the same
     # (layer, bucket) key in the same order under the strict contract.
-    _run_native_core(
-        layer, workspace, mok_functional, config, in_hidden, in_ids, in_weights
-    )
-    torch.cuda.synchronize(device)
+    try:
+        _run_native_core(
+            layer, workspace, mok_functional, config,
+            in_hidden, in_ids, in_weights,
+        )
+        torch.cuda.synchronize(device)
+        if not envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+            # Combine-path warmup held the lease past the core; release it
+            # before capture (nothing reads workspace.output here).
+            mok_functional.release_workspace_lease(workspace)
+    except RuntimeError:
+        _die_if_trapped(workspace, mok_functional)
+        raise
     if _PREFILL_GRAPH_POOL is None:
         _PREFILL_GRAPH_POOL = torch.cuda.graph_pool_handle()
     graph = torch.cuda.CUDAGraph()
@@ -562,6 +589,10 @@ def _capture_prefill_graph(
                 in_weights,
             )
     except Exception:
+        # A trap during capture poisons the context: check the pinned record
+        # BEFORE any further CUDA work (the consensus path below allocates
+        # tensors and all-reduces, which the trap contract forbids).
+        _die_if_trapped(workspace, mok_functional)
         captured = False
         logger.exception("MoK prefill graph capture failed on this rank")
     # Rank consensus: replaying on some ranks while others run eager would
@@ -698,10 +729,18 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
                 entry.in_hidden[num_tokens:].zero_()
                 entry.in_ids[num_tokens:].fill_(-1)
                 entry.in_weights[num_tokens:].zero_()
-            entry.graph.replay()
-            # workspace.output is consumed by the caller before the next
-            # replay of any graph on this stream; layers run serially.
-            return entry.out[:num_tokens].contiguous()
+            try:
+                entry.graph.replay()
+                result = entry.out[:num_tokens].contiguous()
+                if not envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+                    # Combine-path graphs record the acquire but no release;
+                    # release outside the graph, after the materializing
+                    # copy from workspace-backed entry.out.
+                    mok_functional.release_workspace_lease(workspace)
+                return result
+            except RuntimeError:
+                _die_if_trapped(workspace, mok_functional)
+                raise
 
     if padded_tokens == num_tokens:
         padded_hidden = hidden_states
@@ -734,17 +773,14 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             padded_topk_ids,
             padded_topk_weights,
         )
-        return output[:num_tokens].contiguous()
+        result = output[:num_tokens].contiguous()
+        if not envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+            # Combine path leaves the result in workspace.output: release
+            # only after the materializing copy above.
+            mok_functional.release_workspace_lease(workspace)
+        return result
     except RuntimeError:
-        # Fatal-error boundary (MoK trap contract): after any CUDA API has
-        # returned an error the context is poisoned -- issue NO further CUDA
-        # calls, read the host-mapped pinned record directly, log it, and
-        # exit so the supervisor restarts the process.
-        record = mok_functional.format_trap_record(workspace)
-        if record is not None:
-            logger.error(record)
-            logging.shutdown()
-            os._exit(70)
+        _die_if_trapped(workspace, mok_functional)
         raise
 
 
