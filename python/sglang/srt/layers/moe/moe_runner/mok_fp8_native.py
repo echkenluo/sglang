@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -388,6 +389,13 @@ def _run_native_core(
         scale_tma_aligned=False,
         scale_ue8m0=False,
     )
+    # Workspace lease: the orchestrator owns it across the whole pipeline
+    # (build_schedule is the first workspace write).  Every branch below
+    # runs in leased mode; release happens exactly once -- by the fused
+    # epilogue's last CTA (K2 branch) or by the trailing release at the end
+    # of the combine path.  Concurrent reuse of the workspace fails closed
+    # in the acquire kernel (REENTRANT trap).
+    mok_functional.acquire_workspace_lease(workspace)
     schedule = mok_functional.build_schedule(
         workspace,
         config,
@@ -418,9 +426,6 @@ def _run_native_core(
                 copy_clusters=(
                     envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS.get()
                 ),
-                # Full pipeline: keep the workspace lease held; the routed
-                # epilogue's last CTA releases it (gemm_combine_fused).
-                hold_lease=True,
             )
         )
     else:
@@ -488,6 +493,7 @@ def _run_native_core(
             layer.w2_weight_scale_inv,
             routed_y,
             padded_topk_weights,
+            release_lease=True,
         )
     mok_functional.grouped_gemm_fp8_block_dynamic_out(
         down_input,
@@ -498,13 +504,17 @@ def _run_native_core(
         schedule.num_tokens,
         routed_y,
     )
-    return mok_functional.combine_reduce_fp8_block_routes(
+    out = mok_functional.combine_reduce_fp8_block_routes(
         workspace,
         schedule,
         routed_y,
         padded_topk_weights,
         combine_precleared=True,
     )
+    # Combine-path end of pipeline: stream-ordered trailing release (the
+    # release kernel launches after every consumer of the workspace).
+    mok_functional.release_workspace_lease(workspace)
+    return out
 
 
 def _capture_prefill_graph(
@@ -607,6 +617,9 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         "combine_fp8_block",
         "combine_reduce_fp8_block_routes",
         "reduce_fp8_block_routes",
+        "acquire_workspace_lease",
+        "release_workspace_lease",
+        "format_trap_record",
     )
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
         required_apis = required_apis + ("dispatch_gemm_fused_fp8_block",)
@@ -711,16 +724,28 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         )
         padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
 
-    output = _run_native_core(
-        layer,
-        workspace,
-        mok_functional,
-        config,
-        padded_hidden,
-        padded_topk_ids,
-        padded_topk_weights,
-    )
-    return output[:num_tokens].contiguous()
+    try:
+        output = _run_native_core(
+            layer,
+            workspace,
+            mok_functional,
+            config,
+            padded_hidden,
+            padded_topk_ids,
+            padded_topk_weights,
+        )
+        return output[:num_tokens].contiguous()
+    except RuntimeError:
+        # Fatal-error boundary (MoK trap contract): after any CUDA API has
+        # returned an error the context is poisoned -- issue NO further CUDA
+        # calls, read the host-mapped pinned record directly, log it, and
+        # exit so the supervisor restarts the process.
+        record = mok_functional.format_trap_record(workspace)
+        if record is not None:
+            logger.error(record)
+            logging.shutdown()
+            os._exit(70)
+        raise
 
 
 def _report_active(
