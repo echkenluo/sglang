@@ -17,6 +17,7 @@ import os
 import sys
 
 QDIR = sys.argv[1] if len(sys.argv) > 1 else "/mok/claude-mok/quality"
+EXPECT_SGLANG_HEAD = sys.argv[2] if len(sys.argv) > 2 else ""
 GATES = []
 
 
@@ -190,7 +191,10 @@ def main():
               and pm.get("mok_head") == exp["mok_head"]
               and pm.get("so_content_md5s") == exp["so_content_md5s"]
               and pm.get("image_id") == exp["image_id"]
-              and pm.get("sharegpt_sha256") == exp["sharegpt_sha256"])
+              and pm.get("sharegpt_sha256") == exp["sharegpt_sha256"]
+              and pm.get("gsm8k_sha256") == exp["gsm8k_sha256"]
+              and len(EXPECT_SGLANG_HEAD) == 40
+              and pm.get("sglang_head") == EXPECT_SGLANG_HEAD)
         gate("preflight-manifest", ok,
              f"verified={pm.get('verified')} failures={pm.get('failures')}")
         manifest["preflight-manifest.json"] = sha(pf)

@@ -65,6 +65,9 @@ def main():
     g_md5 = md5(f"{ROOT}/gsm8k_test.jsonl")
     if g_md5 != exp["gsm8k_md5"]:
         fail("gsm8k_md5", g_md5)
+    g_sha = sha256(f"{ROOT}/gsm8k_test.jsonl")
+    if g_sha != exp["gsm8k_sha256"]:
+        fail("gsm8k_sha256", g_sha)
     sg_sha = sha256(SHAREGPT)
     if sg_sha != exp["sharegpt_sha256"]:
         fail("sharegpt_sha256", sg_sha)
@@ -115,7 +118,7 @@ def main():
         "verified": not FAILS,
         "failures": FAILS,
         "gsm8k_md5": g_md5,
-        "gsm8k_sha256": sha256(f"{ROOT}/gsm8k_test.jsonl"),
+        "gsm8k_sha256": g_sha,
         "sharegpt_sha256": sg_sha,
         "mok_head": mok_head,
         "sglang_head": sglang_head,

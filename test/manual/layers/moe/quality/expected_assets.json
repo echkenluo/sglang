@@ -2,7 +2,9 @@
   "gsm8k_md5": "6493e22fc90d491ae8da0b88ffcfebae",
   "sharegpt_sha256": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
   "mok_head": "2c8ad81e0027b39f6a63c648a150850438a1d885",
-  "so_content_md5s": ["7a039283cdb3aa2f93bdd3ed213b1b26"],
+  "so_content_md5s": [
+    "7a039283cdb3aa2f93bdd3ed213b1b26"
+  ],
   "image_id": "sha256:dcc92eacd7c8444f9472ce351017da6eff1293ad884c1a474990e9d1bf61a1cc",
   "tokenizer_files": {
     "tokenizer.json": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
@@ -17,5 +19,6 @@
     "quality_gate_eval.py",
     "quality_run.sh",
     "run_phase2.sh"
-  ]
+  ],
+  "gsm8k_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
 }

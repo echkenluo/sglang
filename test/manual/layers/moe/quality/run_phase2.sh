@@ -27,7 +27,7 @@ for cfg in "deepep d1" "deepep d2" "split s1" "split s2" "fused f1"; do
   run $1 logprob-score $2
   run $1 longgen       $2
 done
-python3 $QSRC/quality_gate_eval.py "$QUALITY_DIR"
+python3 $QSRC/quality_gate_eval.py "$QUALITY_DIR" "$EXPECT_SGLANG_HEAD"
 RC=$?
 echo "P2_ALL_DONE|verdict_rc=$RC"
 exit $RC
