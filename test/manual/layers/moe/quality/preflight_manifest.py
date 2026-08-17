@@ -45,9 +45,18 @@ def md5(path):
 
 
 def git(repo, *args):
+    # The repos are owned by the host user while this runs as container
+    # root: git's dubious-ownership guard silently empties every command
+    # unless safe.directory is granted via system/global config (the -C/-c
+    # forms are deliberately ignored for this key).  A throwaway global
+    # config keeps the host's real global config out of the measurement.
+    cfg = "/tmp/quality-gitconfig"
+    if not os.path.exists(cfg):
+        with open(cfg, "w") as f:
+            f.write("[safe]\n\tdirectory = *\n")
     return subprocess.run(
         ["git", "-C", repo, *args], capture_output=True, text=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"},
+        env={**os.environ, "GIT_CONFIG_GLOBAL": cfg},
     ).stdout.strip()
 
 
