@@ -35,6 +35,11 @@ class ErrorMetrics:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experts", type=int, default=1)
+    parser.add_argument(
+        "--active-experts",
+        type=int,
+        help="experts receiving rows; defaults to min(experts, m / 64)",
+    )
     parser.add_argument("--m", type=int, default=64)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
@@ -52,6 +57,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"n must be divisible by {BLOCK}")
     if args.k < BLOCK or args.k % BLOCK:
         raise ValueError(f"k must be divisible by {BLOCK}")
+    active_experts = (
+        args.active_experts
+        if args.active_experts is not None
+        else min(args.experts, args.m // 64)
+    )
+    if active_experts < 1 or active_experts > args.experts:
+        raise ValueError("active-experts must be in [1, experts]")
+    if active_experts > args.m // 64:
+        raise ValueError("each active expert must receive at least one 64-row tile")
+    args.active_experts = active_experts
 
 
 def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
@@ -86,14 +101,16 @@ def make_inputs(args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
         * 0.09
         + 0.01
     )
-    # Contiguous expert segments match the production grouped-GEMM contract.
-    m_indices = (
-        torch.arange(args.m, dtype=torch.int64, device=device)
-        .mul_(args.experts)
-        .div_(args.m, rounding_mode="floor")
-        .clamp_max_(args.experts - 1)
+    # Production dispatch pads every active expert segment to a 64-row tile.
+    # Keep segments contiguous; the remaining experts are intentionally empty.
+    num_tiles = args.m // 64
+    tile_experts = (
+        torch.arange(num_tiles, dtype=torch.int64, device=device)
+        .mul_(args.active_experts)
+        .div_(num_tiles, rounding_mode="floor")
         .to(torch.int32)
     )
+    m_indices = torch.repeat_interleave(tile_experts, 64)
     return a, b, a_scale, b_scale, m_indices
 
 
@@ -191,6 +208,7 @@ def main() -> int:
         "device": torch.cuda.get_device_name(),
         "shape": {
             "experts": args.experts,
+            "active_experts": args.active_experts,
             "m": args.m,
             "n": args.n,
             "k": args.k,
