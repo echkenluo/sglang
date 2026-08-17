@@ -395,32 +395,55 @@ def _run_native_core(
         num_local_experts=layer.num_local_experts,
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
-    routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
-        workspace,
-        schedule,
-        input_fp8,
-        input_scale,
-        trim_to_active_rows=False,
-        prepare_combine=True,
-    )
-    capacity_rows = routed_x.shape[0]
-
     gate_up_size = layer.w13_weight.shape[1]
     intermediate_size = layer.w2_weight.shape[2]
-    gate_up = torch.empty(
-        (capacity_rows, gate_up_size),
-        dtype=torch.bfloat16,
-        device=padded_hidden.device,
-    )
-    mok_functional.grouped_gemm_fp8_block_dynamic_out(
-        routed_x,
-        layer.w13_weight,
-        routed_x_scale,
-        layer.w13_weight_scale_inv,
-        m_indices,
-        schedule.num_tokens,
-        gate_up,
-    )
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
+        # First fusion cut: the input barrier, pull dispatch, and gate/up
+        # GEMM run as one persistent kernel with per-M64-tile handoff.
+        capacity_rows = workspace.schedule_capacity
+        gate_up = torch.empty(
+            (capacity_rows, gate_up_size),
+            dtype=torch.bfloat16,
+            device=padded_hidden.device,
+        )
+        routed_x, routed_x_scale, m_indices = (
+            mok_functional.dispatch_gemm_fused_fp8_block(
+                workspace,
+                schedule,
+                input_fp8,
+                input_scale,
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                gate_up,
+                copy_clusters=(
+                    envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS.get()
+                ),
+            )
+        )
+    else:
+        routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
+            workspace,
+            schedule,
+            input_fp8,
+            input_scale,
+            trim_to_active_rows=False,
+            prepare_combine=True,
+        )
+        capacity_rows = routed_x.shape[0]
+        gate_up = torch.empty(
+            (capacity_rows, gate_up_size),
+            dtype=torch.bfloat16,
+            device=padded_hidden.device,
+        )
+        mok_functional.grouped_gemm_fp8_block_dynamic_out(
+            routed_x,
+            layer.w13_weight,
+            routed_x_scale,
+            layer.w13_weight_scale_inv,
+            m_indices,
+            schedule.num_tokens,
+            gate_up,
+        )
 
     down_input = torch.empty(
         (capacity_rows, intermediate_size),
@@ -568,6 +591,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         "combine_reduce_fp8_block_routes",
         "reduce_fp8_block_routes",
     )
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
+        required_apis = required_apis + ("dispatch_gemm_fused_fp8_block",)
     missing = [name for name in required_apis if not hasattr(mok_functional, name)]
     if missing:
         raise RuntimeError(f"loaded MoK package lacks native APIs: {missing}")

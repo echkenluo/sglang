@@ -886,6 +886,10 @@ class Envs:
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
+    # First fusion cut: input barrier + pull dispatch + gate/up GEMM as one
+    # persistent kernel (strict contract only). Off by default.
+    SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS = EnvInt(8)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
