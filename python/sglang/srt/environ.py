@@ -881,6 +881,9 @@ class Envs:
     SGLANG_OPT_USE_MOK_FP8_EXPERT_MLP = EnvBool(False)
     SGLANG_OPT_MOK_FP8_MIN_EXPECTED_M = EnvInt(256)
     SGLANG_OPT_MOK_FP8_PROFILE_SHAPES = EnvBool(False)
+    # Diagnostic only: run DeepGEMM beside the selected MoK GEMM once per
+    # layer/stage and log elementwise output deltas. Never enable for perf.
+    SGLANG_OPT_MOK_FP8_NUMERIC_AUDIT = EnvBool(False)
     # Correctness-first full-native path. Unlike the expert-only canary above,
     # this replaces DeepEP dispatch/combine as well as expert compute.
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)

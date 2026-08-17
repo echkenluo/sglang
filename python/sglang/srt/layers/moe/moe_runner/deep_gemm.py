@@ -49,6 +49,69 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+_MOK_FP8_NUMERIC_AUDITED: set[tuple[object, str]] = set()
+
+
+def _audit_mok_fp8_output_once(
+    *,
+    layer_id: object,
+    stage: str,
+    input_tensor: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    mok_output: torch.Tensor,
+) -> None:
+    """Log one production-tensor MoK/DeepGEMM comparison per layer stage."""
+    if not envs.SGLANG_OPT_MOK_FP8_NUMERIC_AUDIT.get():
+        return
+    key = (layer_id, stage)
+    if key in _MOK_FP8_NUMERIC_AUDITED:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("MoK FP8 numeric audit is incompatible with CUDA graph")
+
+    from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
+
+    deepgemm_output = torch.empty_like(mok_output)
+    deepgemm_input_scale = (
+        tma_align_input_scale(input_scale)
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+        else input_scale
+    )
+    deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+        (input_tensor, deepgemm_input_scale),
+        (weight, weight_scale),
+        deepgemm_output,
+        m_indices,
+    )
+
+    delta = (mok_output.float() - deepgemm_output.float()).abs().flatten()
+    reference_norm = torch.linalg.vector_norm(deepgemm_output.float()).clamp_min(
+        1e-12
+    )
+    relative_l2 = torch.linalg.vector_norm(
+        mok_output.float() - deepgemm_output.float()
+    ) / reference_norm
+    exact_fraction = (mok_output == deepgemm_output).float().mean()
+    logger.info(
+        "MOK_FP8_NUMERIC_AUDIT|layer=%s|stage=%s|E=%d|M=%d|N=%d|K=%d|"
+        "exact=%.9f|mean_abs=%.9g|p95_abs=%.9g|max_abs=%.9g|rel_l2=%.9g",
+        layer_id,
+        stage,
+        weight.shape[0],
+        input_tensor.shape[0],
+        weight.shape[1],
+        input_tensor.shape[1],
+        exact_fraction.item(),
+        delta.mean().item(),
+        torch.quantile(delta, 0.95).item(),
+        delta.max().item(),
+        relative_l2.item(),
+    )
+    _MOK_FP8_NUMERIC_AUDITED.add(key)
+
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
@@ -258,6 +321,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 m_indices,
                 gateup_output,
             )
+            _audit_mok_fp8_output_once(
+                layer_id=self.config.layer_id,
+                stage="w13",
+                input_tensor=hidden_states,
+                input_scale=hidden_states_scale,
+                weight=quant_info.w13_weight,
+                weight_scale=quant_info.w13_scale,
+                m_indices=m_indices,
+                mok_output=gateup_output,
+            )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
                 (hidden_states, hidden_states_scale),
@@ -346,6 +419,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 quant_info.w2_scale,
                 m_indices,
                 down_output,
+            )
+            _audit_mok_fp8_output_once(
+                layer_id=self.config.layer_id,
+                stage="w2",
+                input_tensor=down_input_fp8,
+                input_scale=down_input_scale,
+                weight=quant_info.w2_weight,
+                weight_scale=quant_info.w2_scale,
+                m_indices=m_indices,
+                mok_output=down_output,
             )
             global _MOK_FP8_CONTIG_REPORTED_ACTIVE
             if not _MOK_FP8_CONTIG_REPORTED_ACTIVE:
