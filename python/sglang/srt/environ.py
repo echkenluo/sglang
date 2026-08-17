@@ -885,6 +885,7 @@ class Envs:
     # this replaces DeepEP dispatch/combine as well as expert compute.
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

@@ -340,6 +340,186 @@ def _report_fallback(reason: str) -> None:
         logger.info("MoK full-native fallback: %s", reason)
 
 
+class _PrefillGraphEntry:
+    __slots__ = ("graph", "in_hidden", "in_ids", "in_weights", "out")
+
+    def __init__(self, graph, in_hidden, in_ids, in_weights, out):
+        self.graph = graph
+        self.in_hidden = in_hidden
+        self.in_ids = in_ids
+        self.in_weights = in_weights
+        self.out = out
+
+
+# One graph per (layer object, padded token bucket).  All graphs share one
+# memory pool so intermediate activations are reused across layers instead of
+# being held 43 times; layers execute serially on one stream, which is the
+# safety contract for both the shared pool and the shared workspace tensors.
+_PREFILL_GRAPHS: dict[tuple[int, int], _PrefillGraphEntry] = {}
+_PREFILL_GRAPH_POOL = None
+_PREFILL_GRAPH_DISABLED = False
+
+
+def _run_native_core(
+    layer,
+    workspace,
+    mok_functional,
+    config,
+    padded_hidden: torch.Tensor,
+    padded_topk_ids: torch.Tensor,
+    padded_topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Graph-capturable native MoE sequence.
+
+    Strict-contract only: no host reads, no collectives, no data-dependent
+    shapes.  Every launch depends solely on tensor contents plus the fixed
+    workspace geometry, which is what CUDA Graph capture requires.
+    """
+    from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant_dynamic
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    hidden_size = padded_hidden.shape[1]
+    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
+        padded_hidden,
+        128,
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    )
+    schedule = mok_functional.build_schedule(
+        workspace,
+        config,
+        padded_topk_ids,
+        num_local_experts=layer.num_local_experts,
+        expert_padding=_ROUTE_EXPERT_PADDING,
+    )
+    routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        input_fp8,
+        input_scale,
+        trim_to_active_rows=False,
+        prepare_combine=True,
+    )
+    capacity_rows = routed_x.shape[0]
+
+    gate_up_size = layer.w13_weight.shape[1]
+    intermediate_size = layer.w2_weight.shape[2]
+    gate_up = torch.empty(
+        (capacity_rows, gate_up_size),
+        dtype=torch.bfloat16,
+        device=padded_hidden.device,
+    )
+    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+        routed_x,
+        layer.w13_weight,
+        routed_x_scale,
+        layer.w13_weight_scale_inv,
+        m_indices,
+        schedule.num_tokens,
+        gate_up,
+    )
+
+    down_input = torch.empty(
+        (capacity_rows, intermediate_size),
+        dtype=torch.float8_e4m3fn,
+        device=padded_hidden.device,
+    )
+    down_input_scale = torch.empty(
+        (capacity_rows, intermediate_size // 128),
+        dtype=torch.float32,
+        device=padded_hidden.device,
+    )
+    silu_and_mul_contig_post_quant_dynamic(
+        input=gate_up,
+        output=down_input,
+        output_scale=down_input_scale,
+        active_tokens=schedule.num_tokens,
+        quant_group_size=128,
+        scale_ue8m0=False,
+        transposed=False,
+        swiglu_limit=layer.moe_runner_config.swiglu_limit,
+        swizzle=False,
+    )
+
+    routed_y = torch.empty(
+        (capacity_rows, hidden_size),
+        dtype=torch.bfloat16,
+        device=padded_hidden.device,
+    )
+    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+        down_input,
+        layer.w2_weight,
+        down_input_scale,
+        layer.w2_weight_scale_inv,
+        m_indices,
+        schedule.num_tokens,
+        routed_y,
+    )
+    return mok_functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        routed_y,
+        padded_topk_weights,
+        combine_precleared=True,
+    )
+
+
+def _capture_prefill_graph(
+    layer,
+    workspace,
+    mok_functional,
+    config,
+    *,
+    padded_tokens: int,
+    hidden_size: int,
+    topk: int,
+    device: torch.device,
+) -> Optional[_PrefillGraphEntry]:
+    """Lazily capture one per-(layer, bucket) graph; None disables graphs."""
+    global _PREFILL_GRAPH_POOL, _PREFILL_GRAPH_DISABLED
+    in_hidden = torch.zeros(
+        (padded_tokens, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    in_ids = torch.full(
+        (padded_tokens, topk), -1, dtype=torch.int32, device=device
+    )
+    in_weights = torch.zeros(
+        (padded_tokens, topk), dtype=torch.float32, device=device
+    )
+    # Flush lazy JIT/init on the exact capture shape.  This runs for real and
+    # is rank-synchronous: every EP rank reaches capture for the same
+    # (layer, bucket) key in the same order under the strict contract.
+    _run_native_core(
+        layer, workspace, mok_functional, config, in_hidden, in_ids, in_weights
+    )
+    torch.cuda.synchronize(device)
+    if _PREFILL_GRAPH_POOL is None:
+        _PREFILL_GRAPH_POOL = torch.cuda.graph_pool_handle()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, pool=_PREFILL_GRAPH_POOL):
+            out = _run_native_core(
+                layer,
+                workspace,
+                mok_functional,
+                config,
+                in_hidden,
+                in_ids,
+                in_weights,
+            )
+    except Exception:
+        _PREFILL_GRAPH_DISABLED = True
+        logger.exception(
+            "MoK prefill graph capture failed; falling back to eager for the "
+            "rest of this process"
+        )
+        return None
+    return _PrefillGraphEntry(graph, in_hidden, in_ids, in_weights, out)
+
+
 @torch.no_grad()
 def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     """Return native output, or ``None`` before any MoK collective on fallback."""
@@ -382,33 +562,13 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     # route-buffer chunk.  Retain M256 token padding for larger batches until
     # their route-chunk/capacity tradeoff is measured independently.
     padded_tokens, route_chunk_bytes = _route_padding_config(num_tokens, topk)
-    if padded_tokens == num_tokens:
-        padded_hidden = hidden_states
-        padded_topk_ids = topk_output.topk_ids.to(torch.int32)
-        padded_topk_weights = topk_output.topk_weights
-    else:
-        padded_hidden = hidden_states.new_zeros((padded_tokens, hidden_size))
-        padded_hidden[:num_tokens].copy_(hidden_states)
-        padded_topk_ids = torch.full(
-            (padded_tokens, topk),
-            -1,
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int32))
-        padded_topk_weights = torch.zeros(
-            (padded_tokens, topk),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
 
     # SGLang's TP/EP model contract gives every rank the same padded shape,
     # and the MoK workspace validates that invariant when a shape is first
     # created. Use a worst-case route-distribution bound here instead of an
     # extra route-count AllReduce plus GPU-to-host synchronization per layer.
     capacity_factor = _conservative_route_capacity_factor(
-        base_rows=padded_topk_ids.numel(),
+        base_rows=padded_tokens * topk,
         num_local_experts=layer.num_local_experts,
         ep_size=layer.moe_ep_size,
         expert_padding=_ROUTE_EXPERT_PADDING,
@@ -431,103 +591,88 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         topk=topk,
         num_local_experts=layer.num_local_experts,
     )
-    from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant_dynamic
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
 
-    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
-        padded_hidden,
-        128,
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
+    _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
+
+    use_graph = (
+        envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()
+        and strict_contract
+        and not _PREFILL_GRAPH_DISABLED
+        and padded_tokens >= 256
+        and not torch.cuda.is_current_stream_capturing()
     )
-    schedule = mok_functional.build_schedule(
+    if use_graph:
+        key = (id(layer), padded_tokens)
+        entry = _PREFILL_GRAPHS.get(key)
+        if entry is None:
+            entry = _capture_prefill_graph(
+                layer,
+                workspace,
+                mok_functional,
+                config,
+                padded_tokens=padded_tokens,
+                hidden_size=hidden_size,
+                topk=topk,
+                device=hidden_states.device,
+            )
+            if entry is not None:
+                _PREFILL_GRAPHS[key] = entry
+        if entry is not None:
+            entry.in_hidden[:num_tokens].copy_(hidden_states)
+            entry.in_ids[:num_tokens].copy_(topk_output.topk_ids)
+            entry.in_weights[:num_tokens].copy_(topk_output.topk_weights)
+            if padded_tokens > num_tokens:
+                entry.in_hidden[num_tokens:].zero_()
+                entry.in_ids[num_tokens:].fill_(-1)
+                entry.in_weights[num_tokens:].zero_()
+            entry.graph.replay()
+            # workspace.output is consumed by the caller before the next
+            # replay of any graph on this stream; layers run serially.
+            return entry.out[:num_tokens].contiguous()
+
+    if padded_tokens == num_tokens:
+        padded_hidden = hidden_states
+        padded_topk_ids = topk_output.topk_ids.to(torch.int32)
+        padded_topk_weights = topk_output.topk_weights
+    else:
+        padded_hidden = hidden_states.new_zeros((padded_tokens, hidden_size))
+        padded_hidden[:num_tokens].copy_(hidden_states)
+        padded_topk_ids = torch.full(
+            (padded_tokens, topk),
+            -1,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int32))
+        padded_topk_weights = torch.zeros(
+            (padded_tokens, topk),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
+
+    output = _run_native_core(
+        layer,
         workspace,
+        mok_functional,
         config,
+        padded_hidden,
         padded_topk_ids,
-        num_local_experts=layer.num_local_experts,
-        expert_padding=_ROUTE_EXPERT_PADDING,
-    )
-    routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
-        workspace,
-        schedule,
-        input_fp8,
-        input_scale,
-        trim_to_active_rows=False,
-        prepare_combine=True,
-    )
-    capacity_rows = routed_x.shape[0]
-
-    gate_up_size = layer.w13_weight.shape[1]
-    intermediate_size = layer.w2_weight.shape[2]
-    gate_up = torch.empty(
-        (capacity_rows, gate_up_size),
-        dtype=torch.bfloat16,
-        device=hidden_states.device,
-    )
-    mok_functional.grouped_gemm_fp8_block_dynamic_out(
-        routed_x,
-        layer.w13_weight,
-        routed_x_scale,
-        layer.w13_weight_scale_inv,
-        m_indices,
-        schedule.num_tokens,
-        gate_up,
-    )
-
-    down_input = torch.empty(
-        (capacity_rows, intermediate_size),
-        dtype=torch.float8_e4m3fn,
-        device=hidden_states.device,
-    )
-    down_input_scale = torch.empty(
-        (capacity_rows, intermediate_size // 128),
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    silu_and_mul_contig_post_quant_dynamic(
-        input=gate_up,
-        output=down_input,
-        output_scale=down_input_scale,
-        active_tokens=schedule.num_tokens,
-        quant_group_size=128,
-        scale_ue8m0=False,
-        transposed=False,
-        swiglu_limit=layer.moe_runner_config.swiglu_limit,
-        swizzle=False,
-    )
-
-    routed_y = torch.empty(
-        (capacity_rows, hidden_size),
-        dtype=torch.bfloat16,
-        device=hidden_states.device,
-    )
-    mok_functional.grouped_gemm_fp8_block_dynamic_out(
-        down_input,
-        layer.w2_weight,
-        down_input_scale,
-        layer.w2_weight_scale_inv,
-        m_indices,
-        schedule.num_tokens,
-        routed_y,
-    )
-    output = mok_functional.combine_reduce_fp8_block_routes(
-        workspace,
-        schedule,
-        routed_y,
         padded_topk_weights,
-        combine_precleared=True,
     )
+    return output[:num_tokens].contiguous()
 
+
+def _report_active(
+    layer, num_tokens, padded_tokens, topk, workspace, strict_contract
+) -> None:
     global _REPORTED_ACTIVE
     if not _REPORTED_ACTIVE:
         _REPORTED_ACTIVE = True
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
             "topk=%d E_local=%d capacity=%d device_active_rows=true "
-            "expert_padding=%d strict_contract=%s",
+            "expert_padding=%d strict_contract=%s prefill_graph=%s",
             layer.layer_id,
             num_tokens,
             padded_tokens,
@@ -536,5 +681,5 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
             strict_contract,
+            envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get(),
         )
-    return output[:num_tokens].contiguous()
