@@ -5,7 +5,7 @@
 # warmup request followed by REPEAT distinct cache-cold prompts, reporting
 # per-tier latency samples. Decode smoke (8 output tokens) runs at the end.
 set -u
-MODE=${1:?mok|mok-graph|deepep}
+MODE=${1:?mok|mok-graph|mok-fused|mok-fused-eager|deepep}
 PORT=${2:?port}
 TAG=${3:?tag}
 ROOT=/mok/claude-mok
@@ -18,6 +18,7 @@ case "$MODE" in
   mok) ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1" ;;
   mok-graph) ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH=1" ;;
   mok-fused) ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE=1" ;;
+  mok-fused-eager) ENV_MODE="SGLANG_OPT_USE_MOK_FP8_NATIVE=1 SGLANG_OPT_MOK_FP8_NATIVE_STRICT=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM=1 SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE=1" ;;
   deepep) ENV_MODE="" ;;
   *) echo "BAD_MODE"; exit 2 ;;
 esac
@@ -63,6 +64,7 @@ EOF
 
 for words in $TIERS; do
   request "$words" 7777 1 > /dev/null   # JIT / graph-capture warmup for this tier
+  request "$words" 7778 1 > /dev/null   # second warmup (phase-0C first-touch outlier)
   samples=""
   for i in $(seq 1 "$REPEAT"); do
     out=$(request "$words" $((1000 + i)) 1)
