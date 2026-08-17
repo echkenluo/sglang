@@ -102,6 +102,75 @@ def main():
             )
         dist.destroy_process_group()
         return
+
+    eager_iters = int(os.environ.get("MOK_PROFILE_EAGER_ITERS", "0"))
+    if eager_iters > 0:
+        # Eager-path decomposition: SGLang Prefill runs the native path
+        # eagerly, so the per-kernel timeline must come from eager
+        # iterations, not from a captured graph.
+        for _ in range(10):
+            mok_fp8_native.maybe_run_mok_fp8_native(
+                layer, hidden_states, topk_output
+            )
+        torch.cuda.synchronize(device)
+        dist.barrier()
+
+        trace_dir = os.environ.get("MOK_PROFILE_TORCH_TRACE_DIR")
+        if trace_dir:
+            os.makedirs(trace_dir, exist_ok=True)
+            trace_iters = int(os.environ.get("MOK_PROFILE_TRACE_ITERS", "3"))
+            dist.barrier()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            ) as profiler:
+                for _ in range(trace_iters):
+                    mok_fp8_native.maybe_run_mok_fp8_native(
+                        layer, hidden_states, topk_output
+                    )
+                torch.cuda.synchronize(device)
+            profiler.export_chrome_trace(
+                os.path.join(trace_dir, f"eager-rank{rank}.trace.json")
+            )
+            dist.barrier()
+            if rank == 0:
+                print(f"MOK_PROFILE_EAGER_TRACE|dir={trace_dir}", flush=True)
+
+        events = [
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in range(eager_iters)
+        ]
+        dist.barrier()
+        for start, end in events:
+            start.record()
+            mok_fp8_native.maybe_run_mok_fp8_native(
+                layer, hidden_states, topk_output
+            )
+            end.record()
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        samples = _rank_max_samples(
+            [s.elapsed_time(e) for s, e in events], device
+        )
+        ordered = sorted(samples)
+        p50 = statistics.median(ordered)
+        p95 = ordered[max(0, int(len(ordered) * 0.95) - 1)]
+        if rank == 0:
+            print(
+                "MOK_PROFILE_EAGER_TIMED|"
+                f"T={tokens}|topk={topk}|E_local={local_experts}|H={hidden}|"
+                f"I={intermediate}|iters={eager_iters}|p50_ms={p50:.6f}|"
+                f"p95_ms={p95:.6f}|samples_ms="
+                + ",".join(f"{sample:.6f}" for sample in ordered),
+                flush=True,
+            )
+        dist.destroy_process_group()
+        return
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = mok_fp8_native.maybe_run_mok_fp8_native(
