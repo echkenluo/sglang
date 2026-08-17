@@ -92,6 +92,35 @@ def main() -> None:
     for name, duration in sorted(by_name.items(), key=lambda kv: -kv[1])[: args.top]:
         print(f"  {duration / 1000:>10.3f} ms  {name[:120]}")
 
+    # Timeline gaps: distinguish idle bubbles between kernels from the
+    # bucket-level span-minus-sum figure, which also counts pre/post-request
+    # idle inside the profiler window.
+    timeline = sorted(
+        (
+            (float(e["ts"]), float(e["ts"]) + float(e.get("dur", 0.0)),
+             e.get("name", "?"))
+            for e in events
+            if e.get("ph") == "X"
+            and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset", "gpu_op")
+        ),
+    )
+    gaps = []
+    cursor_end = None
+    cursor_name = ""
+    for start, end, name in timeline:
+        if cursor_end is not None and start > cursor_end:
+            gaps.append((start - cursor_end, cursor_name, name))
+        if cursor_end is None or end > cursor_end:
+            cursor_end = end
+            cursor_name = name
+    gaps.sort(reverse=True)
+    big = [g for g in gaps if g[0] >= 500.0]
+    small_sum = sum(g[0] for g in gaps if g[0] < 500.0)
+    print(f"-- gaps >=0.5ms: {len(big)}, sum={sum(g[0] for g in big)/1000:.3f} ms; "
+          f"sub-0.5ms gap total={small_sum/1000:.3f} ms --")
+    for duration, before, after in big[:20]:
+        print(f"  {duration/1000:>9.3f} ms  after [{before[:60]}] before [{after[:60]}]")
+
 
 if __name__ == "__main__":
     main()
