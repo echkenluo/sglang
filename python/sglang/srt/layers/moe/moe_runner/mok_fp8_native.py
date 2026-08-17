@@ -418,6 +418,9 @@ def _run_native_core(
                 copy_clusters=(
                     envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_COPY_CLUSTERS.get()
                 ),
+                # Full pipeline: keep the workspace lease held; the routed
+                # epilogue's last CTA releases it (gemm_combine_fused).
+                hold_lease=True,
             )
         )
     else:
