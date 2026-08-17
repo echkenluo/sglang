@@ -49,7 +49,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-_MOK_FP8_NUMERIC_AUDITED: set[tuple[object, str]] = set()
+_MOK_FP8_NUMERIC_AUDITED: set[tuple[object, str, int]] = set()
 
 
 def _audit_mok_fp8_output_once(
@@ -68,7 +68,9 @@ def _audit_mok_fp8_output_once(
     """Log one production-tensor MoK/DeepGEMM comparison per layer stage."""
     if not envs.SGLANG_OPT_MOK_FP8_NUMERIC_AUDIT.get():
         return
-    key = (layer_id, stage)
+    # Startup/decode and prefill exercise very different routed-M regimes.
+    # Retain one observation per aligned M so one does not mask the other.
+    key = (layer_id, stage, input_tensor.shape[0])
     if key in _MOK_FP8_NUMERIC_AUDITED:
         return
     if torch.cuda.is_current_stream_capturing():
