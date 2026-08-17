@@ -62,6 +62,8 @@ def _audit_mok_fp8_output_once(
     weight_scale: torch.Tensor,
     m_indices: torch.Tensor,
     mok_output: torch.Tensor,
+    routed_topk_ids: torch.Tensor,
+    aligned_rows_per_expert: list[int],
 ) -> None:
     """Log one production-tensor MoK/DeepGEMM comparison per layer stage."""
     if not envs.SGLANG_OPT_MOK_FP8_NUMERIC_AUDIT.get():
@@ -87,28 +89,59 @@ def _audit_mok_fp8_output_once(
         m_indices,
     )
 
-    delta = (mok_output.float() - deepgemm_output.float()).abs().flatten()
-    reference_norm = torch.linalg.vector_norm(deepgemm_output.float()).clamp_min(
-        1e-12
+    if sum(aligned_rows_per_expert) != input_tensor.shape[0]:
+        raise RuntimeError("aligned expert-row counts do not cover GEMM input")
+    routed_experts = routed_topk_ids[routed_topk_ids >= 0].to(torch.int64)
+    actual_rows_per_expert = torch.bincount(
+        routed_experts, minlength=weight.shape[0]
+    ).tolist()
+    valid_rows = torch.zeros(
+        input_tensor.shape[0], dtype=torch.bool, device=input_tensor.device
     )
+    row_start = 0
+    for actual_rows, aligned_rows in zip(
+        actual_rows_per_expert, aligned_rows_per_expert
+    ):
+        if actual_rows > aligned_rows:
+            raise RuntimeError("actual expert rows exceed aligned allocation")
+        valid_rows[row_start : row_start + actual_rows] = True
+        row_start += aligned_rows
+    if not valid_rows.any().item():
+        raise RuntimeError("numeric audit found no routed expert rows")
+
+    mok_valid = mok_output[valid_rows].float()
+    deepgemm_valid = deepgemm_output[valid_rows].float()
+    finite = torch.isfinite(mok_valid) & torch.isfinite(deepgemm_valid)
+    if not finite.all().item():
+        raise RuntimeError("numeric audit found non-finite valid-row output")
+    signed_delta = mok_valid - deepgemm_valid
+    delta = signed_delta.abs().flatten()
+    reference_norm = torch.linalg.vector_norm(deepgemm_valid).clamp_min(1e-12)
     relative_l2 = torch.linalg.vector_norm(
-        mok_output.float() - deepgemm_output.float()
+        signed_delta
     ) / reference_norm
-    exact_fraction = (mok_output == deepgemm_output).float().mean()
+    exact_fraction = (mok_valid == deepgemm_valid).float().mean()
+    # torch.quantile has a device-side element-count ceiling. A deterministic
+    # strided sample keeps this diagnostic valid for long-prefill routed M.
+    p95_stride = max(1, ceil_div(delta.numel(), 1_000_000))
+    p95_sample = delta[::p95_stride]
     logger.info(
         "MOK_FP8_NUMERIC_AUDIT|layer=%s|stage=%s|E=%d|M=%d|N=%d|K=%d|"
-        "exact=%.9f|mean_abs=%.9g|p95_abs=%.9g|max_abs=%.9g|rel_l2=%.9g",
+        "valid_M=%d|exact=%.9f|mean_abs=%.9g|p95_abs=%.9g|max_abs=%.9g|"
+        "rel_l2=%.9g|p95_sample=%d",
         layer_id,
         stage,
         weight.shape[0],
         input_tensor.shape[0],
         weight.shape[1],
         input_tensor.shape[1],
+        int(valid_rows.sum().item()),
         exact_fraction.item(),
         delta.mean().item(),
-        torch.quantile(delta, 0.95).item(),
+        torch.quantile(p95_sample, 0.95).item(),
         delta.max().item(),
         relative_l2.item(),
+        p95_sample.numel(),
     )
     _MOK_FP8_NUMERIC_AUDITED.add(key)
 
@@ -330,6 +363,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 weight_scale=quant_info.w13_scale,
                 m_indices=m_indices,
                 mok_output=gateup_output,
+                routed_topk_ids=running_state["topk_ids"],
+                aligned_rows_per_expert=running_state[
+                    "num_recv_tokens_per_expert"
+                ],
             )
         else:
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -429,6 +466,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 weight_scale=quant_info.w2_scale,
                 m_indices=m_indices,
                 mok_output=down_output,
+                routed_topk_ids=running_state["topk_ids"],
+                aligned_rows_per_expert=running_state[
+                    "num_recv_tokens_per_expert"
+                ],
             )
             global _MOK_FP8_CONTIG_REPORTED_ACTIVE
             if not _MOK_FP8_CONTIG_REPORTED_ACTIVE:
