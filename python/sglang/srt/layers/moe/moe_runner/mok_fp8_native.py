@@ -9,7 +9,7 @@ import os
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Optional
+from typing import NoReturn, Optional
 
 import torch
 import torch.distributed as dist
@@ -96,9 +96,41 @@ def _die_if_trapped(workspace, mok_functional) -> None:
         logger.error(record)
         logging.shutdown()
         os._exit(70)
+
+
+def _fatal_terminal_transaction_failure(
+    workspace,
+    mok_functional,
+    phase: str,
+    error: BaseException,
+) -> NoReturn:
+    """CPU-only endpoint for every exception after lease acquire is attempted.
+
+    The acquire kernel may already have set ``in_use`` and an arbitrary CUDA
+    exception may have poisoned the context.  Do not issue a release or any
+    other CUDA operation; format the host-mapped receipt and terminate so the
+    supervisor recreates the process/context.
+    """
+    try:
+        receipt = mok_functional.format_terminal_transaction_failure(
+            workspace, phase, error
+        )
+    except BaseException:
+        receipt = (
+            "MOK_TERMINAL_TRANSACTION_FATAL"
+            f"|phase={phase}|error_type={type(error).__name__}"
+        )
+    try:
+        logger.error(receipt)
+        logging.shutdown()
+    finally:
+        os._exit(70)
+
+
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
 _REPORTED_TERMINAL_LAYER_IDS: set[object] = set()
+_REPORTED_TERMINAL_QUANT_PREWARM: set[tuple] = set()
 _ROUTE_EXPERT_PADDING = 64
 _TERMINAL_DEEPEP_OUTER_ACTIVE: ContextVar[bool] = ContextVar(
     "mok_terminal_deepep_outer_active", default=False
@@ -850,8 +882,8 @@ def _run_terminal_eager(
 ) -> torch.Tensor:
     """Run the strict caller-owned-output terminal megakernel in eager mode."""
     from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8_out,
-        validate_sglang_per_token_group_quant_fp8_out,
+        launch_sglang_per_token_group_quant_fp8_out_prevalidated,
+        prewarm_sglang_per_token_group_quant_fp8_out,
     )
 
     output = torch.empty(
@@ -859,42 +891,60 @@ def _run_terminal_eager(
         dtype=torch.bfloat16,
         device=padded_hidden.device,
     )
-    validate_sglang_per_token_group_quant_fp8_out(
+    prewarm_receipt = prewarm_sglang_per_token_group_quant_fp8_out(
         padded_hidden,
         workspace.x_buffer,
         workspace.x_scale_buffer,
         128,
     )
-    mok_functional.acquire_megakernel_fp8_block_from_topk_lease(
-        workspace,
-        config,
-        layer.w13_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight,
-        layer.w2_weight_scale_inv,
-        padded_topk_weights,
-        padded_topk_ids,
-        output,
-        swiglu_limit=layer.moe_runner_config.swiglu_limit,
-    )
-    sglang_per_token_group_quant_fp8_out(
-        padded_hidden,
-        workspace.x_buffer,
-        workspace.x_scale_buffer,
-        128,
-    )
-    return mok_functional.megakernel_fp8_block_from_topk_preloaded_leased(
-        workspace,
-        config,
-        layer.w13_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight,
-        layer.w2_weight_scale_inv,
-        padded_topk_weights,
-        padded_topk_ids,
-        output,
-        swiglu_limit=layer.moe_runner_config.swiglu_limit,
-    )
+    if prewarm_receipt not in _REPORTED_TERMINAL_QUANT_PREWARM:
+        _REPORTED_TERMINAL_QUANT_PREWARM.add(prewarm_receipt)
+        logger.info(
+            "MOK_TERMINAL_QUANT_PREWARM|backend=%s|group=%d|pdl=%s",
+            prewarm_receipt[0],
+            prewarm_receipt[5],
+            str(prewarm_receipt[-1]).lower(),
+        )
+
+    phase = "acquire"
+    try:
+        mok_functional.acquire_megakernel_fp8_block_from_topk_lease(
+            workspace,
+            config,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            padded_topk_weights,
+            padded_topk_ids,
+            output,
+            swiglu_limit=layer.moe_runner_config.swiglu_limit,
+        )
+        phase = "quant"
+        launch_sglang_per_token_group_quant_fp8_out_prevalidated(
+            padded_hidden,
+            workspace.x_buffer,
+            workspace.x_scale_buffer,
+            128,
+            prewarm_receipt,
+        )
+        phase = "terminal"
+        return mok_functional.megakernel_fp8_block_from_topk_preloaded_leased(
+            workspace,
+            config,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            padded_topk_weights,
+            padded_topk_ids,
+            output,
+            swiglu_limit=layer.moe_runner_config.swiglu_limit,
+        )
+    except BaseException as error:
+        _fatal_terminal_transaction_failure(
+            workspace, mok_functional, phase, error
+        )
 
 
 def _capture_prefill_graph(
@@ -1018,6 +1068,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             "acquire_megakernel_fp8_block_from_topk_lease",
             "megakernel_fp8_block_from_topk_preloaded_leased",
             "format_trap_record",
+            "format_terminal_transaction_failure",
         )
     else:
         required_apis = (

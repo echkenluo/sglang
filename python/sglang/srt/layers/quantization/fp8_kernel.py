@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import threading
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -72,9 +73,11 @@ if _is_cuda or _is_musa:
         enable_sgl_per_token_group_quant_8bit = False
 
     from sglang.jit_kernel.per_token_group_quant_8bit import (
+        _jit_per_token_group_quant_8bit_module,
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
     )
     from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+        _jit_module as _jit_per_token_group_quant_8bit_v2_module,
         per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
 
@@ -134,6 +137,10 @@ else:
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
+
+
+_FP8_OUT_PREWARM_LOCK = threading.Lock()
+_FP8_OUT_PREWARM_RECEIPTS: set[tuple] = set()
 
 
 @register_custom_op(mutates_args=["C"])
@@ -511,6 +518,85 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
+def _resolve_sglang_per_token_group_quant_fp8_backend(
+    group_size: int,
+    enable_v2: Optional[bool],
+) -> tuple[str, bool]:
+    """Resolve the unchanged numerical backend before a terminal lease."""
+    # Enable v2 kernel by default on supported group sizes
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+
+    if enable_sgl_per_token_group_quant_8bit:
+        if enable_v2 and _is_musa:
+            return "aot_v2", True
+        if enable_v2:
+            return "jit_v2", True
+        return "jit_v1", False
+    if enable_v2:
+        raise RuntimeError(
+            "the legacy FP8 quant backend does not support the v2 kernel"
+        )
+    return "aot_legacy", False
+
+
+def _fp8_out_prewarm_key(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    group_size: int,
+    enable_v2: Optional[bool],
+) -> tuple:
+    backend, resolved_v2 = _resolve_sglang_per_token_group_quant_fp8_backend(
+        group_size, enable_v2
+    )
+    use_pdl = bool(is_arch_support_pdl()) if backend == "jit_v2" else False
+    return (
+        backend,
+        x.device.type,
+        x.device.index,
+        x.dtype,
+        x_q.dtype,
+        group_size,
+        resolved_v2,
+        use_pdl,
+    )
+
+
+def prewarm_sglang_per_token_group_quant_fp8_out(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    enable_v2: Optional[bool] = None,
+) -> tuple:
+    """Validate and materialize the exact out backend before lease acquire.
+
+    The returned immutable receipt is consumed by the terminal transaction.
+    A cold receipt is rejected during CUDA Graph capture: compilation/loading
+    must have completed in warmup, while no workspace lease is held.
+    """
+    validate_sglang_per_token_group_quant_fp8_out(x, x_q, x_s, group_size)
+    receipt = _fp8_out_prewarm_key(x, x_q, group_size, enable_v2)
+    with _FP8_OUT_PREWARM_LOCK:
+        if receipt in _FP8_OUT_PREWARM_RECEIPTS:
+            return receipt
+        if x.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "terminal FP8 quant backend must be prewarmed before capture"
+            )
+        backend = receipt[0]
+        if backend == "jit_v2":
+            _jit_per_token_group_quant_8bit_v2_module(
+                x.dtype, x_q.dtype, receipt[-1]
+            )
+        elif backend == "jit_v1":
+            _jit_per_token_group_quant_8bit_module(x.dtype, x_q.dtype)
+        # AOT backends were materialized by the sgl_kernel import above.
+        _FP8_OUT_PREWARM_RECEIPTS.add(receipt)
+    return receipt
+
+
 def _run_sglang_per_token_group_quant_fp8_out(
     x: torch.Tensor,
     x_q: torch.Tensor,
@@ -521,59 +607,59 @@ def _run_sglang_per_token_group_quant_fp8_out(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
+    resolved_backend: Optional[str] = None,
 ) -> None:
     """Run the existing quant kernel into preallocated output tensors."""
-    # Enable v2 kernel by default on supported group sizes
-    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
-    if enable_v2 is None:
-        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+    if resolved_backend is None:
+        backend, enable_v2 = _resolve_sglang_per_token_group_quant_fp8_backend(
+            group_size, enable_v2
+        )
+    else:
+        backend = resolved_backend
 
     if x.shape[0] > 0:
-        # Temporary
-        if enable_sgl_per_token_group_quant_8bit:
-            if enable_v2 and _is_musa:
-                # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
-                # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
-                # carries the USE_MUSA vector load/store fallbacks.
-                sgl_per_token_group_quant_8bit(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    scale_ue8m0,
-                    fuse_silu_and_mul,
-                    masked_m,
-                    enable_v2=True,
-                )
-            elif enable_v2:
-                sgl_per_token_group_quant_8bit_jit_v2(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    scale_ue8m0=scale_ue8m0,
-                    fuse_silu_and_mul=fuse_silu_and_mul,
-                    masked_m=masked_m,
-                )
-            else:
-                sgl_per_token_group_quant_8bit_jit(
-                    input=x,
-                    output_q=x_q,
-                    output_s=x_s,
-                    group_size=group_size,
-                    eps=eps,
-                    fp8_min=fp8_min,
-                    fp8_max=fp8_max,
-                    scale_ue8m0=scale_ue8m0,
-                )
+        if backend == "aot_v2":
+            # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
+            # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
+            # carries the USE_MUSA vector load/store fallbacks.
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+                enable_v2=True,
+            )
+        elif backend == "jit_v2":
+            sgl_per_token_group_quant_8bit_jit_v2(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0=scale_ue8m0,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=masked_m,
+            )
+        elif backend == "jit_v1":
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q,
+                output_s=x_s,
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=scale_ue8m0,
+            )
         else:
-            assert not enable_v2
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
@@ -650,6 +736,38 @@ def sglang_per_token_group_quant_fp8_out(
         fuse_silu_and_mul=False,
         masked_m=None,
         enable_v2=enable_v2,
+    )
+
+
+def launch_sglang_per_token_group_quant_fp8_out_prevalidated(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    prewarm_receipt: tuple,
+    eps: float = 1e-10,
+) -> None:
+    """Launch a validated, materialized backend inside a terminal lease.
+
+    This entry deliberately performs no tensor/layout validation and no JIT
+    materialization.  The caller must pass the exact receipt returned by
+    :func:`prewarm_sglang_per_token_group_quant_fp8_out` before acquiring the
+    terminal workspace.  A missing receipt is a transaction-fatal invariant
+    failure at the caller boundary.
+    """
+    if prewarm_receipt not in _FP8_OUT_PREWARM_RECEIPTS:
+        raise RuntimeError("terminal FP8 quant prewarm receipt is not active")
+    _run_sglang_per_token_group_quant_fp8_out(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_m=None,
+        enable_v2=bool(prewarm_receipt[6]),
+        resolved_backend=str(prewarm_receipt[0]),
     )
 
 

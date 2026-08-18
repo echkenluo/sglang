@@ -10,6 +10,7 @@ TERMINAL_RUNNER = (
     ROOT / "python/sglang/srt/layers/moe/moe_runner/mok_fp8_native.py"
 )
 JIT_V2 = ROOT / "python/sglang/jit_kernel/per_token_group_quant_8bit_v2.py"
+JIT_V1 = ROOT / "python/sglang/jit_kernel/per_token_group_quant_8bit.py"
 AOT_SCHEMA = ROOT / "sgl-kernel/csrc/common_extension.cc"
 
 
@@ -49,8 +50,9 @@ def test_quant_out_reuses_the_allocating_numerical_dispatch():
 
 
 def test_quant_backends_declare_caller_owned_outputs_mutated():
-    jit = JIT_V2.read_text()
-    assert 'mutates_args=["output_q", "output_s"]' in jit
+    for jit_path in (JIT_V1, JIT_V2):
+        jit = jit_path.read_text()
+        assert 'mutates_args=["output_q", "output_s"]' in jit
     schema = AOT_SCHEMA.read_text()
     assert (
         "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, "
@@ -65,10 +67,10 @@ def test_quant_backends_declare_caller_owned_outputs_mutated():
 def test_terminal_quantization_is_inside_the_workspace_lease():
     runner = _function_source(TERMINAL_RUNNER, "_run_terminal_eager")
     ordered = (
-        "\n    validate_sglang_per_token_group_quant_fp8_out(",
-        "\n    mok_functional.acquire_megakernel_fp8_block_from_topk_lease(",
-        "\n    sglang_per_token_group_quant_fp8_out(",
-        "\n    return mok_functional."
+        "\n    prewarm_receipt = prewarm_sglang_per_token_group_quant_fp8_out(",
+        "\n        mok_functional.acquire_megakernel_fp8_block_from_topk_lease(",
+        "\n        launch_sglang_per_token_group_quant_fp8_out_prevalidated(",
+        "\n        return mok_functional."
         "megakernel_fp8_block_from_topk_preloaded_leased(",
     )
     positions = [runner.find(needle) for needle in ordered]
@@ -82,3 +84,40 @@ def test_terminal_quantization_is_inside_the_workspace_lease():
         "release_workspace_lease(",
     ):
         assert forbidden not in runner
+    assert "except BaseException as error:" in runner
+    assert "_fatal_terminal_transaction_failure(" in runner
+
+
+def test_quant_prewarm_materializes_before_capture_and_returns_receipt():
+    prewarm = _function_source(
+        FP8_KERNEL, "prewarm_sglang_per_token_group_quant_fp8_out"
+    )
+    assert "validate_sglang_per_token_group_quant_fp8_out(" in prewarm
+    assert "torch.cuda.is_current_stream_capturing()" in prewarm
+    assert "must be prewarmed before capture" in prewarm
+    assert "_jit_per_token_group_quant_8bit_v2_module(" in prewarm
+    assert "_jit_per_token_group_quant_8bit_module(" in prewarm
+    assert "_FP8_OUT_PREWARM_RECEIPTS.add(receipt)" in prewarm
+
+    launch = _function_source(
+        FP8_KERNEL,
+        "launch_sglang_per_token_group_quant_fp8_out_prevalidated",
+    )
+    assert "validate_sglang_per_token_group_quant_fp8_out(" not in launch
+    assert "_run_sglang_per_token_group_quant_fp8_out(" in launch
+    assert "resolved_backend=str(prewarm_receipt[0])" in launch
+
+
+def test_post_acquire_failure_endpoint_is_cpu_only_and_unconditional():
+    fatal = _function_source(
+        TERMINAL_RUNNER, "_fatal_terminal_transaction_failure"
+    )
+    assert "format_terminal_transaction_failure(" in fatal
+    assert "except BaseException:" in fatal
+    assert "os._exit(70)" in fatal
+    for forbidden in (
+        "release_workspace_lease(",
+        "torch.cuda",
+        "synchronize(",
+    ):
+        assert forbidden not in fatal
