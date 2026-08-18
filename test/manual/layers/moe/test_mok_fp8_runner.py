@@ -559,10 +559,10 @@ def test_mok_fp8_terminal_eager_padding_is_route_stable():
 def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
     terminal_source = inspect.getsource(mok_fp8_native._run_terminal_eager)
     ordered = (
-        "\n    validate_sglang_per_token_group_quant_fp8_out(",
-        "\n    mok_functional.acquire_megakernel_fp8_block_from_topk_lease(",
-        "\n    sglang_per_token_group_quant_fp8_out(",
-        "\n    return mok_functional."
+        "\n    prewarm_receipt = prewarm_sglang_per_token_group_quant_fp8_out(",
+        "\n        mok_functional.acquire_megakernel_fp8_block_from_topk_lease(",
+        "\n        launch_sglang_per_token_group_quant_fp8_out_prevalidated(",
+        "\n        return mok_functional."
         "megakernel_fp8_block_from_topk_preloaded_leased(",
     )
     positions = [terminal_source.find(needle) for needle in ordered]
@@ -580,6 +580,8 @@ def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
         "release_workspace_lease(",
     ):
         assert forbidden not in terminal_source
+    assert "except BaseException as error:" in terminal_source
+    assert "_fatal_terminal_transaction_failure(" in terminal_source
 
     adapter_source = inspect.getsource(mok_fp8_native.maybe_run_mok_fp8_native)
     terminal_return = adapter_source.find("return output[:num_tokens]")
@@ -612,6 +614,113 @@ def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
     )
     legacy_dispatch = deepep_impl_source.find("self.dispatcher.dispatch")
     assert 0 <= terminal_dispatch < legacy_dispatch
+
+
+class _InjectedTerminalFatalExit(BaseException):
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+@pytest.mark.parametrize(
+    "injected",
+    (RuntimeError("quant-runtime"), ValueError("quant-value")),
+    ids=("runtime-error", "non-runtime-error"),
+)
+def test_mok_terminal_post_acquire_quant_failure_is_fatal(
+    monkeypatch, injected
+):
+    from sglang.srt.layers.quantization import fp8_kernel
+
+    events = []
+    receipt = (
+        "jit_v2",
+        "cpu",
+        None,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        128,
+        True,
+        False,
+    )
+
+    def prewarm(*args, **kwargs):
+        events.append("prewarm")
+        return receipt
+
+    def fail_quant(*args, **kwargs):
+        events.append("quant")
+        raise injected
+
+    monkeypatch.setattr(
+        fp8_kernel,
+        "prewarm_sglang_per_token_group_quant_fp8_out",
+        prewarm,
+    )
+    monkeypatch.setattr(
+        fp8_kernel,
+        "launch_sglang_per_token_group_quant_fp8_out_prevalidated",
+        fail_quant,
+    )
+    monkeypatch.setattr(
+        mok_fp8_native, "_REPORTED_TERMINAL_QUANT_PREWARM", set()
+    )
+
+    class FakeMoKFunctional:
+        @staticmethod
+        def acquire_megakernel_fp8_block_from_topk_lease(*args, **kwargs):
+            events.append("acquire")
+
+        @staticmethod
+        def megakernel_fp8_block_from_topk_preloaded_leased(*args, **kwargs):
+            events.append("terminal")
+            raise AssertionError("terminal must not run after quant failure")
+
+        @staticmethod
+        def format_terminal_transaction_failure(workspace, phase, error):
+            events.append(f"format:{phase}:{type(error).__name__}")
+            return "MOK_TERMINAL_TRANSACTION_FATAL|injected=1"
+
+    def fatal_exit(code):
+        events.append(f"exit:{code}")
+        raise _InjectedTerminalFatalExit(code)
+
+    monkeypatch.setattr(logging, "shutdown", lambda: events.append("shutdown"))
+    monkeypatch.setattr(os, "_exit", fatal_exit)
+    workspace = SimpleNamespace(
+        x_buffer=torch.empty((2, 4096), dtype=torch.float8_e4m3fn),
+        x_scale_buffer=torch.empty((2, 32), dtype=torch.float32),
+    )
+    layer = SimpleNamespace(
+        w13_weight=object(),
+        w13_weight_scale_inv=object(),
+        w2_weight=object(),
+        w2_weight_scale_inv=object(),
+        moe_runner_config=SimpleNamespace(swiglu_limit=10.0),
+    )
+    padded_hidden = torch.empty((2, 4096), dtype=torch.bfloat16)
+    padded_ids = torch.zeros((2, 6), dtype=torch.int32)
+    padded_weights = torch.zeros((2, 6), dtype=torch.float32)
+
+    with pytest.raises(_InjectedTerminalFatalExit) as fatal:
+        mok_fp8_native._run_terminal_eager(
+            layer,
+            workspace,
+            FakeMoKFunctional,
+            object(),
+            padded_hidden,
+            padded_ids,
+            padded_weights,
+        )
+    assert fatal.value.code == 70
+    assert events == [
+        "prewarm",
+        "acquire",
+        "quant",
+        f"format:quant:{type(injected).__name__}",
+        "shutdown",
+        "exit:70",
+    ]
 
 
 def test_mok_fp8_native_trap_watchdog_shutdown_is_idempotent_and_restartable():
