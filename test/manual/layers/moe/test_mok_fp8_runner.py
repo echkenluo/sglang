@@ -558,11 +558,23 @@ def test_mok_fp8_terminal_eager_padding_is_route_stable():
 
 def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
     terminal_source = inspect.getsource(mok_fp8_native._run_terminal_eager)
-    assert "megakernel_fp8_block_from_topk(" in terminal_source
-    assert "sglang_per_token_group_quant_fp8(" in terminal_source
+    ordered = (
+        "\n    validate_sglang_per_token_group_quant_fp8_out(",
+        "\n    mok_functional.acquire_megakernel_fp8_block_from_topk_lease(",
+        "\n    sglang_per_token_group_quant_fp8_out(",
+        "\n    return mok_functional."
+        "megakernel_fp8_block_from_topk_preloaded_leased(",
+    )
+    positions = [terminal_source.find(needle) for needle in ordered]
+    assert all(position >= 0 for position in positions)
+    assert positions == sorted(positions)
     for forbidden in (
         "torch.cat(",
         ".clone(",
+        "sglang_per_token_group_quant_fp8(",
+        "megakernel_fp8_block_from_topk(",
+        "workspace.x_buffer.copy_(",
+        "workspace.x_scale_buffer.copy_(",
         "dispatch_gemm_fused_fp8_block(",
         "gemm_combine_fused_fp8_block(",
         "release_workspace_lease(",
