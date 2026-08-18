@@ -901,9 +901,9 @@ def _run_terminal_eager(
         _REPORTED_TERMINAL_QUANT_PREWARM.add(prewarm_receipt)
         logger.info(
             "MOK_TERMINAL_QUANT_PREWARM|backend=%s|group=%d|pdl=%s",
-            prewarm_receipt[0],
-            prewarm_receipt[5],
-            str(prewarm_receipt[-1]).lower(),
+            prewarm_receipt.contract.backend,
+            prewarm_receipt.contract.group_size,
+            str(prewarm_receipt.use_pdl).lower(),
         )
 
     phase = "acquire"
@@ -925,7 +925,6 @@ def _run_terminal_eager(
             padded_hidden,
             workspace.x_buffer,
             workspace.x_scale_buffer,
-            128,
             prewarm_receipt,
         )
         phase = "terminal"

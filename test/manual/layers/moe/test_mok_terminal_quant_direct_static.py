@@ -62,6 +62,8 @@ def test_quant_backends_declare_caller_owned_outputs_mutated():
         "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, "
         "Tensor! output_s"
     ) in schema
+    jit_v2 = JIT_V2.read_text()
+    assert "_jit_module(input.dtype, output_q.dtype, use_pdl)" in jit_v2
 
 
 def test_terminal_quantization_is_inside_the_workspace_lease():
@@ -97,7 +99,16 @@ def test_quant_prewarm_materializes_before_capture_and_returns_receipt():
     assert "must be prewarmed before capture" in prewarm
     assert "_jit_per_token_group_quant_8bit_v2_module(" in prewarm
     assert "_jit_per_token_group_quant_8bit_module(" in prewarm
-    assert "_FP8_OUT_PREWARM_RECEIPTS.add(receipt)" in prewarm
+    ordered = (
+        "scratch_q = torch.empty_like(x_q)",
+        "_run_sglang_per_token_group_quant_fp8_out(",
+        "_synchronize_fp8_out_prewarm(x)",
+        "_FP8_OUT_PREWARM_RECEIPTS[contract] = receipt",
+    )
+    positions = [prewarm.find(needle) for needle in ordered]
+    assert all(position >= 0 for position in positions)
+    assert positions == sorted(positions)
+    assert "resolved_use_pdl=receipt.use_pdl" in prewarm
 
     launch = _function_source(
         FP8_KERNEL,
@@ -105,7 +116,8 @@ def test_quant_prewarm_materializes_before_capture_and_returns_receipt():
     )
     assert "validate_sglang_per_token_group_quant_fp8_out(" not in launch
     assert "_run_sglang_per_token_group_quant_fp8_out(" in launch
-    assert "resolved_backend=str(prewarm_receipt[0])" in launch
+    assert "resolved_backend=contract.backend" in launch
+    assert "resolved_use_pdl=prewarm_receipt.use_pdl" in launch
 
 
 def test_post_acquire_failure_endpoint_is_cpu_only_and_unconditional():
