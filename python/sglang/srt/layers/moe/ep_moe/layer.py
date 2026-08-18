@@ -46,6 +46,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
+def _reject_terminal_split_entry(entry: str) -> None:
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+        raise RuntimeError(
+            "strict full-native MoK contract rejected: "
+            f"DeepEPMoE.{entry} bypasses the terminal adapter"
+        )
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -152,6 +160,12 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        # Terminal MoK is a strict replacement for the DeepEP routed-expert
+        # implementation.  Intercept it before this subclass' piecewise
+        # custom-op dispatch; otherwise DeepEPMoE.forward_impl may silently
+        # select the legacy dispatcher when deprecate_flag is false.
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            return super().forward_impl(hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
@@ -171,7 +185,11 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-
+        # Some model/custom-op paths call forward_impl directly.  Keep the
+        # same terminal interception here so no value of deprecate_flag can
+        # re-enable the legacy DeepEP dispatch/combine chain.
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            return super().forward_impl(hidden_states, topk_output)
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,
@@ -189,6 +207,7 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        _reject_terminal_split_entry("dispatch")
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -198,6 +217,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
+        _reject_terminal_split_entry("run_moe_core")
 
         if self.deprecate_flag:
             return super().run_moe_core(dispatch_output)
@@ -230,6 +250,12 @@ class DeepEPMoE(FusedMoE):
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
         )
+
+    def forward_deferred_finalize(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ):
+        _reject_terminal_split_entry("forward_deferred_finalize")
+        return super().forward_deferred_finalize(hidden_states, topk_output)
 
     def combine(
         self,

@@ -861,6 +861,35 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            # The terminal specialization is defined only for the DeepEP
+            # outer below.  Do not let MegaMoE or either forward_normal path
+            # consume its routed-only output with different scale/reduction
+            # semantics.
+            from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+                _terminal_graph_context_error,
+            )
+
+            if graph_error := _terminal_graph_context_error():
+                raise RuntimeError(
+                    f"strict full-native MoK contract rejected: {graph_error}"
+                )
+            if should_use_mega_moe(self, hidden_states):
+                raise RuntimeError("terminal MoK is incompatible with MegaMoE")
+            if not self._enable_a2a_moe or not get_moe_a2a_backend().is_deepep():
+                raise RuntimeError(
+                    "terminal MoK requires the DeepSeekV2 DeepEP outer path"
+                )
+            if forward_batch is None:
+                raise RuntimeError("terminal MoK requires a DeepEP ForwardBatch")
+            if skip_shared_experts:
+                raise RuntimeError(
+                    "terminal MoK requires the DeepEP outer shared-expert add"
+                )
+            return self.forward_deepep(
+                hidden_states, forward_batch, input_ids_global=input_ids_global
+            )
+
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
                 self,
@@ -1395,10 +1424,24 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            # Terminal MoK produces the routed contribution only.  Mark this
+            # exact outer path so its strict contract can rely on the routed
+            # scaling and separate shared-expert add immediately below.
+            from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+                terminal_deepep_outer_context,
+            )
+
+            with terminal_deepep_outer_context():
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    topk_output=topk_output,
+                )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if (
             hidden_states.shape[0] > 0
@@ -1436,6 +1479,11 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            raise RuntimeError(
+                "strict full-native MoK contract rejected: decomposed "
+                "SBO/TBO MoE execution bypasses the terminal adapter"
+            )
         if state.hidden_states_mlp_input.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             state.router_logits = self.gate(state.hidden_states_mlp_input)

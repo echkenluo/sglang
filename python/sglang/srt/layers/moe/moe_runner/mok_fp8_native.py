@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 import torch
@@ -97,6 +99,54 @@ def _die_if_trapped(workspace, mok_functional) -> None:
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
 _ROUTE_EXPERT_PADDING = 64
+_TERMINAL_DEEPEP_OUTER_ACTIVE: ContextVar[bool] = ContextVar(
+    "mok_terminal_deepep_outer_active", default=False
+)
+
+
+@contextmanager
+def terminal_deepep_outer_context():
+    """Mark the exact DeepSeekV2 DeepEP outer semantics for terminal MoK.
+
+    The terminal kernel returns the routed-expert contribution.  The enclosing
+    DeepseekV2MoE.forward_deepep path owns routed_scaling_factor and the shared
+    expert add.  Keeping this explicit prevents another FusedMoE caller from
+    accidentally treating the routed output as a fully finalized model output.
+    """
+    token = _TERMINAL_DEEPEP_OUTER_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _TERMINAL_DEEPEP_OUTER_ACTIVE.reset(token)
+
+
+def _terminal_deepep_backend_is_active() -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return get_moe_a2a_backend().is_deepep()
+
+
+def _terminal_graph_context_error() -> Optional[str]:
+    """Reject every SGLang graph context, not only active CUDA capture."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    if is_in_tc_piecewise_cuda_graph():
+        return "terminal MoK is eager-only and rejects tc_piecewise CUDA graph"
+    if is_in_breakable_cuda_graph():
+        return "terminal MoK is eager-only and rejects breakable CUDA graph"
+    if get_is_capture_mode():
+        return "terminal MoK is eager-only and rejects whole-model graph capture"
+    if torch.cuda.is_current_stream_capturing():
+        return "terminal MoK is eager-only and rejects active CUDA graph capture"
+    return None
 
 
 def native_shape_contract_error(
@@ -270,6 +320,20 @@ def native_terminal_contract_error(
     layer, hidden_states, topk_output
 ) -> Optional[str]:
     """Validate the exact eager terminal DeepSeek-V4 specialization."""
+    # The production target deliberately retains the DeepSeekV2 DeepEP outer
+    # path: terminal MoK replaces only its routed-expert implementation, while
+    # that outer applies routed_scaling_factor and adds the separate shared
+    # expert.  No other FusedMoE caller has the same finalization semantics.
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+
+    if not isinstance(layer, DeepEPMoE):
+        return "terminal MoK requires the DeepEPMoE production layer"
+    if not _terminal_deepep_backend_is_active():
+        return "terminal MoK requires --moe-a2a-backend deepep"
+    if not _TERMINAL_DEEPEP_OUTER_ACTIVE.get():
+        return "terminal MoK requires DeepseekV2MoE.forward_deepep outer semantics"
+    if getattr(layer, "reduce_results", False):
+        return "terminal MoK routed output must not be all-reduced inside FusedMoE"
     if getattr(layer, "num_fused_shared_experts", 0) != 0 or getattr(
         layer, "_has_fused_shared", False
     ):
@@ -829,12 +893,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     )
     if terminal_mode and reason is None:
         reason = _terminal_mode_config_error()
-    if (
-        terminal_mode
-        and reason is None
-        and torch.cuda.is_current_stream_capturing()
-    ):
-        reason = "terminal MoK is eager-only and cannot run during graph capture"
+    if terminal_mode and reason is None:
+        reason = _terminal_graph_context_error()
     if reason is None and dist.get_world_size(group) != layer.moe_ep_size:
         reason = "the MoK process group must match moe_ep_size"
     strict_contract = terminal_mode or envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.get()

@@ -12,6 +12,8 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner import mok_fp8_native
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
@@ -25,8 +27,10 @@ from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _conservative_route_capacity_factor,
     _pad_eager_inputs,
     _route_padding_config,
+    _terminal_graph_context_error,
     native_shape_contract_error,
     native_terminal_contract_error,
+    terminal_deepep_outer_context,
 )
 
 
@@ -109,25 +113,31 @@ def test_mok_fp8_native_strict_contract_skips_collective():
 
 
 def _terminal_contract_fixture():
-    layer = SimpleNamespace(
-        moe_ep_size=4,
-        num_experts=256,
-        num_local_experts=64,
-        num_fused_shared_experts=0,
-        _has_fused_shared=False,
-        quant_method=SimpleNamespace(load_up_proj_weight_first=False),
-        w13_weight=torch.empty(
-            (64, 4096, 4096), dtype=torch.float8_e4m3fn, device="meta"
-        ),
-        w13_weight_scale_inv=torch.empty(
-            (64, 32, 32), dtype=torch.float32, device="meta"
-        ),
-        w2_weight=torch.empty(
-            (64, 4096, 2048), dtype=torch.float8_e4m3fn, device="meta"
-        ),
-        w2_weight_scale_inv=torch.empty(
-            (64, 32, 16), dtype=torch.float32, device="meta"
-        ),
+    layer = DeepEPMoE.__new__(DeepEPMoE)
+    torch.nn.Module.__init__(layer)
+    layer.moe_ep_size = 4
+    layer.num_experts = 256
+    layer.num_local_experts = 64
+    layer.num_fused_shared_experts = 0
+    layer._has_fused_shared = False
+    layer.reduce_results = False
+    layer.deprecate_flag = False
+    layer.quant_method = SimpleNamespace(load_up_proj_weight_first=False)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.empty((64, 4096, 4096), dtype=torch.float8_e4m3fn, device="meta"),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.empty((64, 32, 32), dtype=torch.float32, device="meta"),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.empty((64, 4096, 2048), dtype=torch.float8_e4m3fn, device="meta"),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.empty((64, 32, 16), dtype=torch.float32, device="meta"),
+        requires_grad=False,
     )
     hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
     topk_output = SimpleNamespace(
@@ -143,23 +153,171 @@ def test_mok_fp8_terminal_exact_contract(monkeypatch):
         "native_runtime_contract_error",
         lambda layer, hidden_states, topk_output: None,
     )
+    monkeypatch.setattr(
+        mok_fp8_native, "_terminal_deepep_backend_is_active", lambda: True
+    )
     layer, hidden_states, topk_output = _terminal_contract_fixture()
-    assert native_terminal_contract_error(layer, hidden_states, topk_output) is None
+    with terminal_deepep_outer_context():
+        assert (
+            native_terminal_contract_error(layer, hidden_states, topk_output) is None
+        )
 
-    layer.num_fused_shared_experts = 1
-    assert "shared-expert fusion disabled" in native_terminal_contract_error(
+        layer.num_fused_shared_experts = 1
+        assert "shared-expert fusion disabled" in native_terminal_contract_error(
+            layer, hidden_states, topk_output
+        )
+        layer.num_fused_shared_experts = 0
+        layer.quant_method.load_up_proj_weight_first = True
+        assert "gate-then-up" in native_terminal_contract_error(
+            layer, hidden_states, topk_output
+        )
+        layer.quant_method.load_up_proj_weight_first = False
+        layer.moe_ep_size = 8
+        assert "EP4" in native_terminal_contract_error(
+            layer, hidden_states, topk_output
+        )
+
+
+def test_mok_fp8_terminal_outer_contract_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        mok_fp8_native,
+        "native_runtime_contract_error",
+        lambda layer, hidden_states, topk_output: None,
+    )
+    layer, hidden_states, topk_output = _terminal_contract_fixture()
+
+    monkeypatch.setattr(
+        mok_fp8_native, "_terminal_deepep_backend_is_active", lambda: True
+    )
+    assert "forward_deepep outer semantics" in native_terminal_contract_error(
         layer, hidden_states, topk_output
     )
-    layer.num_fused_shared_experts = 0
-    layer.quant_method.load_up_proj_weight_first = True
-    assert "gate-then-up" in native_terminal_contract_error(
-        layer, hidden_states, topk_output
+
+    with terminal_deepep_outer_context():
+        monkeypatch.setattr(
+            mok_fp8_native, "_terminal_deepep_backend_is_active", lambda: False
+        )
+        assert "--moe-a2a-backend deepep" in native_terminal_contract_error(
+            layer, hidden_states, topk_output
+        )
+        monkeypatch.setattr(
+            mok_fp8_native, "_terminal_deepep_backend_is_active", lambda: True
+        )
+        layer.reduce_results = True
+        assert "must not be all-reduced" in native_terminal_contract_error(
+            layer, hidden_states, topk_output
+        )
+
+    with terminal_deepep_outer_context():
+        assert "DeepEPMoE production layer" in native_terminal_contract_error(
+            SimpleNamespace(), hidden_states, topk_output
+        )
+
+
+def test_mok_fp8_terminal_deepep_override_cannot_fall_back(monkeypatch):
+    layer = DeepEPMoE.__new__(DeepEPMoE)
+    torch.nn.Module.__init__(layer)
+    layer.deprecate_flag = False
+    calls = []
+    marker = object()
+
+    def terminal_base_forward(self, hidden_states, topk_output):
+        calls.append((hidden_states, topk_output))
+        return marker
+
+    monkeypatch.setattr(FusedMoE, "forward_impl", terminal_base_forward)
+    with envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.override(True):
+        assert layer.forward("hidden", "topk") is marker
+        assert layer.forward_impl("hidden-impl", "topk-impl") is marker
+    assert calls == [("hidden", "topk"), ("hidden-impl", "topk-impl")]
+
+
+def test_mok_fp8_terminal_rejects_split_entry_points():
+    from sglang.srt.models import deepseek_v2
+
+    layer = DeepEPMoE.__new__(DeepEPMoE)
+    torch.nn.Module.__init__(layer)
+    moe = deepseek_v2.DeepseekV2MoE.__new__(deepseek_v2.DeepseekV2MoE)
+    torch.nn.Module.__init__(moe)
+
+    with envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.override(True):
+        for call, name in (
+            (lambda: layer.dispatch("hidden", "topk"), "dispatch"),
+            (lambda: layer.run_moe_core("dispatch-output"), "run_moe_core"),
+            (
+                lambda: layer.forward_deferred_finalize("hidden", "topk"),
+                "forward_deferred_finalize",
+            ),
+        ):
+            with pytest.raises(RuntimeError, match=name):
+                call()
+        with pytest.raises(RuntimeError, match="SBO/TBO"):
+            moe.op_gate(object())
+
+
+def test_mok_fp8_terminal_selects_only_deepep_outer(monkeypatch):
+    from sglang.srt.layers.moe import mega_moe
+    from sglang.srt.models import deepseek_v2
+
+    moe = deepseek_v2.DeepseekV2MoE.__new__(deepseek_v2.DeepseekV2MoE)
+    torch.nn.Module.__init__(moe)
+    moe._enable_a2a_moe = True
+    calls = []
+    marker = object()
+
+    monkeypatch.setattr(mega_moe, "should_use_mega_moe", lambda *args: False)
+    monkeypatch.setattr(
+        deepseek_v2,
+        "get_moe_a2a_backend",
+        lambda: SimpleNamespace(is_deepep=lambda: True),
     )
-    layer.quant_method.load_up_proj_weight_first = False
-    layer.moe_ep_size = 8
-    assert "EP4" in native_terminal_contract_error(
-        layer, hidden_states, topk_output
+    monkeypatch.setattr(
+        mok_fp8_native, "_terminal_graph_context_error", lambda: None
     )
+
+    def forward_deepep(self, hidden_states, forward_batch, input_ids_global=None):
+        calls.append((hidden_states, forward_batch, input_ids_global))
+        return marker
+
+    monkeypatch.setattr(deepseek_v2.DeepseekV2MoE, "forward_deepep", forward_deepep)
+    with envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.override(True):
+        assert (
+            moe.forward(
+                "hidden",
+                forward_batch="forward-batch",
+                input_ids_global="input-ids",
+            )
+            is marker
+        )
+    assert calls == [("hidden", "forward-batch", "input-ids")]
+
+    moe._enable_a2a_moe = False
+    with (
+        envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.override(True),
+        pytest.raises(RuntimeError, match="requires the DeepSeekV2 DeepEP outer"),
+    ):
+        moe.forward("hidden", forward_batch="forward-batch")
+
+
+def test_mok_fp8_terminal_rejects_all_graph_contexts(monkeypatch):
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        enable_tc_piecewise_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with enable_tc_piecewise_cuda_graph():
+        assert "tc_piecewise" in _terminal_graph_context_error()
+    with enable_breakable_cuda_graph():
+        assert "breakable" in _terminal_graph_context_error()
+    with model_capture_mode():
+        assert "whole-model" in _terminal_graph_context_error()
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert "active CUDA graph" in _terminal_graph_context_error()
 
 
 def test_mok_fp8_terminal_eager_padding_is_route_stable():
@@ -207,6 +365,22 @@ def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
         "is_in_tc_piecewise_cuda_graph"
     )
     assert 0 <= terminal_dispatch < piecewise_dispatch
+
+    deepep_forward_source = inspect.getsource(DeepEPMoE.forward)
+    terminal_dispatch = deepep_forward_source.find(
+        "SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL"
+    )
+    piecewise_dispatch = deepep_forward_source.find(
+        "is_in_tc_piecewise_cuda_graph"
+    )
+    assert 0 <= terminal_dispatch < piecewise_dispatch
+
+    deepep_impl_source = inspect.getsource(DeepEPMoE.forward_impl)
+    terminal_dispatch = deepep_impl_source.find(
+        "SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL"
+    )
+    legacy_dispatch = deepep_impl_source.find("self.dispatcher.dispatch")
+    assert 0 <= terminal_dispatch < legacy_dispatch
 
 
 def test_mok_fp8_native_trap_watchdog_shutdown_is_idempotent_and_restartable():
