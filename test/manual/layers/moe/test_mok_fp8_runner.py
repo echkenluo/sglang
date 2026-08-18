@@ -258,13 +258,16 @@ def test_mok_fp8_terminal_rejects_split_entry_points():
 
 def test_mok_fp8_terminal_selects_only_deepep_outer(monkeypatch):
     from sglang.srt.layers.moe import mega_moe
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.models import deepseek_v2
 
     moe = deepseek_v2.DeepseekV2MoE.__new__(deepseek_v2.DeepseekV2MoE)
     torch.nn.Module.__init__(moe)
     moe._enable_a2a_moe = True
     calls = []
+    graph_modes = []
     marker = object()
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
     monkeypatch.setattr(mega_moe, "should_use_mega_moe", lambda *args: False)
     monkeypatch.setattr(
@@ -273,7 +276,9 @@ def test_mok_fp8_terminal_selects_only_deepep_outer(monkeypatch):
         lambda: SimpleNamespace(is_deepep=lambda: True),
     )
     monkeypatch.setattr(
-        mok_fp8_native, "_terminal_graph_context_error", lambda: None
+        mok_fp8_native,
+        "_terminal_graph_context_error",
+        lambda forward_mode=None: graph_modes.append(forward_mode),
     )
 
     def forward_deepep(self, hidden_states, forward_batch, input_ids_global=None):
@@ -285,45 +290,200 @@ def test_mok_fp8_terminal_selects_only_deepep_outer(monkeypatch):
         assert (
             moe.forward(
                 "hidden",
-                forward_batch="forward-batch",
+                forward_batch=forward_batch,
                 input_ids_global="input-ids",
             )
             is marker
         )
-    assert calls == [("hidden", "forward-batch", "input-ids")]
+    assert calls == [("hidden", forward_batch, "input-ids")]
+    assert graph_modes == [ForwardMode.DECODE]
 
     moe._enable_a2a_moe = False
     with (
         envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.override(True),
         pytest.raises(RuntimeError, match="requires the DeepSeekV2 DeepEP outer"),
     ):
-        moe.forward("hidden", forward_batch="forward-batch")
+        moe.forward("hidden", forward_batch=forward_batch)
 
 
-def test_mok_fp8_terminal_rejects_all_graph_contexts(monkeypatch):
+def _concurrency_server_args(**overrides):
+    values = dict(
+        enable_pdmux=False,
+        enable_two_batch_overlap=False,
+        enable_single_batch_overlap=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("enable_pdmux", "PDMux concurrent graph streams"),
+        ("enable_two_batch_overlap", "two-batch overlap (TBO)"),
+        ("enable_single_batch_overlap", "single-batch overlap (SBO)"),
+    ],
+)
+def test_mok_fp8_terminal_rejects_concurrent_modes(
+    monkeypatch, field, message
+):
+    from sglang.srt import runtime_context
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        full_decode_cuda_graph_mode,
+        model_capture_mode,
+    )
+
+    server_args = _concurrency_server_args(**{field: True})
+    monkeypatch.setattr(runtime_context, "get_server_args", lambda: server_args)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with (
+        envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.override(False),
+        envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.override(False),
+        envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.override(False),
+    ):
+        assert message in mok_fp8_native._terminal_mode_config_error()
+        with model_capture_mode(), full_decode_cuda_graph_mode():
+            assert message in _terminal_graph_context_error(ForwardMode.DECODE)
+
+
+def test_mok_fp8_terminal_concurrency_config_is_fail_closed(monkeypatch):
+    from sglang.srt import runtime_context
+
+    def no_server_args():
+        raise ValueError("Global server args is not set yet!")
+
+    monkeypatch.setattr(runtime_context, "get_server_args", no_server_args)
+    assert mok_fp8_native._terminal_concurrency_mode_error() is None
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_server_args",
+        lambda: SimpleNamespace(enable_pdmux=False),
+    )
+    with pytest.raises(AttributeError, match="enable_two_batch_overlap"):
+        mok_fp8_native._terminal_concurrency_mode_error()
+
+
+def test_mok_fp8_terminal_allows_only_full_decode_graph(monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         enable_breakable_cuda_graph,
     )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         enable_tc_piecewise_cuda_graph,
     )
-    from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        full_decode_cuda_graph_mode,
+        model_capture_mode,
+    )
 
+    monkeypatch.setattr(
+        mok_fp8_native, "_terminal_concurrency_mode_error", lambda: None
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     with enable_tc_piecewise_cuda_graph():
-        assert "tc_piecewise" in _terminal_graph_context_error()
+        assert "tc_piecewise" in _terminal_graph_context_error(ForwardMode.DECODE)
     with enable_breakable_cuda_graph():
-        assert "breakable" in _terminal_graph_context_error()
+        assert "breakable" in _terminal_graph_context_error(ForwardMode.DECODE)
     with model_capture_mode():
-        assert "whole-model" in _terminal_graph_context_error()
+        assert "DecodeCudaGraphRunner Full" in _terminal_graph_context_error(
+            ForwardMode.DECODE
+        )
+        with full_decode_cuda_graph_mode():
+            assert _terminal_graph_context_error(ForwardMode.DECODE) is None
+            assert (
+                "DeepEP ForwardMode.DECODE outer"
+                in _terminal_graph_context_error()
+            )
+            for unsupported_mode in (
+                ForwardMode.EXTEND,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.DLLM_EXTEND,
+            ):
+                assert (
+                    "supports only ForwardMode.DECODE"
+                    in _terminal_graph_context_error(unsupported_mode)
+                )
+            with terminal_deepep_outer_context(ForwardMode.DECODE):
+                assert _terminal_graph_context_error() is None
+            assert (
+                "DeepEP ForwardMode.DECODE outer"
+                in _terminal_graph_context_error()
+            )
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert "active CUDA graph" in _terminal_graph_context_error()
+    assert "external active CUDA graph" in _terminal_graph_context_error(
+        ForwardMode.DECODE
+    )
+
+
+def test_mok_fp8_terminal_full_decode_scope_excludes_draft_runner():
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_full_decode_cuda_graph_mode,
+    )
+
+    runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+    runner.backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
+    server_args = _concurrency_server_args()
+    runner.model_runner = SimpleNamespace(
+        is_draft_worker=False, server_args=server_args
+    )
+    assert not get_is_full_decode_cuda_graph_mode()
+    with runner._capture_mode_scope():
+        assert get_is_full_decode_cuda_graph_mode()
+    assert not get_is_full_decode_cuda_graph_mode()
+
+    runner.model_runner.is_draft_worker = True
+    with runner._capture_mode_scope():
+        assert not get_is_full_decode_cuda_graph_mode()
+
+    runner.model_runner.is_draft_worker = False
+    for field in (
+        "enable_two_batch_overlap",
+        "enable_single_batch_overlap",
+        "enable_pdmux",
+    ):
+        setattr(server_args, field, True)
+        with runner._capture_mode_scope():
+            assert not get_is_full_decode_cuda_graph_mode()
+        setattr(server_args, field, False)
+
+    del runner.model_runner.is_draft_worker
+    with pytest.raises(AttributeError, match="is_draft_worker"):
+        with runner._capture_mode_scope():
+            pass
+
+    runner.model_runner = SimpleNamespace(
+        is_draft_worker=False,
+        server_args=SimpleNamespace(
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+        ),
+    )
+    with pytest.raises(AttributeError, match="enable_pdmux"):
+        with runner._capture_mode_scope():
+            pass
 
 
 def test_mok_fp8_terminal_active_receipt_is_once_per_layer(caplog, monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        full_decode_cuda_graph_mode,
+        model_capture_mode,
+    )
+
     monkeypatch.setattr(mok_fp8_native, "_REPORTED_ACTIVE", False)
     monkeypatch.setattr(mok_fp8_native, "_REPORTED_TERMINAL_LAYER_IDS", set())
+    monkeypatch.setattr(
+        mok_fp8_native, "_terminal_concurrency_mode_error", lambda: None
+    )
     workspace = SimpleNamespace(schedule_capacity=4608)
 
     def report(layer_id, *, terminal_mode, num_tokens=1):
@@ -345,7 +505,12 @@ def test_mok_fp8_terminal_active_receipt_is_once_per_layer(caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger=mok_fp8_native.__name__):
         report(3, terminal_mode=True)
         report(3, terminal_mode=True, num_tokens=2)
-        report(7, terminal_mode=True)
+        with (
+            model_capture_mode(),
+            full_decode_cuda_graph_mode(),
+            terminal_deepep_outer_context(ForwardMode.DECODE),
+        ):
+            report(7, terminal_mode=True)
         report(11, terminal_mode=False)
         report(12, terminal_mode=False)
 
@@ -370,6 +535,8 @@ def test_mok_fp8_terminal_active_receipt_is_once_per_layer(caplog, monkeypatch):
     assert "capacity=4608" in terminal_receipts[0]
     assert "layer_id=7" in terminal_receipts[1]
     assert all("T=2" not in message for message in terminal_receipts)
+    assert "terminal_graph=false eager_only=true" in terminal_receipts[0]
+    assert "terminal_graph=true eager_only=false" in terminal_receipts[1]
 
 
 def test_mok_fp8_terminal_eager_padding_is_route_stable():

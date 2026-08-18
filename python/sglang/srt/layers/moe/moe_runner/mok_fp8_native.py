@@ -103,10 +103,62 @@ _ROUTE_EXPERT_PADDING = 64
 _TERMINAL_DEEPEP_OUTER_ACTIVE: ContextVar[bool] = ContextVar(
     "mok_terminal_deepep_outer_active", default=False
 )
+_TERMINAL_DECODE_GRAPH_ACTIVE: ContextVar[bool] = ContextVar(
+    "mok_terminal_decode_graph_active", default=False
+)
+
+
+def _terminal_forward_mode_is_decode(forward_mode) -> bool:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    return forward_mode == ForwardMode.DECODE
+
+
+def _terminal_concurrency_mode_error() -> Optional[str]:
+    """Return a configured concurrent-mode error, if runtime config exists."""
+    from sglang.srt.runtime_context import get_server_args
+
+    try:
+        server_args = get_server_args()
+    except ValueError:
+        # Direct unit/kernel callers have no process-wide ServerArgs.  Catch
+        # only that explicit condition: a present but incomplete config must
+        # raise instead of silently defaulting a safety field to false.
+        return None
+    if server_args.enable_pdmux:
+        return "terminal MoK rejects PDMux concurrent graph streams"
+    if server_args.enable_two_batch_overlap:
+        return "terminal MoK rejects two-batch overlap (TBO)"
+    if server_args.enable_single_batch_overlap:
+        return "terminal MoK rejects single-batch overlap (SBO)"
+    return None
+
+
+def _is_terminal_full_decode_graph(forward_mode) -> bool:
+    """Whether this DeepEP outer is SGLang's supported graph context."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_full_decode_cuda_graph_mode,
+        get_is_capture_mode,
+    )
+
+    return (
+        _terminal_forward_mode_is_decode(forward_mode)
+        and get_is_capture_mode()
+        and get_is_full_decode_cuda_graph_mode()
+        and not is_in_tc_piecewise_cuda_graph()
+        and not is_in_breakable_cuda_graph()
+        and _terminal_concurrency_mode_error() is None
+    )
 
 
 @contextmanager
-def terminal_deepep_outer_context():
+def terminal_deepep_outer_context(forward_mode=None):
     """Mark the exact DeepSeekV2 DeepEP outer semantics for terminal MoK.
 
     The terminal kernel returns the routed-expert contribution.  The enclosing
@@ -114,11 +166,15 @@ def terminal_deepep_outer_context():
     expert add.  Keeping this explicit prevents another FusedMoE caller from
     accidentally treating the routed output as a fully finalized model output.
     """
-    token = _TERMINAL_DEEPEP_OUTER_ACTIVE.set(True)
+    outer_token = _TERMINAL_DEEPEP_OUTER_ACTIVE.set(True)
+    graph_token = _TERMINAL_DECODE_GRAPH_ACTIVE.set(
+        _is_terminal_full_decode_graph(forward_mode)
+    )
     try:
         yield
     finally:
-        _TERMINAL_DEEPEP_OUTER_ACTIVE.reset(token)
+        _TERMINAL_DECODE_GRAPH_ACTIVE.reset(graph_token)
+        _TERMINAL_DEEPEP_OUTER_ACTIVE.reset(outer_token)
 
 
 def _terminal_deepep_backend_is_active() -> bool:
@@ -127,8 +183,13 @@ def _terminal_deepep_backend_is_active() -> bool:
     return get_moe_a2a_backend().is_deepep()
 
 
-def _terminal_graph_context_error() -> Optional[str]:
-    """Reject every SGLang graph context, not only active CUDA capture."""
+def _terminal_graph_context_error(forward_mode=None) -> Optional[str]:
+    """Allow only SGLang's whole-model Full graph for plain Decode.
+
+    The top-level DeepSeek MoE call supplies ``forward_mode``.  The nested
+    terminal adapter deliberately supplies none and is allowed only when the
+    validated DeepEP outer context propagated the decode-graph capability.
+    """
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         is_in_breakable_cuda_graph,
     )
@@ -136,17 +197,37 @@ def _terminal_graph_context_error() -> Optional[str]:
         is_in_tc_piecewise_cuda_graph,
     )
     from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_full_decode_cuda_graph_mode,
         get_is_capture_mode,
     )
 
     if is_in_tc_piecewise_cuda_graph():
-        return "terminal MoK is eager-only and rejects tc_piecewise CUDA graph"
+        return "terminal MoK rejects tc_piecewise CUDA graph"
     if is_in_breakable_cuda_graph():
-        return "terminal MoK is eager-only and rejects breakable CUDA graph"
+        return "terminal MoK rejects breakable CUDA graph"
     if get_is_capture_mode():
-        return "terminal MoK is eager-only and rejects whole-model graph capture"
+        if not get_is_full_decode_cuda_graph_mode():
+            return (
+                "terminal MoK rejects graph capture outside the production "
+                "DecodeCudaGraphRunner Full backend"
+            )
+        if concurrency_error := _terminal_concurrency_mode_error():
+            return concurrency_error
+        if _TERMINAL_DECODE_GRAPH_ACTIVE.get():
+            return None
+        if forward_mode is None:
+            return (
+                "terminal MoK whole-model graph capture requires the validated "
+                "DeepEP ForwardMode.DECODE outer context"
+            )
+        if not _terminal_forward_mode_is_decode(forward_mode):
+            return (
+                "terminal MoK whole-model graph capture supports only "
+                "ForwardMode.DECODE"
+            )
+        return None
     if torch.cuda.is_current_stream_capturing():
-        return "terminal MoK is eager-only and rejects active CUDA graph capture"
+        return "terminal MoK rejects external active CUDA graph capture"
     return None
 
 
@@ -380,14 +461,14 @@ def native_terminal_contract_error(
 
 
 def _terminal_mode_config_error() -> Optional[str]:
-    """Reject flags that would obscure the eager terminal path receipt."""
+    """Reject modes that cannot preserve the terminal workspace contract."""
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get():
         return "terminal MoK eager adapter does not support prefill graphs yet"
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
         return "terminal MoK is incompatible with the intermediate K1 flag"
     if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
         return "terminal MoK is incompatible with the intermediate K2 flag"
-    return None
+    return _terminal_concurrency_mode_error()
 
 
 def _consensus_supported(local_supported: bool, device: torch.device, group) -> bool:
@@ -1124,11 +1205,12 @@ def _report_active(
         if layer_id in _REPORTED_TERMINAL_LAYER_IDS:
             return
         _REPORTED_TERMINAL_LAYER_IDS.add(layer_id)
+        terminal_graph = _TERMINAL_DECODE_GRAPH_ACTIVE.get()
         logger.info(
             "MoK full-native FP8 active: layer_id=%s class=%s "
             "deprecate_flag=%s T=%d padded=%d topk=%d E_local=%d "
             "capacity=%d device_active_rows=true expert_padding=%d "
-            "strict_contract=%s terminal=true eager_only=true "
+            "strict_contract=%s terminal=true terminal_graph=%s eager_only=%s "
             "prefill_graph=False fused_k1=False fused_k2=False",
             layer_id,
             type(layer).__name__,
@@ -1140,6 +1222,8 @@ def _report_active(
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
             strict_contract,
+            str(terminal_graph).lower(),
+            str(not terminal_graph).lower(),
         )
         return
 

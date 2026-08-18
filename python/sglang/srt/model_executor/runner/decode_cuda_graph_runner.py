@@ -78,6 +78,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -87,6 +90,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_lora_variant,
+    full_decode_cuda_graph_mode,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -359,12 +363,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture --------------------------------------------------
         try:
-            with model_capture_mode():
+            with self._capture_mode_scope():
                 self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    @contextlib.contextmanager
+    def _capture_mode_scope(self):
+        """Mark only the production whole-model Full decode capture.
+
+        Speculative draft runners also use ``model_capture_mode`` and some use
+        ``ForwardMode.DECODE``.  They are intentionally excluded here.
+        """
+        server_args = self.model_runner.server_args
+        full_decode_ctx = (
+            full_decode_cuda_graph_mode()
+            if isinstance(self.backend, FullCudaGraphBackend)
+            and not self.model_runner.is_draft_worker
+            and not server_args.enable_two_batch_overlap
+            and not server_args.enable_single_batch_overlap
+            and not server_args.enable_pdmux
+            else contextlib.nullcontext()
+        )
+        with model_capture_mode(), full_decode_ctx:
+            yield
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -902,7 +926,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
-            self.capture()
+            with self._capture_mode_scope():
+                self.capture()
 
     def load_batch(
         self,

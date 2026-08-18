@@ -20,6 +20,7 @@ which variant to use).
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 import torch
@@ -35,9 +36,30 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
+# Set only by the production DecodeCudaGraphRunner when its resolved backend
+# is FullCudaGraphBackend.  Speculative draft runners also use
+# model_capture_mode() with ForwardMode.DECODE, so that broader flag cannot be
+# used to authorize operators that support only the production decode graph.
+_full_decode_cuda_graph_mode: ContextVar[bool] = ContextVar(
+    "full_decode_cuda_graph_mode", default=False
+)
+
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
+
+
+def get_is_full_decode_cuda_graph_mode() -> bool:
+    return _full_decode_cuda_graph_mode.get()
+
+
+@contextmanager
+def full_decode_cuda_graph_mode():
+    token = _full_decode_cuda_graph_mode.set(True)
+    try:
+        yield
+    finally:
+        _full_decode_cuda_graph_mode.reset(token)
 
 
 def compile_in_capture_mode(func):

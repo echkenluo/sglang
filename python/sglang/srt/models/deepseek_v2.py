@@ -870,7 +870,9 @@ class DeepseekV2MoE(nn.Module):
                 _terminal_graph_context_error,
             )
 
-            if graph_error := _terminal_graph_context_error():
+            if graph_error := _terminal_graph_context_error(
+                getattr(forward_batch, "forward_mode", None)
+            ):
                 raise RuntimeError(
                     f"strict full-native MoK contract rejected: {graph_error}"
                 )
@@ -1432,7 +1434,7 @@ class DeepseekV2MoE(nn.Module):
                 terminal_deepep_outer_context,
             )
 
-            with terminal_deepep_outer_context():
+            with terminal_deepep_outer_context(forward_batch.forward_mode):
                 final_hidden_states = self.experts(
                     hidden_states=hidden_states,
                     topk_output=topk_output,
