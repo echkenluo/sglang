@@ -511,34 +511,18 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
-def sglang_per_token_group_quant_fp8(
+def _run_sglang_per_token_group_quant_fp8_out(
     x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
-
-    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
-
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=out_shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-    )
-
+) -> None:
+    """Run the existing quant kernel into preallocated output tensors."""
     # Enable v2 kernel by default on supported group sizes
     _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
     if enable_v2 is None:
@@ -593,6 +577,120 @@ def sglang_per_token_group_quant_fp8(
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
+
+
+def validate_sglang_per_token_group_quant_fp8_out(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+) -> None:
+    """Validate the row-major out contract without launching device work.
+
+    The terminal MoK path calls this before acquiring its workspace lease, so
+    an invalid input cannot strand a successfully acquired lease.  This narrow
+    contract intentionally excludes column-major/TMA-aligned scales, UE8M0,
+    fused SwiGLU, and masked-M layouts.
+    """
+    for name, value in (("x", x), ("x_q", x_q), ("x_s", x_s)):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+    if x.dim() < 2:
+        raise ValueError("x must have at least two dimensions")
+    if type(group_size) is not int or group_size <= 0:
+        raise ValueError("group_size must be a positive integer")
+    if x.shape[-1] % group_size != 0:
+        raise ValueError("the last dimension of x must be divisible by group_size")
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+    if x_q.device != x.device or x_s.device != x.device:
+        raise ValueError("quant inputs and outputs must share one device")
+    if x_q.dtype != fp8_dtype or tuple(x_q.shape) != tuple(x.shape):
+        raise ValueError("x_q must match x shape and use the configured FP8 dtype")
+    expected_scale_shape = tuple(x.shape[:-1]) + (x.shape[-1] // group_size,)
+    if x_s.dtype != torch.float32 or tuple(x_s.shape) != expected_scale_shape:
+        raise ValueError(
+            f"x_s must be float32 with shape {expected_scale_shape}"
+        )
+    if not x_q.is_contiguous() or not x_s.is_contiguous():
+        raise ValueError("row-major quant outputs must be contiguous")
+    storages = {
+        x.untyped_storage().data_ptr(),
+        x_q.untyped_storage().data_ptr(),
+        x_s.untyped_storage().data_ptr(),
+    }
+    if len(storages) != 3:
+        raise ValueError("quant input and outputs must not alias")
+
+
+def sglang_per_token_group_quant_fp8_out(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    enable_v2: Optional[bool] = None,
+) -> None:
+    """Quantize directly into caller-owned row-major FP8/FP32 buffers.
+
+    The numerical dispatch is shared with
+    :func:`sglang_per_token_group_quant_fp8`; both paths therefore select the
+    same JIT/AOT kernel and use the same constants.  The underlying registered
+    custom ops declare ``output_q`` and ``output_s`` as mutated arguments, so
+    these writes remain explicit under torch.compile and CUDA Graph capture.
+    """
+    validate_sglang_per_token_group_quant_fp8_out(x, x_q, x_s, group_size)
+    _run_sglang_per_token_group_quant_fp8_out(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_m=None,
+        enable_v2=enable_v2,
+    )
+
+
+def sglang_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
+):
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+
+    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=out_shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+    _run_sglang_per_token_group_quant_fp8_out(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        scale_ue8m0=scale_ue8m0,
+        fuse_silu_and_mul=fuse_silu_and_mul,
+        masked_m=masked_m,
+        enable_v2=enable_v2,
+    )
 
     return x_q, x_s
 

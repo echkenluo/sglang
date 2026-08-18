@@ -850,26 +850,42 @@ def _run_terminal_eager(
 ) -> torch.Tensor:
     """Run the strict caller-owned-output terminal megakernel in eager mode."""
     from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
+        sglang_per_token_group_quant_fp8_out,
+        validate_sglang_per_token_group_quant_fp8_out,
     )
 
-    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
-        padded_hidden,
-        128,
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    )
     output = torch.empty(
         (padded_hidden.shape[0], 4096),
         dtype=torch.bfloat16,
         device=padded_hidden.device,
     )
-    return mok_functional.megakernel_fp8_block_from_topk(
+    validate_sglang_per_token_group_quant_fp8_out(
+        padded_hidden,
+        workspace.x_buffer,
+        workspace.x_scale_buffer,
+        128,
+    )
+    mok_functional.acquire_megakernel_fp8_block_from_topk_lease(
         workspace,
         config,
-        input_fp8,
-        input_scale,
+        layer.w13_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight,
+        layer.w2_weight_scale_inv,
+        padded_topk_weights,
+        padded_topk_ids,
+        output,
+        swiglu_limit=layer.moe_runner_config.swiglu_limit,
+    )
+    sglang_per_token_group_quant_fp8_out(
+        padded_hidden,
+        workspace.x_buffer,
+        workspace.x_scale_buffer,
+        128,
+    )
+    return mok_functional.megakernel_fp8_block_from_topk_preloaded_leased(
+        workspace,
+        config,
         layer.w13_weight,
         layer.w13_weight_scale_inv,
         layer.w2_weight,
@@ -999,7 +1015,8 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         required_apis = (
             "MoKConfig",
             "get_fp8_terminal_workspace",
-            "megakernel_fp8_block_from_topk",
+            "acquire_megakernel_fp8_block_from_topk_lease",
+            "megakernel_fp8_block_from_topk_preloaded_leased",
             "format_trap_record",
         )
     else:
