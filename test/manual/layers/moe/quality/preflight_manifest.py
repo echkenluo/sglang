@@ -11,6 +11,7 @@ Args: <run_dir> <expect_sglang_head_full> ; env IMAGE_ID from the launcher
 """
 
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -23,6 +24,11 @@ QSRC = f"{ROOT}/sglang/test/manual/layers/moe/quality"
 MODEL_DIR = "/data2/pubulic-models/DeepSeek-V4-Flash-FP8-fixed"
 SHAREGPT = "/data2/pubulic-models/ShareGPT_V3_unfiltered_cleaned_split.json"
 FAILS = []
+POWER_INPUT_NAME = "phase2-v4-power-input.json"
+POWER_EVALUATOR_NAME = "phase2_v4_power.py"
+POWER_INPUT_SCHEMA = "phase2-v4-raw-power-input-v2"
+POWER_ASSESSMENT_SCHEMA = "phase2-v4-raw-power-assessment-v2"
+POWER_FAMILIES = {"teacher68", "gsm5", "full73"}
 
 
 def fail(kind, detail):
@@ -44,6 +50,259 @@ def md5(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _is_sha256(value):
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _load_power_evaluator(path):
+    module_name = "phase2_v4_power_preflight"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load power evaluator from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_power_asset(exp, qsrc=QSRC, expected_heads=None):
+    """Recompute power from bounded raw control assets before T(S)."""
+    asset = exp.get("phase2_v4_power_input")
+    configured_path = asset.get("path") if isinstance(asset, dict) else None
+    expected_sha = asset.get("sha256") if isinstance(asset, dict) else None
+    input_path = os.path.join(qsrc, configured_path or POWER_INPUT_NAME)
+    evaluator_path = os.path.join(qsrc, POWER_EVALUATOR_NAME)
+    result = {
+        "verified": False,
+        "input_path": input_path,
+        "evaluator_path": evaluator_path,
+        "expected_sha256": expected_sha,
+        "actual_sha256": None,
+        "schema": None,
+        "candidate_blind": None,
+        "control_only": None,
+        "source_shas": {},
+        "raw_source_digest": None,
+        "validation": None,
+        "assessment": None,
+    }
+
+    if (
+        not isinstance(asset, dict)
+        or not isinstance(configured_path, str)
+        or not configured_path
+        or os.path.isabs(configured_path)
+        or os.path.normpath(configured_path) != configured_path
+        or configured_path.startswith("..")
+    ):
+        fail("power_input_config", asset or "MISSING")
+        return result
+    if not _is_sha256(expected_sha):
+        kind = (
+            "power_input_expected_pending"
+            if isinstance(expected_sha, str) and expected_sha.startswith("PENDING")
+            else "power_input_expected_sha256"
+        )
+        fail(kind, expected_sha or asset or "MISSING")
+        return result
+    if not os.path.isfile(input_path):
+        fail("power_input_missing", input_path)
+        return result
+    if os.path.islink(input_path):
+        fail("power_input_symlink", input_path)
+        return result
+    actual_sha = sha256(input_path)
+    result["actual_sha256"] = actual_sha
+    if actual_sha != expected_sha:
+        fail("power_input_sha256", f"{actual_sha} vs {expected_sha}")
+        return result
+
+    try:
+        with open(input_path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        fail("power_input_json", str(error))
+        return result
+    if not isinstance(payload, dict):
+        fail("power_input_schema", "root must be an object")
+        return result
+
+    result["schema"] = payload.get("schema")
+    result["candidate_blind"] = payload.get("candidate_blind")
+    result["control_only"] = payload.get("control_only")
+    source_shas = payload.get("artifacts")
+    if payload.get("schema") != POWER_INPUT_SCHEMA:
+        fail("power_input_schema", payload.get("schema"))
+    if payload.get("candidate_blind") is not True:
+        fail("power_input_candidate_blind", payload.get("candidate_blind"))
+    if payload.get("control_only") is not True:
+        fail("power_input_control_only", payload.get("control_only"))
+    if (
+        not isinstance(source_shas, dict)
+        or not source_shas
+        or not all(
+            isinstance(name, str)
+            and name
+            and _is_sha256(value)
+            for name, value in source_shas.items()
+        )
+    ):
+        fail("power_input_source_shas", source_shas)
+    else:
+        result["source_shas"] = dict(sorted(source_shas.items()))
+
+    if any(
+        kind in FAILS
+        for kind in (
+            "power_input_schema",
+            "power_input_candidate_blind",
+            "power_input_control_only",
+            "power_input_source_shas",
+        )
+    ):
+        return result
+    if not os.path.isfile(evaluator_path):
+        fail("power_evaluator_missing", evaluator_path)
+        return result
+
+    try:
+        evaluator = _load_power_evaluator(evaluator_path)
+        validate = getattr(evaluator, "validate_power_input")
+        compute = getattr(evaluator, "compute_power_assessment")
+    except Exception as error:  # importing the frozen evaluator must fail closed
+        fail("power_evaluator_interface", str(error))
+        return result
+    try:
+        validation = validate(payload)
+        # This is intentionally the expensive raw recomputation.  No rate or
+        # verdict field is accepted from the manifest itself.
+        assessment = compute(input_path)
+    except Exception as error:  # evaluator errors are a fail-closed asset error
+        fail("power_evaluator_error", f"{type(error).__name__}: {error}")
+        return result
+    if not isinstance(validation, dict) or validation != payload:
+        fail("power_input_validation", "evaluator did not accept the frozen payload")
+        return result
+    try:
+        # The preflight manifest is the audit artifact.  Refuse evaluator
+        # results that cannot be represented there instead of failing later
+        # during the final json.dump after expensive asset checks have run.
+        result["validation"] = {"valid": True}
+        result["assessment"] = json.loads(json.dumps(assessment))
+    except (TypeError, ValueError) as error:
+        fail("power_evaluator_output", str(error))
+        return result
+
+    if not isinstance(assessment, dict):
+        fail("power_assessment_schema", assessment)
+        return result
+    if assessment.get("schema") != POWER_ASSESSMENT_SCHEMA:
+        fail("power_assessment_schema", assessment.get("schema"))
+    if assessment.get("candidate_blind") is not True:
+        fail(
+            "power_assessment_candidate_blind",
+            assessment.get("candidate_blind"),
+        )
+    if assessment.get("control_only") is not True:
+        fail("power_assessment_control_only", assessment.get("control_only"))
+    if assessment.get("source_shas") != result["source_shas"]:
+        fail("power_assessment_source_shas", assessment.get("source_shas"))
+    if assessment.get("raw_manifest_sha256") != expected_sha:
+        fail("power_assessment_manifest_sha256", assessment.get("raw_manifest_sha256"))
+    result["raw_source_digest"] = assessment.get("raw_source_digest")
+    contract = assessment.get("contract")
+    if not isinstance(contract, dict) or (
+        contract.get("ci_gates"), contract.get("span_gates"),
+        contract.get("blocking_gates"), contract.get("effect_scenarios"),
+        contract.get("outer_trials"), contract.get("bootstrap_replicates"),
+        contract.get("outer_chunk"), contract.get("formal_outer_chunk"),
+    ) != (70, 3, 73, 22, 10_000, 10_000, 32, 32):
+        fail("power_assessment_contract", contract)
+    provenance = assessment.get("provenance")
+    generator_path = os.path.join(qsrc, "logprob_client.py")
+    if not os.path.isfile(generator_path) or os.path.islink(generator_path):
+        fail("power_provenance_file", generator_path)
+        return result
+    expected_provenance = {
+        "dataset_sha256": exp.get("sharegpt_sha256"),
+        "gsm8k_sha256": exp.get("gsm8k_sha256"),
+        "tokenizer_sha256": (exp.get("tokenizer_files") or {}).get("tokenizer.json"),
+        "generator_sha256": sha256(generator_path),
+        "evaluator_sha256": sha256(evaluator_path),
+        "mok_head": exp.get("mok_head"),
+    }
+    if expected_heads:
+        expected_provenance.update(expected_heads)
+    if not isinstance(provenance, dict) or any(
+        provenance.get(key) != value for key, value in expected_provenance.items()
+        if value is not None
+    ):
+        fail("power_assessment_provenance", provenance)
+    families = assessment.get("zero_degradation_families")
+    if not isinstance(families, dict) or set(families) != POWER_FAMILIES:
+        fail(
+            "power_assessment_families",
+            sorted(families) if isinstance(families, dict) else families,
+        )
+    else:
+        for family, gates in sorted(families.items()):
+            if not isinstance(gates, dict) or gates.get("pass") is not True:
+                value = gates.get("pass") if isinstance(gates, dict) else gates
+                fail("power_family_gate", f"{family}.pass={value}")
+    single_gates = assessment.get("single_ci_gates")
+    expected_single_gates = getattr(evaluator, "EXPECTED_POWER_GATE_NAMES", set())
+    if (
+        not isinstance(single_gates, dict)
+        or not expected_single_gates
+        or set(single_gates) != set(expected_single_gates)
+    ):
+        fail(
+            "power_single_gate_set",
+            sorted(single_gates) if isinstance(single_gates, dict) else single_gates,
+        )
+    else:
+        for gate, verdict in sorted(single_gates.items()):
+            if not isinstance(verdict, dict) or verdict.get("pass") is not True:
+                value = verdict.get("pass") if isinstance(verdict, dict) else verdict
+                fail("power_single_gate", f"{gate}.pass={value}")
+    effects = assessment.get("exact_margin_effects")
+    expected_effects = getattr(evaluator, "EFFECT_GATE_NAMES", ())
+    if not isinstance(effects, dict) or set(effects) != set(expected_effects):
+        fail("power_effect_set", sorted(effects) if isinstance(effects, dict) else effects)
+    else:
+        for gate, verdict in sorted(effects.items()):
+            if not isinstance(verdict, dict) or verdict.get("pass") is not True:
+                fail("power_effect_gate", f"{gate}.pass={verdict.get('pass') if isinstance(verdict, dict) else verdict}")
+    vector = assessment.get("pass_vector")
+    popcounts = vector.get("popcounts") if isinstance(vector, dict) else None
+    if (
+        not isinstance(vector, dict)
+        or not _is_sha256(vector.get("sha256"))
+        or vector.get("bits") != 1_200_000
+        or not isinstance(vector.get("ones"), int)
+        or not isinstance(popcounts, dict)
+        or set(popcounts) != {
+            "ci_pass", "span_pass", "family_pass",
+            "effect_gate_rejection", "effect_family_failure",
+        }
+        or not all(isinstance(value, int) and value >= 0 for value in popcounts.values())
+        or sum(popcounts.values()) != vector.get("ones")
+    ):
+        fail("power_pass_vector", vector)
+    if assessment.get("overall_pass") is not True:
+        fail("power_assessment_no_go", assessment.get("overall_pass"))
+
+    power_failures = [kind for kind in FAILS if kind.startswith("power_")]
+    result["verified"] = not power_failures
+    return result
 
 
 def git(repo, *args):
@@ -125,6 +384,14 @@ def main():
         fail("script_set", f"{present}")
     scripts = {n: sha256(f"{QSRC}/{n}") for n in present}
 
+    # Candidate-blind power is an admission gate, not a post-hoc report.  It
+    # must close before T(S), and its full validation/assessment is preserved
+    # in the manifest for independent audit.
+    power_analysis = verify_power_asset(
+        exp,
+        expected_heads={"sglang_head": sglang_head, "mok_head": mok_head},
+    )
+
     # Direct numeric evidence is a hard gate independent of end-to-end task
     # drift. Verify raw artifacts before deriving the frozen summary.
     numeric_hashes = {}
@@ -190,6 +457,7 @@ def main():
         "image_id": image_id,
         "tokenizer_files": tok,
         "harness_scripts": scripts,
+        "power_analysis": power_analysis,
         "numeric_audit": numeric_audit,
         "model_dir": MODEL_DIR,
     }

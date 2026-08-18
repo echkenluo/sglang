@@ -16,12 +16,18 @@
     "gsm8k_client.py",
     "logprob_client.py",
     "longgen_client.py",
+    "phase2-v4-power-input.json",
+    "phase2_v4_power.py",
     "preflight_manifest.py",
     "quality_gate_eval.py",
     "quality_run.sh",
     "run_phase2.sh"
   ],
   "gsm8k_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+  "phase2_v4_power_input": {
+    "path": "phase2-v4-power-input.json",
+    "sha256": "PENDING_PHASE2_V4_POWER_INPUT_SHA256"
+  },
   "numeric_audit_assets": {
     "/mok/claude-mok/gemm-audit-e64-a1-m128-n4096-k4096-s20260818.json": "937468c309fecb5b17b860536693af9cf9b318d4c47d547e122118398976df07",
     "/mok/claude-mok/gemm-audit-e64-a2-m256-n4096-k4096-s20260819.json": "d474ab0bd68c5c3fc866a4f816a7786abc04342b845895c306affdcb6d1f3f6a",
