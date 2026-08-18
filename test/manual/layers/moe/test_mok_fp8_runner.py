@@ -1,6 +1,7 @@
 """Manual SM90 correctness gate for the SGLang MoK FP8 runner path."""
 
 import inspect
+import logging
 import os
 import threading
 from types import SimpleNamespace
@@ -318,6 +319,57 @@ def test_mok_fp8_terminal_rejects_all_graph_contexts(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert "active CUDA graph" in _terminal_graph_context_error()
+
+
+def test_mok_fp8_terminal_active_receipt_is_once_per_layer(caplog, monkeypatch):
+    monkeypatch.setattr(mok_fp8_native, "_REPORTED_ACTIVE", False)
+    monkeypatch.setattr(mok_fp8_native, "_REPORTED_TERMINAL_LAYER_IDS", set())
+    workspace = SimpleNamespace(schedule_capacity=4608)
+
+    def report(layer_id, *, terminal_mode, num_tokens=1):
+        layer = SimpleNamespace(
+            layer_id=layer_id,
+            num_local_experts=64,
+            deprecate_flag=False,
+        )
+        mok_fp8_native._report_active(
+            layer,
+            num_tokens,
+            2,
+            8,
+            workspace,
+            True,
+            terminal_mode=terminal_mode,
+        )
+
+    with caplog.at_level(logging.INFO, logger=mok_fp8_native.__name__):
+        report(3, terminal_mode=True)
+        report(3, terminal_mode=True, num_tokens=2)
+        report(7, terminal_mode=True)
+        report(11, terminal_mode=False)
+        report(12, terminal_mode=False)
+
+    receipts = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("MoK full-native FP8 active:")
+    ]
+    terminal_receipts = [
+        message for message in receipts if "terminal=true" in message
+    ]
+    nonterminal_receipts = [
+        message for message in receipts if "terminal=False" in message
+    ]
+    assert len(terminal_receipts) == 2
+    assert len(nonterminal_receipts) == 1
+    assert (
+        "layer_id=3 class=SimpleNamespace deprecate_flag=false"
+        in terminal_receipts[0]
+    )
+    assert "T=1 padded=2" in terminal_receipts[0]
+    assert "capacity=4608" in terminal_receipts[0]
+    assert "layer_id=7" in terminal_receipts[1]
+    assert all("T=2" not in message for message in terminal_receipts)
 
 
 def test_mok_fp8_terminal_eager_padding_is_route_stable():

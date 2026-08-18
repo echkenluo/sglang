@@ -98,6 +98,7 @@ def _die_if_trapped(workspace, mok_functional) -> None:
         os._exit(70)
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
+_REPORTED_TERMINAL_LAYER_IDS: set[object] = set()
 _ROUTE_EXPERT_PADDING = 64
 _TERMINAL_DEEPEP_OUTER_ACTIVE: ContextVar[bool] = ContextVar(
     "mok_terminal_deepep_outer_active", default=False
@@ -1118,6 +1119,30 @@ def _report_active(
     terminal_mode: bool = False,
 ) -> None:
     global _REPORTED_ACTIVE
+    if terminal_mode:
+        layer_id = layer.layer_id
+        if layer_id in _REPORTED_TERMINAL_LAYER_IDS:
+            return
+        _REPORTED_TERMINAL_LAYER_IDS.add(layer_id)
+        logger.info(
+            "MoK full-native FP8 active: layer_id=%s class=%s "
+            "deprecate_flag=%s T=%d padded=%d topk=%d E_local=%d "
+            "capacity=%d device_active_rows=true expert_padding=%d "
+            "strict_contract=%s terminal=true eager_only=true "
+            "prefill_graph=False fused_k1=False fused_k2=False",
+            layer_id,
+            type(layer).__name__,
+            str(bool(getattr(layer, "deprecate_flag", False))).lower(),
+            num_tokens,
+            padded_tokens,
+            topk,
+            layer.num_local_experts,
+            workspace.schedule_capacity,
+            _ROUTE_EXPERT_PADDING,
+            strict_contract,
+        )
+        return
+
     if not _REPORTED_ACTIVE:
         _REPORTED_ACTIVE = True
         logger.info(
