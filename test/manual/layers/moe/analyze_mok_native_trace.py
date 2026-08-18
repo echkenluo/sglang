@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -64,6 +65,16 @@ def main() -> None:
     parser.add_argument("trace_dir", type=Path)
     parser.add_argument("--iters", type=int, required=True,
                         help="eager iterations captured inside the trace")
+    parser.add_argument(
+        "--drop-first-iters",
+        type=int,
+        default=0,
+        help=(
+            "discard this many leading iterations after segmenting on the "
+            "one-per-layer input quant kernel; use this to remove profiler "
+            "startup skew from cross-rank barriers"
+        ),
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -73,46 +84,110 @@ def main() -> None:
         if not path.exists():
             raise SystemExit(f"missing trace: {path}")
         events = load_events(path)
-        totals: dict[str, float] = defaultdict(float)
-        counts: dict[str, int] = defaultdict(int)
+        classified = [
+            (event, classify(event.get("name", ""), event.get("cat", "")))
+            for event in events
+        ]
+        classified = [(event, phase) for event, phase in classified if phase]
+        classified.sort(key=lambda item: float(item[0].get("ts", 0.0)))
+        quant_starts = [
+            float(event["ts"]) for event, phase in classified if phase == "quant"
+        ]
+        if len(quant_starts) != args.iters:
+            raise SystemExit(
+                f"{path}: expected {args.iters} quant iteration markers, "
+                f"found {len(quant_starts)}"
+            )
+        if not 0 <= args.drop_first_iters < args.iters:
+            raise SystemExit("drop-first-iters must be in [0,iters)")
+
+        final_end = max(
+            float(event["ts"]) + float(event.get("dur", 0.0))
+            for event, _phase in classified
+        )
+        iteration_rows = []
         unknown: dict[str, float] = defaultdict(float)
         barrier_durs: list[float] = []
-        span_start = None
-        span_end = None
-        for event in events:
-            phase = classify(event.get("name", ""), event.get("cat", ""))
-            if phase is None:
-                continue
-            duration = float(event.get("dur", 0.0))
-            timestamp = float(event.get("ts", 0.0))
-            span_start = timestamp if span_start is None else min(span_start, timestamp)
-            span_end = (
-                timestamp + duration
-                if span_end is None
-                else max(span_end, timestamp + duration)
+        for index, start in enumerate(quant_starts):
+            end = quant_starts[index + 1] if index + 1 < args.iters else final_end
+            selected = [
+                (event, phase)
+                for event, phase in classified
+                if start <= float(event["ts"]) < end
+            ]
+            totals: dict[str, float] = defaultdict(float)
+            counts: dict[str, int] = defaultdict(int)
+            for event, phase in selected:
+                duration = float(event.get("dur", 0.0))
+                totals[phase] += duration
+                counts[phase] += 1
+                if index >= args.drop_first_iters and phase == "barrier":
+                    barrier_durs.append(duration)
+                if index >= args.drop_first_iters and phase == "other":
+                    unknown[event.get("name", "?")] += duration
+            selected_start = min(float(event["ts"]) for event, _phase in selected)
+            selected_end = max(
+                float(event["ts"]) + float(event.get("dur", 0.0))
+                for event, _phase in selected
             )
-            totals[phase] += duration
-            counts[phase] += 1
-            if phase == "barrier":
-                barrier_durs.append(duration)
-            if phase == "other":
-                unknown[event.get("name", "?")] += duration
+            kernel_sum = sum(totals.values())
+            iteration_rows.append(
+                {
+                    "index": index,
+                    "totals": dict(totals),
+                    "counts": dict(counts),
+                    "span_us": selected_end - selected_start,
+                    "gap_us": selected_end - selected_start - kernel_sum,
+                }
+            )
 
-        span = (span_end - span_start) if span_start is not None else 0.0
-        kernel_sum = sum(totals.values())
+        kept = iteration_rows[args.drop_first_iters :]
+        phases = sorted(
+            {phase for row in kept for phase in row["totals"]},
+            key=lambda phase: -statistics.median(
+                row["totals"].get(phase, 0.0) for row in kept
+            ),
+        )
+        phase_medians = {
+            phase: statistics.median(
+                row["totals"].get(phase, 0.0) for row in kept
+            )
+            for phase in phases
+        }
+        count_medians = {
+            phase: statistics.median(
+                row["counts"].get(phase, 0) for row in kept
+            )
+            for phase in phases
+        }
         report[f"rank{rank}"] = {
             "per_iter_us": {
-                phase: round(totals[phase] / args.iters, 2)
-                for phase in sorted(totals, key=lambda p: -totals[p])
+                phase: round(phase_medians[phase], 2) for phase in phases
             },
-            "per_iter_counts": {
-                phase: counts[phase] / args.iters for phase in counts
-            },
-            "span_per_iter_us": round(span / args.iters, 2),
-            "gap_per_iter_us": round((span - kernel_sum) / args.iters, 2),
+            "per_iter_counts": count_medians,
+            "span_per_iter_us": round(
+                statistics.median(row["span_us"] for row in kept), 2
+            ),
+            "gap_per_iter_us": round(
+                statistics.median(row["gap_us"] for row in kept), 2
+            ),
             "barrier_durs_us": [round(d, 1) for d in barrier_durs],
+            "drop_first_iters": args.drop_first_iters,
+            "kept_iterations": len(kept),
+            "iteration_rows": [
+                {
+                    "index": row["index"],
+                    "span_us": round(row["span_us"], 2),
+                    "gap_us": round(row["gap_us"], 2),
+                    "phase_us": {
+                        phase: round(value, 2)
+                        for phase, value in sorted(row["totals"].items())
+                    },
+                }
+                for row in kept
+            ],
             "unclassified": {
-                name: round(duration / args.iters, 2)
+                name: round(duration / len(kept), 2)
                 for name, duration in sorted(
                     unknown.items(), key=lambda item: -item[1]
                 )[:12]
