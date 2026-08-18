@@ -1045,9 +1045,17 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     # alignment under the worst valid route distribution.  Decode uses the
     # smallest legal chunk; 1024 bytes keeps larger route gathers compact and
     # divides every T*topk*sizeof(int32) buffer padded to M256.
+    fwd_num_comm_sms = envs.SGLANG_OPT_MOK_FP8_NATIVE_FWD_NUM_COMM_SMS.get()
+    if type(fwd_num_comm_sms) is not int or fwd_num_comm_sms <= 0:
+        raise RuntimeError("MoK fwd_num_comm_sms must be a positive integer")
+    if terminal_mode and fwd_num_comm_sms % 2 != 0:
+        raise RuntimeError(
+            "terminal MoK fwd_num_comm_sms must be even for cluster2 roles"
+        )
     config = mok_functional.MoKConfig(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=route_chunk_bytes,
+        fwd_num_comm_sms=fwd_num_comm_sms,
     )
     if terminal_mode:
         schedule_capacity = padded_tokens * topk * capacity_factor
@@ -1061,6 +1069,7 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
             num_local_tokens=padded_tokens,
             schedule_capacity=schedule_capacity,
             num_local_experts=layer.num_local_experts,
+            comm_clusters=fwd_num_comm_sms // 2,
         )
     else:
         workspace = mok_functional.get_fp8_route_workspace(
@@ -1210,6 +1219,7 @@ def _report_active(
             "MoK full-native FP8 active: layer_id=%s class=%s "
             "deprecate_flag=%s T=%d padded=%d topk=%d E_local=%d "
             "capacity=%d device_active_rows=true expert_padding=%d "
+            "fwd_num_comm_sms=%d comm_clusters=%d compute_clusters=%d "
             "strict_contract=%s terminal=true terminal_graph=%s eager_only=%s "
             "prefill_graph=False fused_k1=False fused_k2=False",
             layer_id,
@@ -1221,6 +1231,9 @@ def _report_active(
             layer.num_local_experts,
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
+            workspace.comm_clusters * 2,
+            workspace.comm_clusters,
+            workspace.compute_clusters,
             strict_contract,
             str(terminal_graph).lower(),
             str(not terminal_graph).lower(),

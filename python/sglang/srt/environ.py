@@ -894,6 +894,10 @@ class Envs:
     # is being validated; always fail-closed.
     SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
+    # Original MoK expresses communication capacity in CTAs.  The terminal
+    # SM90 kernel uses cluster2 roles, so this must be positive and even and is
+    # converted to communication clusters at workspace creation.
+    SGLANG_OPT_MOK_FP8_NATIVE_FWD_NUM_COMM_SMS = EnvInt(40)
     # First fusion cut: input barrier + pull dispatch + gate/up GEMM as one
     # persistent kernel (strict contract only). Off by default.
     SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM = EnvBool(False)
