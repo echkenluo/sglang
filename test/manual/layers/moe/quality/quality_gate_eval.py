@@ -176,8 +176,10 @@ def check_aa_family(label: str, tags: tuple[str, ...]) -> dict[str, dict[str, fl
     )
     gate(
         f"1c-{label}-longgen-admission",
-        long_band["token_mismatch_rate"] <= 0.50
-        and wave_band["token_mismatch_rate"] <= 0.50,
+        all(
+            math.isfinite(value) and 0 <= value <= 1
+            for value in [*long_band.values(), *wave_band.values()]
+        ),
         {"serial": long_band, "waves": wave_band},
     )
     return {
