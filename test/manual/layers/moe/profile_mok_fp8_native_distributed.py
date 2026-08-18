@@ -30,6 +30,18 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl")
+    try:
+        _run_profile(device)
+    finally:
+        # The trap poller reads pinned records through PyTorch while it is
+        # alive.  Join it before ProcessGroup/CUDA teardown so interpreter
+        # finalization cannot race the daemon thread.
+        mok_fp8_native.shutdown_trap_watchdog()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_profile(device):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     assert world_size == 4
@@ -100,7 +112,6 @@ def main():
                 f"I={intermediate}",
                 flush=True,
             )
-        dist.destroy_process_group()
         return
 
     eager_iters = int(os.environ.get("MOK_PROFILE_EAGER_ITERS", "0"))
@@ -175,7 +186,6 @@ def main():
                 f"disabled={mok_fp8_native._PREFILL_GRAPH_DISABLED}",
                 flush=True,
             )
-        dist.destroy_process_group()
         return
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -234,7 +244,6 @@ def main():
             flush=True,
         )
     dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

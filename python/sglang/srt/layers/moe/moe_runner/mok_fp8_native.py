@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
 import os
 import threading
-import time
 from typing import Optional
 
 import torch
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _TRAP_WATCHDOG_LOCK = threading.Lock()
 _TRAP_WATCHDOG_ENTRIES: list = []
+_TRAP_WATCHDOG_STOP = threading.Event()
+_TRAP_WATCHDOG_THREAD: Optional[threading.Thread] = None
 _TRAP_WATCHDOG_STARTED = False
 
 
@@ -31,28 +33,53 @@ def _trap_watchdog_loop() -> None:
     thread polls the host-mapped pinned records with pure CPU reads (never
     a CUDA call) and performs the log-and-exit contract the moment any
     record turns non-zero."""
-    while True:
+    while not _TRAP_WATCHDOG_STOP.is_set():
         for workspace, mok_functional in list(_TRAP_WATCHDOG_ENTRIES):
             record = mok_functional.format_trap_record(workspace)
             if record is not None:
                 logger.error(record)
                 logging.shutdown()
                 os._exit(70)
-        time.sleep(0.05)
+        _TRAP_WATCHDOG_STOP.wait(0.05)
 
 
 def _register_trap_watchdog(workspace, mok_functional) -> None:
-    global _TRAP_WATCHDOG_STARTED
+    global _TRAP_WATCHDOG_STARTED, _TRAP_WATCHDOG_THREAD
     with _TRAP_WATCHDOG_LOCK:
         if not any(w is workspace for w, _ in _TRAP_WATCHDOG_ENTRIES):
             _TRAP_WATCHDOG_ENTRIES.append((workspace, mok_functional))
-        if not _TRAP_WATCHDOG_STARTED:
-            threading.Thread(
+        if _TRAP_WATCHDOG_THREAD is None or not _TRAP_WATCHDOG_THREAD.is_alive():
+            _TRAP_WATCHDOG_STOP.clear()
+            _TRAP_WATCHDOG_THREAD = threading.Thread(
                 target=_trap_watchdog_loop,
                 name="mok-trap-watchdog",
                 daemon=True,
-            ).start()
+            )
+            _TRAP_WATCHDOG_THREAD.start()
             _TRAP_WATCHDOG_STARTED = True
+
+
+def shutdown_trap_watchdog() -> None:
+    """Stop the host-only trap poller before distributed/CUDA teardown.
+
+    The poller deliberately remains a daemon for fatal production shutdown,
+    but graceful exits must not leave it running while PyTorch unloads.  This
+    operation is CPU-only, idempotent, and leaves the watchdog restartable for
+    a later workspace registration in the same process.
+    """
+    global _TRAP_WATCHDOG_STARTED, _TRAP_WATCHDOG_THREAD
+    with _TRAP_WATCHDOG_LOCK:
+        _TRAP_WATCHDOG_STOP.set()
+        thread = _TRAP_WATCHDOG_THREAD
+        if thread is not None:
+            thread.join()
+        _TRAP_WATCHDOG_ENTRIES.clear()
+        _TRAP_WATCHDOG_THREAD = None
+        _TRAP_WATCHDOG_STARTED = False
+        _TRAP_WATCHDOG_STOP.clear()
+
+
+atexit.register(shutdown_trap_watchdog)
 
 
 def _die_if_trapped(workspace, mok_functional) -> None:

@@ -1,6 +1,7 @@
 """Manual SM90 correctness gate for the SGLang MoK FP8 runner path."""
 
 import os
+import threading
 
 os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 os.environ["SGLANG_MASKED_GEMM_FAST_ACT"] = "0"
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.moe_runner import mok_fp8_native
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmMoeQuantInfo,
@@ -22,6 +24,15 @@ from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _route_padding_config,
     native_shape_contract_error,
 )
+
+
+class _NoTrapFunctional:
+    polled = threading.Event()
+
+    @staticmethod
+    def format_trap_record(workspace):
+        _NoTrapFunctional.polled.set()
+        return None
 
 
 def _fp8_random(shape, generator, device):
@@ -91,6 +102,41 @@ def test_mok_fp8_native_strict_contract_skips_collective():
     assert _accept_runtime_contract(None, None, None, strict=True)
     with pytest.raises(RuntimeError, match="strict full-native MoK contract"):
         _accept_runtime_contract("unsupported shape", None, None, strict=True)
+
+
+def test_mok_fp8_native_trap_watchdog_shutdown_is_idempotent_and_restartable():
+    mok_fp8_native.shutdown_trap_watchdog()
+    first_workspace = object()
+    second_workspace = object()
+    first_thread = None
+    try:
+        _NoTrapFunctional.polled.clear()
+        mok_fp8_native._register_trap_watchdog(first_workspace, _NoTrapFunctional)
+        first_thread = mok_fp8_native._TRAP_WATCHDOG_THREAD
+        assert first_thread is not None
+        assert first_thread.is_alive()
+        assert first_thread.daemon
+        assert _NoTrapFunctional.polled.wait(timeout=1)
+
+        mok_fp8_native.shutdown_trap_watchdog()
+        assert not first_thread.is_alive()
+        assert mok_fp8_native._TRAP_WATCHDOG_THREAD is None
+        assert not mok_fp8_native._TRAP_WATCHDOG_STARTED
+        assert not mok_fp8_native._TRAP_WATCHDOG_ENTRIES
+        assert not mok_fp8_native._TRAP_WATCHDOG_STOP.is_set()
+
+        # A second call is a no-op, and a later registration gets a fresh
+        # poller rather than inheriting the stopped Event/thread.
+        mok_fp8_native.shutdown_trap_watchdog()
+        _NoTrapFunctional.polled.clear()
+        mok_fp8_native._register_trap_watchdog(second_workspace, _NoTrapFunctional)
+        second_thread = mok_fp8_native._TRAP_WATCHDOG_THREAD
+        assert second_thread is not None
+        assert second_thread is not first_thread
+        assert second_thread.is_alive()
+        assert _NoTrapFunctional.polled.wait(timeout=1)
+    finally:
+        mok_fp8_native.shutdown_trap_watchdog()
 
 
 def test_mok_fp8_native_capacity_includes_expert_padding():

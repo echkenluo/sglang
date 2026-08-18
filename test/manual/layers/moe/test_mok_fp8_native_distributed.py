@@ -85,6 +85,18 @@ def test_mok_fp8_native_full_chain_matches_deepgemm():
     device = torch.device("cuda", local_rank)
     assert torch.cuda.get_device_capability(device) == (9, 0)
     dist.init_process_group("nccl")
+    try:
+        _run_mok_fp8_native_full_chain_test(device)
+    finally:
+        # Stop CPU polling before ProcessGroup/CUDA teardown.  Leaving the
+        # daemon alive here can race PyTorch interpreter finalization and
+        # abort an otherwise successful distributed test.
+        mok_fp8_native.shutdown_trap_watchdog()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_mok_fp8_native_full_chain_test(device):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     assert world_size == 4
@@ -311,6 +323,5 @@ def test_mok_fp8_native_full_chain_matches_deepgemm():
     )
     mok_functional.clear_workspace_cache()
     dist.barrier()
-    dist.destroy_process_group()
     assert metrics[0].item() < 0.05
     assert metrics[1].item() < 0.05
