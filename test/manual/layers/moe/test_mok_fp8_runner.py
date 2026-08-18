@@ -622,6 +622,117 @@ class _InjectedTerminalFatalExit(BaseException):
         self.code = code
 
 
+def _terminal_quant_receipt(fp8_kernel, x, x_q, x_s):
+    contract = fp8_kernel._FP8OutLaunchContract(
+        backend="jit_v2",
+        device_type=x.device.type,
+        device_index=x.device.index,
+        input_dtype=x.dtype,
+        output_dtype=x_q.dtype,
+        scale_dtype=x_s.dtype,
+        group_size=128,
+        resolved_v2=True,
+        input_shape=tuple(x.shape),
+        input_stride=tuple(x.stride()),
+        output_shape=tuple(x_q.shape),
+        output_stride=tuple(x_q.stride()),
+        scale_shape=tuple(x_s.shape),
+        scale_stride=tuple(x_s.stride()),
+        eps=1e-10,
+    )
+    return fp8_kernel._FP8OutPrewarmReceipt(contract, False)
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ("launch", "synchronize"), ids=("synchronous", "deferred")
+)
+def test_mok_terminal_quant_prewarm_failure_precedes_acquire(
+    monkeypatch, failure_stage
+):
+    from sglang.srt.layers.quantization import fp8_kernel
+
+    events = []
+    monkeypatch.setattr(
+        fp8_kernel,
+        "enable_sgl_per_token_group_quant_8bit",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(fp8_kernel, "_is_musa", False)
+    monkeypatch.setattr(fp8_kernel, "is_arch_support_pdl", lambda: False)
+    monkeypatch.setattr(
+        fp8_kernel,
+        "_jit_per_token_group_quant_8bit_v2_module",
+        lambda *args: events.append("module"),
+        raising=False,
+    )
+    monkeypatch.setattr(fp8_kernel, "_FP8_OUT_PREWARM_RECEIPTS", {})
+
+    def launch(*args, **kwargs):
+        events.append("launch")
+        if failure_stage == "launch":
+            raise RuntimeError("injected synchronous quant launch failure")
+
+    def synchronize(*args, **kwargs):
+        events.append("synchronize")
+        if failure_stage == "synchronize":
+            raise RuntimeError("injected deferred synchronize failure")
+
+    monkeypatch.setattr(
+        fp8_kernel, "_run_sglang_per_token_group_quant_fp8_out", launch
+    )
+    monkeypatch.setattr(
+        fp8_kernel, "_synchronize_fp8_out_prewarm", synchronize
+    )
+    monkeypatch.setattr(
+        mok_fp8_native, "_REPORTED_TERMINAL_QUANT_PREWARM", set()
+    )
+
+    class FakeMoKFunctional:
+        @staticmethod
+        def acquire_megakernel_fp8_block_from_topk_lease(*args, **kwargs):
+            events.append("acquire")
+
+        @staticmethod
+        def megakernel_fp8_block_from_topk_preloaded_leased(*args, **kwargs):
+            events.append("terminal")
+            raise AssertionError("terminal must not run after prewarm failure")
+
+    workspace = SimpleNamespace(
+        x_buffer=torch.empty((2, 4096), dtype=torch.float8_e4m3fn),
+        x_scale_buffer=torch.empty((2, 32), dtype=torch.float32),
+    )
+    layer = SimpleNamespace(
+        w13_weight=object(),
+        w13_weight_scale_inv=object(),
+        w2_weight=object(),
+        w2_weight_scale_inv=object(),
+        moe_runner_config=SimpleNamespace(swiglu_limit=10.0),
+    )
+    padded_hidden = torch.empty((2, 4096), dtype=torch.bfloat16)
+    padded_ids = torch.zeros((2, 6), dtype=torch.int32)
+    padded_weights = torch.zeros((2, 6), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match=failure_stage):
+        mok_fp8_native._run_terminal_eager(
+            layer,
+            workspace,
+            FakeMoKFunctional,
+            object(),
+            padded_hidden,
+            padded_ids,
+            padded_weights,
+        )
+    assert "acquire" not in events
+    assert "terminal" not in events
+    assert not fp8_kernel._FP8_OUT_PREWARM_RECEIPTS
+    assert events == (
+        ["module", "launch"]
+        if failure_stage == "launch"
+        else ["module", "launch", "synchronize"]
+    )
+
+
 @pytest.mark.parametrize(
     "injected",
     (RuntimeError("quant-runtime"), ValueError("quant-value")),
@@ -633,16 +744,6 @@ def test_mok_terminal_post_acquire_quant_failure_is_fatal(
     from sglang.srt.layers.quantization import fp8_kernel
 
     events = []
-    receipt = (
-        "jit_v2",
-        "cpu",
-        None,
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-        128,
-        True,
-        False,
-    )
 
     def prewarm(*args, **kwargs):
         events.append("prewarm")
@@ -701,6 +802,12 @@ def test_mok_terminal_post_acquire_quant_failure_is_fatal(
     padded_hidden = torch.empty((2, 4096), dtype=torch.bfloat16)
     padded_ids = torch.zeros((2, 6), dtype=torch.int32)
     padded_weights = torch.zeros((2, 6), dtype=torch.float32)
+    receipt = _terminal_quant_receipt(
+        fp8_kernel,
+        padded_hidden,
+        workspace.x_buffer,
+        workspace.x_scale_buffer,
+    )
 
     with pytest.raises(_InjectedTerminalFatalExit) as fatal:
         mok_fp8_native._run_terminal_eager(

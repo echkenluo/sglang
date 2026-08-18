@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -139,8 +140,35 @@ else:
 fp8_min = -fp8_max
 
 
+@dataclass(frozen=True)
+class _FP8OutLaunchContract:
+    backend: str
+    device_type: str
+    device_index: Optional[int]
+    input_dtype: torch.dtype
+    output_dtype: torch.dtype
+    scale_dtype: torch.dtype
+    group_size: int
+    resolved_v2: bool
+    input_shape: tuple[int, ...]
+    input_stride: tuple[int, ...]
+    output_shape: tuple[int, ...]
+    output_stride: tuple[int, ...]
+    scale_shape: tuple[int, ...]
+    scale_stride: tuple[int, ...]
+    eps: float
+
+
+@dataclass(frozen=True)
+class _FP8OutPrewarmReceipt:
+    contract: _FP8OutLaunchContract
+    use_pdl: bool
+
+
 _FP8_OUT_PREWARM_LOCK = threading.Lock()
-_FP8_OUT_PREWARM_RECEIPTS: set[tuple] = set()
+_FP8_OUT_PREWARM_RECEIPTS: dict[
+    _FP8OutLaunchContract, _FP8OutPrewarmReceipt
+] = {}
 
 
 @register_custom_op(mutates_args=["C"])
@@ -541,26 +569,40 @@ def _resolve_sglang_per_token_group_quant_fp8_backend(
     return "aot_legacy", False
 
 
-def _fp8_out_prewarm_key(
+def _fp8_out_launch_contract(
     x: torch.Tensor,
     x_q: torch.Tensor,
+    x_s: torch.Tensor,
     group_size: int,
     enable_v2: Optional[bool],
-) -> tuple:
+    eps: float,
+) -> _FP8OutLaunchContract:
     backend, resolved_v2 = _resolve_sglang_per_token_group_quant_fp8_backend(
         group_size, enable_v2
     )
-    use_pdl = bool(is_arch_support_pdl()) if backend == "jit_v2" else False
-    return (
-        backend,
-        x.device.type,
-        x.device.index,
-        x.dtype,
-        x_q.dtype,
-        group_size,
-        resolved_v2,
-        use_pdl,
+    return _FP8OutLaunchContract(
+        backend=backend,
+        device_type=x.device.type,
+        device_index=x.device.index,
+        input_dtype=x.dtype,
+        output_dtype=x_q.dtype,
+        scale_dtype=x_s.dtype,
+        group_size=group_size,
+        resolved_v2=resolved_v2,
+        input_shape=tuple(x.shape),
+        input_stride=tuple(x.stride()),
+        output_shape=tuple(x_q.shape),
+        output_stride=tuple(x_q.stride()),
+        scale_shape=tuple(x_s.shape),
+        scale_stride=tuple(x_s.stride()),
+        eps=float(eps),
     )
+
+
+def _synchronize_fp8_out_prewarm(x: torch.Tensor) -> None:
+    """Surface deferred CUDA launch errors before a terminal lease exists."""
+    if x.is_cuda:
+        torch.cuda.synchronize(x.device)
 
 
 def prewarm_sglang_per_token_group_quant_fp8_out(
@@ -569,7 +611,8 @@ def prewarm_sglang_per_token_group_quant_fp8_out(
     x_s: torch.Tensor,
     group_size: int,
     enable_v2: Optional[bool] = None,
-) -> tuple:
+    eps: float = 1e-10,
+) -> _FP8OutPrewarmReceipt:
     """Validate and materialize the exact out backend before lease acquire.
 
     The returned immutable receipt is consumed by the terminal transaction.
@@ -577,23 +620,70 @@ def prewarm_sglang_per_token_group_quant_fp8_out(
     must have completed in warmup, while no workspace lease is held.
     """
     validate_sglang_per_token_group_quant_fp8_out(x, x_q, x_s, group_size)
-    receipt = _fp8_out_prewarm_key(x, x_q, group_size, enable_v2)
+    contract = _fp8_out_launch_contract(
+        x, x_q, x_s, group_size, enable_v2, eps
+    )
+    capturing = bool(
+        x.is_cuda and torch.cuda.is_current_stream_capturing()
+    )
     with _FP8_OUT_PREWARM_LOCK:
-        if receipt in _FP8_OUT_PREWARM_RECEIPTS:
-            return receipt
-        if x.is_cuda and torch.cuda.is_current_stream_capturing():
+        cached = _FP8_OUT_PREWARM_RECEIPTS.get(contract)
+        if cached is not None:
+            return cached
+        if capturing:
             raise RuntimeError(
                 "terminal FP8 quant backend must be prewarmed before capture"
             )
-        backend = receipt[0]
-        if backend == "jit_v2":
+        use_pdl = (
+            bool(is_arch_support_pdl())
+            if contract.backend == "jit_v2"
+            else False
+        )
+        receipt = _FP8OutPrewarmReceipt(contract, use_pdl)
+        if contract.backend == "jit_v2":
             _jit_per_token_group_quant_8bit_v2_module(
-                x.dtype, x_q.dtype, receipt[-1]
+                contract.input_dtype, contract.output_dtype, use_pdl
             )
-        elif backend == "jit_v1":
-            _jit_per_token_group_quant_8bit_module(x.dtype, x_q.dtype)
-        # AOT backends were materialized by the sgl_kernel import above.
-        _FP8_OUT_PREWARM_RECEIPTS.add(receipt)
+        elif contract.backend == "jit_v1":
+            _jit_per_token_group_quant_8bit_module(
+                contract.input_dtype, contract.output_dtype
+            )
+
+        # Loading a JIT/AOT library does not guarantee that CUDA has loaded
+        # the selected function under CUDA_MODULE_LOADING=AUTO.  Exercise the
+        # exact dispatch on independent outputs and synchronize while no
+        # workspace lease exists.  Only a fully completed launch earns a
+        # reusable receipt.
+        scratch_q = torch.empty_like(x_q)
+        scratch_s = torch.empty_like(x_s)
+        scratch_storages = {
+            scratch_q.untyped_storage().data_ptr(),
+            scratch_s.untyped_storage().data_ptr(),
+        }
+        live_storages = {
+            x.untyped_storage().data_ptr(),
+            x_q.untyped_storage().data_ptr(),
+            x_s.untyped_storage().data_ptr(),
+        }
+        if len(scratch_storages) != 2 or scratch_storages & live_storages:
+            raise RuntimeError(
+                "terminal FP8 quant prewarm scratch must not alias live tensors"
+            )
+        _run_sglang_per_token_group_quant_fp8_out(
+            x,
+            scratch_q,
+            scratch_s,
+            contract.group_size,
+            contract.eps,
+            scale_ue8m0=False,
+            fuse_silu_and_mul=False,
+            masked_m=None,
+            enable_v2=contract.resolved_v2,
+            resolved_backend=contract.backend,
+            resolved_use_pdl=receipt.use_pdl,
+        )
+        _synchronize_fp8_out_prewarm(x)
+        _FP8_OUT_PREWARM_RECEIPTS[contract] = receipt
     return receipt
 
 
@@ -608,6 +698,7 @@ def _run_sglang_per_token_group_quant_fp8_out(
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
     resolved_backend: Optional[str] = None,
+    resolved_use_pdl: Optional[bool] = None,
 ) -> None:
     """Run the existing quant kernel into preallocated output tensors."""
     if resolved_backend is None:
@@ -647,6 +738,7 @@ def _run_sglang_per_token_group_quant_fp8_out(
                 scale_ue8m0=scale_ue8m0,
                 fuse_silu_and_mul=fuse_silu_and_mul,
                 masked_m=masked_m,
+                use_pdl=resolved_use_pdl,
             )
         elif backend == "jit_v1":
             sgl_per_token_group_quant_8bit_jit(
@@ -743,31 +835,44 @@ def launch_sglang_per_token_group_quant_fp8_out_prevalidated(
     x: torch.Tensor,
     x_q: torch.Tensor,
     x_s: torch.Tensor,
-    group_size: int,
-    prewarm_receipt: tuple,
-    eps: float = 1e-10,
+    prewarm_receipt: _FP8OutPrewarmReceipt,
 ) -> None:
     """Launch a validated, materialized backend inside a terminal lease.
 
-    This entry deliberately performs no tensor/layout validation and no JIT
-    materialization.  The caller must pass the exact receipt returned by
-    :func:`prewarm_sglang_per_token_group_quant_fp8_out` before acquiring the
-    terminal workspace.  A missing receipt is a transaction-fatal invariant
-    failure at the caller boundary.
+    This entry performs only a CPU metadata match against the immutable
+    receipt and no JIT/CUDA setup.  The caller must pass the exact receipt
+    returned by :func:`prewarm_sglang_per_token_group_quant_fp8_out` before
+    acquiring the terminal workspace.  A missing receipt is a
+    transaction-fatal invariant failure at the caller boundary.
     """
-    if prewarm_receipt not in _FP8_OUT_PREWARM_RECEIPTS:
+    active = _FP8_OUT_PREWARM_RECEIPTS.get(prewarm_receipt.contract)
+    if active != prewarm_receipt:
         raise RuntimeError("terminal FP8 quant prewarm receipt is not active")
+    contract = prewarm_receipt.contract
+    observed = _fp8_out_launch_contract(
+        x,
+        x_q,
+        x_s,
+        contract.group_size,
+        contract.resolved_v2,
+        contract.eps,
+    )
+    if observed != contract:
+        raise RuntimeError(
+            "terminal FP8 quant launch does not match its prewarm receipt"
+        )
     _run_sglang_per_token_group_quant_fp8_out(
         x,
         x_q,
         x_s,
-        group_size,
-        eps,
+        contract.group_size,
+        contract.eps,
         scale_ue8m0=False,
         fuse_silu_and_mul=False,
         masked_m=None,
-        enable_v2=bool(prewarm_receipt[6]),
-        resolved_backend=str(prewarm_receipt[0]),
+        enable_v2=contract.resolved_v2,
+        resolved_backend=contract.backend,
+        resolved_use_pdl=prewarm_receipt.use_pdl,
     )
 
 

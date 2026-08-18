@@ -51,6 +51,7 @@ def _per_token_group_quant_8bit_v2_custom_op(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
 ) -> None:
     """Opaque custom-op boundary around the JIT v2 kernel.
 
@@ -78,7 +79,7 @@ def _per_token_group_quant_8bit_v2_custom_op(
     scale_expert_stride = output_s.stride(0) if masked_layout else 0
     scale_hidden_stride = output_s.stride(last)
 
-    module = _jit_module(input.dtype, output_q.dtype, is_arch_support_pdl())
+    module = _jit_module(input.dtype, output_q.dtype, use_pdl)
     module.per_token_group_quant_8bit_v2(
         input,
         output_q,
@@ -110,12 +111,14 @@ def per_token_group_quant_8bit_v2(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    use_pdl: Optional[bool] = None,
 ) -> None:
     """JIT port of sgl_per_token_group_quant_8bit_v2 (full feature parity).
 
     Wraps the registered custom op so torch.compile / piecewise CUDA graph treat
     the tvm-ffi kernel call as an opaque boundary.
     """
+    resolved_use_pdl = is_arch_support_pdl() if use_pdl is None else use_pdl
     _per_token_group_quant_8bit_v2_custom_op(
         input=input,
         output_q=output_q,
@@ -127,4 +130,5 @@ def per_token_group_quant_8bit_v2(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        use_pdl=resolved_use_pdl,
     )
