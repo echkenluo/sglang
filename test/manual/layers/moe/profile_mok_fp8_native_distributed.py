@@ -37,7 +37,7 @@ def main():
     tokens = int(os.environ.get("MOK_PROFILE_TOKENS", "4"))
     topk = int(os.environ.get("MOK_PROFILE_TOPK", "6"))
     local_experts = int(os.environ.get("MOK_PROFILE_LOCAL_EXPERTS", "64"))
-    hidden = int(os.environ.get("MOK_PROFILE_HIDDEN", "7168"))
+    hidden = int(os.environ.get("MOK_PROFILE_HIDDEN", "4096"))
     intermediate = int(os.environ.get("MOK_PROFILE_INTERMEDIATE", "2048"))
     iterations = int(os.environ.get("MOK_PROFILE_ITERS", "30"))
 
