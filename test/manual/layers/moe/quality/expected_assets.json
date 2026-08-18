@@ -12,6 +12,7 @@
   },
   "script_set": [
     "expected_assets.json",
+    "gemm_numeric_audit.py",
     "gsm8k_client.py",
     "logprob_client.py",
     "longgen_client.py",
@@ -20,5 +21,11 @@
     "quality_run.sh",
     "run_phase2.sh"
   ],
-  "gsm8k_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
+  "gsm8k_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+  "numeric_audit_assets": {
+    "/mok/claude-mok/gemm-audit-e64-a1-m128-n4096-k4096-s20260818.json": "937468c309fecb5b17b860536693af9cf9b318d4c47d547e122118398976df07",
+    "/mok/claude-mok/gemm-audit-e64-a2-m256-n4096-k4096-s20260819.json": "d474ab0bd68c5c3fc866a4f816a7786abc04342b845895c306affdcb6d1f3f6a",
+    "/mok/claude-mok/gemm-audit-e64-a4-m512-n4096-k2048-s20260820.json": "7c4c318f518d79b30dc3c6c082dac1f20447d68a0a20d44a9f994b8978854b51",
+    "/mok/claude-mok/diag-live-gemm-audit-prefill-20260818.log": "585b9e8c7b9854a9e3b4564fbc08bd27d56709472d42a36b7201bc71c31089d7"
+  }
 }

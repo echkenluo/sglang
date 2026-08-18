@@ -12,7 +12,9 @@ Args: <run_dir> <expect_sglang_head_full> ; env IMAGE_ID from the launcher
 
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 
@@ -123,6 +125,59 @@ def main():
         fail("script_set", f"{present}")
     scripts = {n: sha256(f"{QSRC}/{n}") for n in present}
 
+    # Direct numeric evidence is a hard gate independent of end-to-end task
+    # drift. Verify raw artifacts before deriving the frozen summary.
+    numeric_hashes = {}
+    synthetic_metrics = []
+    live_rows = []
+    for path, want in exp["numeric_audit_assets"].items():
+        if not os.path.isfile(path):
+            fail("numeric_audit_missing", path)
+            continue
+        got = sha256(path)
+        numeric_hashes[path] = got
+        if got != want:
+            fail("numeric_audit_sha256", f"{path}: {got}")
+        if path.endswith(".json"):
+            payload = json.load(open(path))
+            synthetic_metrics.append(payload["mok_vs_deepgemm"])
+        else:
+            for line in open(path, errors="ignore"):
+                if "MOK_FP8_NUMERIC_AUDIT|" not in line:
+                    continue
+                fields = dict(re.findall(
+                    r"(layer|stage|valid_M|exact|rel_l2)=([^|\s]+)", line
+                ))
+                if fields and int(fields["valid_M"]) > 10:
+                    live_rows.append(fields)
+    numeric_values = [
+        (float(item["exact_bf16_fraction"]), float(item["relative_l2"]))
+        for item in synthetic_metrics
+    ] + [
+        (float(item["exact"]), float(item["rel_l2"])) for item in live_rows
+    ]
+    numeric_audit = {
+        "verified": False,
+        "asset_sha256": numeric_hashes,
+        "synthetic_cases": len(synthetic_metrics),
+        "live_records": len(live_rows),
+        "live_layers": len({int(item["layer"]) for item in live_rows}),
+        "min_exact": min((value[0] for value in numeric_values), default=0),
+        "max_relative_l2": max(
+            (value[1] for value in numeric_values), default=math.inf
+        ),
+    }
+    numeric_audit["verified"] = (
+        len(synthetic_metrics) == 3
+        and numeric_audit["live_records"] == 344
+        and numeric_audit["live_layers"] == 43
+        and all(math.isfinite(value) for pair in numeric_values for value in pair)
+        and numeric_audit["min_exact"] >= 0.999
+        and numeric_audit["max_relative_l2"] <= 1e-3
+    )
+    if not numeric_audit["verified"]:
+        fail("numeric_audit_gate", numeric_audit)
+
     manifest = {
         "verified": not FAILS,
         "failures": FAILS,
@@ -135,6 +190,7 @@ def main():
         "image_id": image_id,
         "tokenizer_files": tok,
         "harness_scripts": scripts,
+        "numeric_audit": numeric_audit,
         "model_dir": MODEL_DIR,
     }
     out = f"{qdir}/preflight-manifest.json"
