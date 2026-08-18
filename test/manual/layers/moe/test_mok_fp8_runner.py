@@ -1,7 +1,9 @@
 """Manual SM90 correctness gate for the SGLang MoK FP8 runner path."""
 
+import inspect
 import os
 import threading
+from types import SimpleNamespace
 
 os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 os.environ["SGLANG_MASKED_GEMM_FAST_ACT"] = "0"
@@ -21,8 +23,10 @@ from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _accept_runtime_contract,
     _capacity_factor_from_global_counts,
     _conservative_route_capacity_factor,
+    _pad_eager_inputs,
     _route_padding_config,
     native_shape_contract_error,
+    native_terminal_contract_error,
 )
 
 
@@ -102,6 +106,107 @@ def test_mok_fp8_native_strict_contract_skips_collective():
     assert _accept_runtime_contract(None, None, None, strict=True)
     with pytest.raises(RuntimeError, match="strict full-native MoK contract"):
         _accept_runtime_contract("unsupported shape", None, None, strict=True)
+
+
+def _terminal_contract_fixture():
+    layer = SimpleNamespace(
+        moe_ep_size=4,
+        num_experts=256,
+        num_local_experts=64,
+        num_fused_shared_experts=0,
+        _has_fused_shared=False,
+        quant_method=SimpleNamespace(load_up_proj_weight_first=False),
+        w13_weight=torch.empty(
+            (64, 4096, 4096), dtype=torch.float8_e4m3fn, device="meta"
+        ),
+        w13_weight_scale_inv=torch.empty(
+            (64, 32, 32), dtype=torch.float32, device="meta"
+        ),
+        w2_weight=torch.empty(
+            (64, 4096, 2048), dtype=torch.float8_e4m3fn, device="meta"
+        ),
+        w2_weight_scale_inv=torch.empty(
+            (64, 32, 16), dtype=torch.float32, device="meta"
+        ),
+    )
+    hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
+    topk_output = SimpleNamespace(
+        topk_ids=torch.zeros((2, 6), dtype=torch.int64),
+        topk_weights=torch.zeros((2, 6), dtype=torch.float32),
+    )
+    return layer, hidden_states, topk_output
+
+
+def test_mok_fp8_terminal_exact_contract(monkeypatch):
+    monkeypatch.setattr(
+        mok_fp8_native,
+        "native_runtime_contract_error",
+        lambda layer, hidden_states, topk_output: None,
+    )
+    layer, hidden_states, topk_output = _terminal_contract_fixture()
+    assert native_terminal_contract_error(layer, hidden_states, topk_output) is None
+
+    layer.num_fused_shared_experts = 1
+    assert "shared-expert fusion disabled" in native_terminal_contract_error(
+        layer, hidden_states, topk_output
+    )
+    layer.num_fused_shared_experts = 0
+    layer.quant_method.load_up_proj_weight_first = True
+    assert "gate-then-up" in native_terminal_contract_error(
+        layer, hidden_states, topk_output
+    )
+    layer.quant_method.load_up_proj_weight_first = False
+    layer.moe_ep_size = 8
+    assert "EP4" in native_terminal_contract_error(
+        layer, hidden_states, topk_output
+    )
+
+
+def test_mok_fp8_terminal_eager_padding_is_route_stable():
+    hidden_states = torch.arange(3 * 4, dtype=torch.bfloat16).view(3, 4)
+    topk_ids = torch.arange(18, dtype=torch.int64).view(3, 6)
+    topk_weights = torch.arange(18, dtype=torch.float32).view(3, 6)
+    padded_hidden, padded_ids, padded_weights = _pad_eager_inputs(
+        hidden_states,
+        SimpleNamespace(topk_ids=topk_ids, topk_weights=topk_weights),
+        padded_tokens=4,
+    )
+    assert torch.equal(padded_hidden[:3], hidden_states)
+    assert torch.equal(padded_ids[:3], topk_ids.to(torch.int32))
+    assert torch.equal(padded_weights[:3], topk_weights)
+    assert torch.count_nonzero(padded_hidden[3]) == 0
+    assert torch.all(padded_ids[3] == -1)
+    assert torch.count_nonzero(padded_weights[3]) == 0
+
+
+def test_mok_fp8_terminal_eager_source_has_no_intermediate_path():
+    terminal_source = inspect.getsource(mok_fp8_native._run_terminal_eager)
+    assert "megakernel_fp8_block_from_topk(" in terminal_source
+    assert "sglang_per_token_group_quant_fp8(" in terminal_source
+    for forbidden in (
+        "torch.cat(",
+        ".clone(",
+        "dispatch_gemm_fused_fp8_block(",
+        "gemm_combine_fused_fp8_block(",
+        "release_workspace_lease(",
+    ):
+        assert forbidden not in terminal_source
+
+    adapter_source = inspect.getsource(mok_fp8_native.maybe_run_mok_fp8_native)
+    terminal_return = adapter_source.find("return output[:num_tokens]")
+    graph_branch = adapter_source.find("use_graph = (")
+    assert 0 <= terminal_return < graph_branch
+
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    layer_forward_source = inspect.getsource(FusedMoE.forward)
+    terminal_dispatch = layer_forward_source.find(
+        "SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL"
+    )
+    piecewise_dispatch = layer_forward_source.find(
+        "is_in_tc_piecewise_cuda_graph"
+    )
+    assert 0 <= terminal_dispatch < piecewise_dispatch
 
 
 def test_mok_fp8_native_trap_watchdog_shutdown_is_idempotent_and_restartable():

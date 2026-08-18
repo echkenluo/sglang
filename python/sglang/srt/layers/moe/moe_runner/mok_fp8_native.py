@@ -266,6 +266,65 @@ def native_runtime_contract_error(layer, hidden_states, topk_output) -> Optional
     return None
 
 
+def native_terminal_contract_error(
+    layer, hidden_states, topk_output
+) -> Optional[str]:
+    """Validate the exact eager terminal DeepSeek-V4 specialization."""
+    if getattr(layer, "num_fused_shared_experts", 0) != 0 or getattr(
+        layer, "_has_fused_shared", False
+    ):
+        return (
+            "terminal MoK requires shared-expert fusion disabled; use "
+            "--disable-shared-experts-fusion"
+        )
+    error = native_runtime_contract_error(layer, hidden_states, topk_output)
+    if error is not None:
+        return error
+    if layer.moe_ep_size != 4:
+        return "terminal MoK requires EP4"
+    if layer.num_experts != 256 or layer.num_local_experts != 64:
+        return "terminal MoK requires E_global=256 and E_local=64"
+    if hidden_states.shape[1] != 4096:
+        return "terminal MoK requires hidden_size=4096"
+    if topk_output.topk_ids.shape[1] != 6:
+        return "terminal MoK requires topk=6"
+    if tuple(layer.w13_weight.shape) != (64, 4096, 4096):
+        return "terminal MoK requires canonical w13 [64,4096,4096]"
+    if tuple(layer.w2_weight.shape) != (64, 4096, 2048):
+        return "terminal MoK requires canonical w2 [64,4096,2048]"
+    if tuple(layer.w13_weight_scale_inv.shape) != (64, 32, 32):
+        return "terminal MoK requires canonical w13 block scales [64,32,32]"
+    if tuple(layer.w2_weight_scale_inv.shape) != (64, 32, 16):
+        return "terminal MoK requires canonical w2 block scales [64,32,16]"
+    if getattr(layer.quant_method, "load_up_proj_weight_first", False):
+        return "terminal MoK requires canonical gate-then-up w13 packing"
+    if any(
+        bool(getattr(weight, "is_shuffled", False))
+        for weight in (layer.w13_weight, layer.w2_weight)
+    ):
+        return "terminal MoK does not accept shuffled expert weights"
+    if any(
+        bool(getattr(scale, "format_ue8m0", False))
+        for scale in (
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+        )
+    ):
+        return "terminal MoK requires canonical FP32 block scales, not UE8M0"
+    return None
+
+
+def _terminal_mode_config_error() -> Optional[str]:
+    """Reject flags that would obscure the eager terminal path receipt."""
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get():
+        return "terminal MoK eager adapter does not support prefill graphs yet"
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
+        return "terminal MoK is incompatible with the intermediate K1 flag"
+    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+        return "terminal MoK is incompatible with the intermediate K2 flag"
+    return None
+
+
 def _consensus_supported(local_supported: bool, device: torch.device, group) -> bool:
     flag = torch.tensor([int(local_supported)], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
@@ -600,6 +659,82 @@ def _run_native_core(
     )
 
 
+def _pad_eager_inputs(
+    hidden_states: torch.Tensor,
+    topk_output,
+    *,
+    padded_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize one fixed eager bucket without changing route ordering."""
+    num_tokens, hidden_size = hidden_states.shape
+    topk = topk_output.topk_ids.shape[1]
+    if padded_tokens == num_tokens:
+        return (
+            hidden_states,
+            topk_output.topk_ids.to(torch.int32),
+            topk_output.topk_weights,
+        )
+
+    padded_hidden = hidden_states.new_zeros((padded_tokens, hidden_size))
+    padded_hidden[:num_tokens].copy_(hidden_states)
+    padded_topk_ids = torch.full(
+        (padded_tokens, topk),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int32))
+    padded_topk_weights = torch.zeros(
+        (padded_tokens, topk),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
+    return padded_hidden, padded_topk_ids, padded_topk_weights
+
+
+def _run_terminal_eager(
+    layer,
+    workspace,
+    mok_functional,
+    config,
+    padded_hidden: torch.Tensor,
+    padded_topk_ids: torch.Tensor,
+    padded_topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Run the strict caller-owned-output terminal megakernel in eager mode."""
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
+        padded_hidden,
+        128,
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    )
+    output = torch.empty(
+        (padded_hidden.shape[0], 4096),
+        dtype=torch.bfloat16,
+        device=padded_hidden.device,
+    )
+    return mok_functional.megakernel_fp8_block_from_topk(
+        workspace,
+        config,
+        input_fp8,
+        input_scale,
+        layer.w13_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight,
+        layer.w2_weight_scale_inv,
+        padded_topk_weights,
+        padded_topk_ids,
+        output,
+        swiglu_limit=layer.moe_runner_config.swiglu_limit,
+    )
+
+
 def _capture_prefill_graph(
     layer,
     workspace,
@@ -686,10 +821,23 @@ def _capture_prefill_graph(
 def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
     """Return native output, or ``None`` before any MoK collective on fallback."""
     group = get_tp_group().device_group
-    reason = native_runtime_contract_error(layer, hidden_states, topk_output)
+    terminal_mode = envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get()
+    reason = (
+        native_terminal_contract_error(layer, hidden_states, topk_output)
+        if terminal_mode
+        else native_runtime_contract_error(layer, hidden_states, topk_output)
+    )
+    if terminal_mode and reason is None:
+        reason = _terminal_mode_config_error()
+    if (
+        terminal_mode
+        and reason is None
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        reason = "terminal MoK is eager-only and cannot run during graph capture"
     if reason is None and dist.get_world_size(group) != layer.moe_ep_size:
         reason = "the MoK process group must match moe_ep_size"
-    strict_contract = envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.get()
+    strict_contract = terminal_mode or envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.get()
     if not _accept_runtime_contract(
         reason,
         hidden_states.device,
@@ -703,24 +851,32 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         from mok import functional as mok_functional
     except ImportError as exc:
         raise RuntimeError(
-            "SGLANG_OPT_USE_MOK_FP8_NATIVE requires the MoK extension"
+            "MoK native or terminal mode requires the MoK extension"
         ) from exc
-    required_apis = (
-        "get_fp8_route_workspace",
-        "build_schedule",
-        "dispatch_fp8_block",
-        "grouped_gemm_fp8_block_dynamic_out",
-        "combine_fp8_block",
-        "combine_reduce_fp8_block_routes",
-        "reduce_fp8_block_routes",
-        "acquire_workspace_lease",
-        "release_workspace_lease",
-        "format_trap_record",
-    )
-    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
-        required_apis = required_apis + ("dispatch_gemm_fused_fp8_block",)
-    if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
-        required_apis = required_apis + ("gemm_combine_fused_fp8_block",)
+    if terminal_mode:
+        required_apis = (
+            "MoKConfig",
+            "get_fp8_terminal_workspace",
+            "megakernel_fp8_block_from_topk",
+            "format_trap_record",
+        )
+    else:
+        required_apis = (
+            "get_fp8_route_workspace",
+            "build_schedule",
+            "dispatch_fp8_block",
+            "grouped_gemm_fp8_block_dynamic_out",
+            "combine_fp8_block",
+            "combine_reduce_fp8_block_routes",
+            "reduce_fp8_block_routes",
+            "acquire_workspace_lease",
+            "release_workspace_lease",
+            "format_trap_record",
+        )
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get():
+            required_apis = required_apis + ("dispatch_gemm_fused_fp8_block",)
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get():
+            required_apis = required_apis + ("gemm_combine_fused_fp8_block",)
     missing = [name for name in required_apis if not hasattr(mok_functional, name)]
     if missing:
         raise RuntimeError(f"loaded MoK package lacks native APIs: {missing}")
@@ -751,18 +907,64 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=route_chunk_bytes,
     )
-    workspace = mok_functional.get_fp8_route_workspace(
-        config,
-        group,
-        device=hidden_states.device,
-        num_local_tokens=padded_tokens,
-        hidden_size=hidden_size,
-        topk=topk,
-        num_local_experts=layer.num_local_experts,
-    )
+    if terminal_mode:
+        schedule_capacity = padded_tokens * topk * capacity_factor
+        if schedule_capacity <= 0 or schedule_capacity % 256 != 0:
+            raise RuntimeError(
+                "terminal MoK schedule capacity must be positive and M256"
+            )
+        workspace = mok_functional.get_fp8_terminal_workspace(
+            group,
+            device=hidden_states.device,
+            num_local_tokens=padded_tokens,
+            schedule_capacity=schedule_capacity,
+            num_local_experts=layer.num_local_experts,
+        )
+    else:
+        workspace = mok_functional.get_fp8_route_workspace(
+            config,
+            group,
+            device=hidden_states.device,
+            num_local_tokens=padded_tokens,
+            hidden_size=hidden_size,
+            topk=topk,
+            num_local_experts=layer.num_local_experts,
+        )
     _register_trap_watchdog(workspace, mok_functional)
 
-    _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
+    _report_active(
+        layer,
+        num_tokens,
+        padded_tokens,
+        topk,
+        workspace,
+        strict_contract,
+        terminal_mode=terminal_mode,
+    )
+
+    if terminal_mode:
+        padded_hidden, padded_topk_ids, padded_topk_weights = _pad_eager_inputs(
+            hidden_states,
+            topk_output,
+            padded_tokens=padded_tokens,
+        )
+        try:
+            output = _run_terminal_eager(
+                layer,
+                workspace,
+                mok_functional,
+                config,
+                padded_hidden,
+                padded_topk_ids,
+                padded_topk_weights,
+            )
+            # The terminal kernel wrote caller-owned storage before releasing
+            # its workspace lease.  A leading-row view remains caller-owned;
+            # no clone or Python release is needed.
+            return output[:num_tokens]
+        except RuntimeError:
+            _die_if_trapped(workspace, mok_functional)
+            raise
 
     use_graph = (
         envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()
@@ -813,26 +1015,11 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
                 _die_if_trapped(workspace, mok_functional)
                 raise
 
-    if padded_tokens == num_tokens:
-        padded_hidden = hidden_states
-        padded_topk_ids = topk_output.topk_ids.to(torch.int32)
-        padded_topk_weights = topk_output.topk_weights
-    else:
-        padded_hidden = hidden_states.new_zeros((padded_tokens, hidden_size))
-        padded_hidden[:num_tokens].copy_(hidden_states)
-        padded_topk_ids = torch.full(
-            (padded_tokens, topk),
-            -1,
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        padded_topk_ids[:num_tokens].copy_(topk_output.topk_ids.to(torch.int32))
-        padded_topk_weights = torch.zeros(
-            (padded_tokens, topk),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        padded_topk_weights[:num_tokens].copy_(topk_output.topk_weights)
+    padded_hidden, padded_topk_ids, padded_topk_weights = _pad_eager_inputs(
+        hidden_states,
+        topk_output,
+        padded_tokens=padded_tokens,
+    )
 
     try:
         output = _run_native_core(
@@ -861,7 +1048,14 @@ def maybe_run_mok_fp8_native(layer, hidden_states, topk_output):
 
 
 def _report_active(
-    layer, num_tokens, padded_tokens, topk, workspace, strict_contract
+    layer,
+    num_tokens,
+    padded_tokens,
+    topk,
+    workspace,
+    strict_contract,
+    *,
+    terminal_mode: bool = False,
 ) -> None:
     global _REPORTED_ACTIVE
     if not _REPORTED_ACTIVE:
@@ -869,7 +1063,8 @@ def _report_active(
         logger.info(
             "MoK full-native FP8 active: layer=%s T=%d padded_T=%d "
             "topk=%d E_local=%d capacity=%d device_active_rows=true "
-            "expert_padding=%d strict_contract=%s prefill_graph=%s "
+            "expert_padding=%d strict_contract=%s terminal=%s "
+            "eager_only=%s prefill_graph=%s "
             "fused_k1=%s fused_k2=%s",
             layer.layer_id,
             num_tokens,
@@ -879,7 +1074,15 @@ def _report_active(
             workspace.schedule_capacity,
             _ROUTE_EXPERT_PADDING,
             strict_contract,
-            envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get(),
-            envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get(),
-            envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get(),
+            terminal_mode,
+            terminal_mode,
+            False
+            if terminal_mode
+            else envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get(),
+            False
+            if terminal_mode
+            else envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_DISPATCH_GEMM.get(),
+            False
+            if terminal_mode
+            else envs.SGLANG_OPT_MOK_FP8_NATIVE_FUSED_GEMM_COMBINE.get(),
         )

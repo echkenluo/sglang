@@ -888,6 +888,11 @@ class Envs:
     # this replaces DeepEP dispatch/combine as well as expert compute.
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
+    # Terminal DeepSeek-V4 specialization: one EP4 megakernel owns dispatch,
+    # both expert GEMMs, activation, combine, and reduction.  This flag implies
+    # the native path on its own.  Eager-only while the terminal graph contract
+    # is being validated; always fail-closed.
+    SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
     # First fusion cut: input barrier + pull dispatch + gate/up GEMM as one
     # persistent kernel (strict contract only). Off by default.

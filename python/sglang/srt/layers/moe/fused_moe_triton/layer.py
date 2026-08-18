@@ -1201,6 +1201,11 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        # The terminal adapter is deliberately eager-only.  Enter it before
+        # the piecewise graph dispatch so graph mode cannot silently bypass
+        # the strict terminal contract and execute the legacy MoE operator.
+        if envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get():
+            return self.forward_impl(hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1233,7 +1238,10 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         final_hidden_states = None
-        if envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.get():
+        if (
+            envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.get()
+            or envs.SGLANG_OPT_MOK_FP8_NATIVE_TERMINAL.get()
+        ):
             from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
                 maybe_run_mok_fp8_native,
             )
