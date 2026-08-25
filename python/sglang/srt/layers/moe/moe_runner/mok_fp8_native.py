@@ -229,8 +229,13 @@ def native_runtime_contract_error(layer, hidden_states, topk_output) -> Optional
         return "DWDP prefetch integration is unsupported"
     if getattr(layer, "use_triton_kernels", False):
         return "transposed Triton expert weights are unsupported"
-    if getattr(config, "gate_up_interleaved", False):
-        return "interleaved gate/up expert weights are unsupported"
+    # gate_up_interleaved defaults True on FusedMoE but does not describe the
+    # w13 byte layout on this stack: _load_w13 places [gate; up] halves
+    # unconditionally for split w1/w3 checkpoint shards (DeepSeek-V4's case),
+    # and the deepgemm silu stage consumes halves. Interleaved bytes can only
+    # arrive via weight_loader_fused checkpoints, which V4 does not use, so a
+    # blanket flag check here mis-rejects the whole stack (seen live on
+    # 2026-08-25: strict raise on the first prefill batch).
     if is_tbo_enabled() or is_sbo_enabled():
         return "batch-overlap modes are unsupported"
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:

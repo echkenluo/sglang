@@ -156,6 +156,59 @@ class TestMoKSplitContract(unittest.TestCase):
             mok_fp8_native._HIT_COUNTS[("warp_masked", "decode", "na")], 1
         )
 
+    def test_runtime_contract_tolerates_interleave_flag_on_split_checkpoints(self):
+        # V4 loads separate w1/w3 shards: _load_w13 places [gate; up] halves
+        # unconditionally, and the deepgemm silu stage consumes halves, so a
+        # default-True gate_up_interleaved config flag must NOT reject the
+        # contract (audited 2026-08-25 after the CANARY3 strict raise). On
+        # CPU the contract should instead fall through to the CUDA-tensor
+        # requirement -- reaching it proves the interleave check is gone.
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        shapes = _make_shape_inputs()
+
+        class Fp8MoEMethod:
+            pass
+
+        qm = Fp8MoEMethod()
+        qm.quant_config = mock.Mock(weight_block_size=[128, 128])
+        qm.is_fp4_expert = False
+        qm.with_bias = False
+        layer = mock.Mock()
+        layer.quant_method = qm
+        layer.moe_runner_config = mock.Mock(
+            activation="silu", is_gated=True, swiglu_limit=10,
+            apply_router_weight_on_input=False, no_combine=False,
+            gate_up_interleaved=True,
+        )
+        layer.moe_tp_size = 1
+        layer._dwdp_bound = False
+        layer.use_triton_kernels = False
+        layer.w13_weight = shapes["w13_weight"]
+        layer.w13_weight_scale_inv = shapes["w13_scale"]
+        layer.w2_weight = shapes["w2_weight"]
+        layer.w2_weight_scale_inv = shapes["w2_scale"]
+        layer.num_local_experts = shapes["num_local_experts"]
+        layer.num_experts = shapes["num_global_experts"]
+        layer.moe_ep_size = shapes["ep_size"]
+        topk = mock.Mock(
+            topk_ids=shapes["topk_ids"], topk_weights=shapes["topk_weights"]
+        )
+
+        with mock.patch.object(
+            mok_fp8_native.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False
+        ), mock.patch(
+            "sglang.srt.layers.moe.utils.is_sbo_enabled", return_value=False
+        ), mock.patch(
+            "sglang.srt.layers.moe.utils.is_tbo_enabled", return_value=False
+        ):
+            reason = mok_fp8_native.native_runtime_contract_error(
+                layer, shapes["hidden_states"], topk
+            )
+        self.assertEqual(reason, "all full-native tensors must be CUDA tensors")
+
     def test_hit_counter_disabled_is_noop(self):
         from sglang.srt.layers.moe.moe_runner import mok_fp8_native
 
