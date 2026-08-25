@@ -209,6 +209,34 @@ class TestMoKSplitContract(unittest.TestCase):
             )
         self.assertEqual(reason, "all full-native tensors must be CUDA tensors")
 
+    def test_function_level_lazy_imports_resolve(self):
+        # _run_native_core lazily imports kernels at first execution;
+        # py_compile and this CPU suite never execute those lines, which is
+        # how a v0.5.15->v0.5.17 module move (fp8_kernel) survived to a live
+        # scheduler crash (CANARY5). Pin resolution of every function-level
+        # `from sglang...` import in the module.
+        import ast
+        import importlib
+        import inspect
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        tree = ast.parse(inspect.getsource(mok_fp8_native))
+        lazy = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.ImportFrom) and sub.module and \
+                            sub.module.startswith("sglang"):
+                        lazy.append((sub.module, [a.name for a in sub.names]))
+        self.assertTrue(lazy, "expected at least one lazy sglang import")
+        for module, names in lazy:
+            mod = importlib.import_module(module)
+            for name in names:
+                self.assertTrue(
+                    hasattr(mod, name), f"{module} lacks {name}"
+                )
+
     def test_hit_counter_disabled_is_noop(self):
         from sglang.srt.layers.moe.moe_runner import mok_fp8_native
 
