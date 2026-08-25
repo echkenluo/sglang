@@ -20,6 +20,33 @@ from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 logger = logging.getLogger(__name__)
 
 
+_HIT_COUNTS: dict = {}
+
+
+def _note_path_hit(path: str, *, mode: str, num_tokens: Optional[int]):
+    """Env-gated canary counter for MoE path-coexistence evidence.
+
+    _report_active and the warp first-hit log fire once per process, so
+    their absence proves nothing about later batches; behind
+    SGLANG_MOE_PATH_HIT_COUNTERS every hit is counted by
+    (path, mode, token-bucket) and a line is emitted on the first hit and
+    every 500th.  Returns the emitted line, or None."""
+    if not envs.SGLANG_MOE_PATH_HIT_COUNTERS.get():
+        return None
+    if num_tokens is None:
+        bucket = "na"
+    else:
+        bucket = "ge256" if num_tokens >= 256 else "lt256"
+    key = (path, mode, bucket)
+    count = _HIT_COUNTS.get(key, 0) + 1
+    _HIT_COUNTS[key] = count
+    if count == 1 or count % 500 == 0:
+        line = f"MOE_PATH_HIT path={path} mode={mode} bucket={bucket} count={count}"
+        logger.info(line)
+        return line
+    return None
+
+
 _TRAP_WATCHDOG_LOCK = threading.Lock()
 _TRAP_WATCHDOG_ENTRIES: list = []
 _TRAP_WATCHDOG_STARTED = False
@@ -711,6 +738,11 @@ def maybe_run_mok_fp8_native(
     _register_trap_watchdog(workspace, mok_functional)
 
     _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
+    _note_path_hit(
+        "mok",
+        mode="extend" if get_is_extend_in_batch() else "decode",
+        num_tokens=num_tokens,
+    )
 
     use_graph = (
         envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()

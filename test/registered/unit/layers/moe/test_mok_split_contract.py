@@ -123,6 +123,49 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertIs(ctx.exception, sentinel)
         self.assertEqual(envs.SGLANG_OPT_MOK_MIN_TOKENS.default, 0)
 
+    def test_hit_counter_records_and_logs_thresholds(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        with envs.SGLANG_MOE_PATH_HIT_COUNTERS.override(True):
+            mok_fp8_native._HIT_COUNTS.clear()
+            emitted = []
+            for i in range(501):
+                line = mok_fp8_native._note_path_hit(
+                    "mok", mode="extend", num_tokens=512
+                )
+                if line:
+                    emitted.append((i, line))
+        self.assertEqual(
+            mok_fp8_native._HIT_COUNTS[("mok", "extend", "ge256")], 501
+        )
+        # first hit and every 500th emit a line
+        self.assertEqual([i for i, _ in emitted], [0, 499])
+        self.assertIn("path=mok mode=extend bucket=ge256", emitted[0][1])
+
+    def test_hit_counter_buckets_and_na(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        with envs.SGLANG_MOE_PATH_HIT_COUNTERS.override(True):
+            mok_fp8_native._HIT_COUNTS.clear()
+            mok_fp8_native._note_path_hit("mok", mode="extend", num_tokens=255)
+            mok_fp8_native._note_path_hit("warp_masked", mode="decode", num_tokens=None)
+        self.assertEqual(
+            mok_fp8_native._HIT_COUNTS[("mok", "extend", "lt256")], 1
+        )
+        self.assertEqual(
+            mok_fp8_native._HIT_COUNTS[("warp_masked", "decode", "na")], 1
+        )
+
+    def test_hit_counter_disabled_is_noop(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        mok_fp8_native._HIT_COUNTS.clear()
+        self.assertIsNone(
+            mok_fp8_native._note_path_hit("mok", mode="decode", num_tokens=8)
+        )
+        self.assertEqual(len(mok_fp8_native._HIT_COUNTS), 0)
+        self.assertFalse(envs.SGLANG_MOE_PATH_HIT_COUNTERS.default)
+
 
 if __name__ == "__main__":
     unittest.main()

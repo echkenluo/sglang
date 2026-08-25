@@ -82,6 +82,18 @@ def _load_ext():
     return _ext
 
 
+_hit_counters_enabled_cache: Optional[bool] = None
+
+
+def _hit_counters_enabled() -> bool:
+    global _hit_counters_enabled_cache
+    if _hit_counters_enabled_cache is None:
+        from sglang.srt.environ import envs
+
+        _hit_counters_enabled_cache = envs.SGLANG_MOE_PATH_HIT_COUNTERS.get()
+    return _hit_counters_enabled_cache
+
+
 def _reject(reason: str) -> bool:
     if _VERBOSE and reason not in _logged_reject:
         _logged_reject.add(reason)
@@ -230,6 +242,19 @@ def masked_run(
             "warp-decode MASKED path ACTIVE: E=%d max_m=%d hidden=%d inter=%d "
             "limit=%s pair_slots=%d",
             E, max_m, hidden, inter, swiglu_limit, _PAIR_SLOTS,
+        )
+
+    # Canary-only coexistence counter. The enabled flag is cached once per
+    # process so the off-path cost in the decode hot loop stays at a global
+    # read; lazy imports keep this module free of the heavy mok chain.
+    if _hit_counters_enabled():
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import _note_path_hit
+
+        _note_path_hit(
+            "warp_masked",
+            mode="extend" if get_is_extend_in_batch() else "decode",
+            num_tokens=None,
         )
 
     ext.moe_warp_masked_fp8(
