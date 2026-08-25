@@ -256,6 +256,43 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+
+
+    # WARP_DECODE_V0517_BEGIN
+    from sglang.srt.layers.moe.moe_runner.triton_utils import warp_decode_moe
+
+    # v0.5.17 may provide a pre-quantized activation.  The Warp kernel consumes
+    # BF16 hidden_states directly, so retain the stock path in that case.
+    if a1_q is None and warp_decode_moe.should_use(
+        hidden_states,
+        w1,
+        w2,
+        topk_ids,
+        moe_runner_config,
+        b1=b1,
+        b2=b2,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        block_shape=block_shape,
+    ):
+        return warp_decode_moe.run_fused_experts(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            moe_runner_config,
+        )
+    # WARP_DECODE_V0517_END
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts

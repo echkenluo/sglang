@@ -488,6 +488,33 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states_device = running_state["hidden_states_device"]
 
+
+        # WARP_DECODE_V0517_BEGIN
+        from sglang.srt.layers.moe.moe_runner.triton_utils import warp_decode_moe
+
+        # v0.5.17 MXFP8 has different scale layout semantics.  Warp masked is
+        # currently defined only for the model's FP8 E4M3 block-128 path.
+        if (
+            not getattr(quant_info, "use_mxfp8", False)
+            and warp_decode_moe.masked_should_use(
+                hidden_states,
+                hidden_states_scale,
+                masked_m,
+                expected_m,
+                quant_info,
+                self.swiglu_limit,
+                running_state,
+            )
+        ):
+            return warp_decode_moe.masked_run(
+                hidden_states,
+                hidden_states_scale,
+                masked_m,
+                quant_info,
+                self.swiglu_limit,
+            )
+        # WARP_DECODE_V0517_END
+
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
