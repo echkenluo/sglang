@@ -472,7 +472,9 @@ def _run_native_core(
     from sglang.kernels.ops.attention.dsv4 import (
         silu_and_mul_contig_post_quant_dynamic,
     )
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    # v0.5.17 moved this kernel from srt.layers.quantization.fp8_kernel to
+    # the sglang.kernels tree (same name and keyword surface).
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
