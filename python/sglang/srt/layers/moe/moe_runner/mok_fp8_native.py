@@ -28,9 +28,11 @@ def _note_path_hit(path: str, *, mode: str, num_tokens: Optional[int]):
 
     _report_active and the warp first-hit log fire once per process, so
     their absence proves nothing about later batches; behind
-    SGLANG_MOE_PATH_HIT_COUNTERS every hit is counted by
-    (path, mode, token-bucket) and a line is emitted on the first hit and
-    every 500th.  Returns the emitted line, or None."""
+    SGLANG_MOE_PATH_HIT_COUNTERS every **Python-path invocation** is
+    counted by (path, mode, token-bucket) and a line is emitted on the
+    first hit and every 500th. CUDA-graph replay does not re-enter Python,
+    so under graph the decode counts reflect capture-time and eager-path
+    invocations only. Returns the emitted line, or None."""
     if not envs.SGLANG_MOE_PATH_HIT_COUNTERS.get():
         return None
     if num_tokens is None:
