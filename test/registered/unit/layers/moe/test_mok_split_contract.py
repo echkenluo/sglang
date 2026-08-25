@@ -73,6 +73,56 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.default)
 
+    def _gate_call(self, tokens, extend, min_tokens):
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        hidden = torch.empty((tokens, 256), dtype=torch.bfloat16)
+        sentinel = RuntimeError("gate passed")
+        with envs.SGLANG_OPT_MOK_MIN_TOKENS.override(min_tokens), mock.patch.object(
+            mok_fp8_native, "get_is_extend_in_batch", return_value=extend
+        ), mock.patch.object(mok_fp8_native, "get_tp_group", side_effect=sentinel):
+            try:
+                result = mok_fp8_native.maybe_run_mok_fp8_native(
+                    layer=mock.Mock(), hidden_states=hidden, topk_output=mock.Mock()
+                )
+            except RuntimeError as exc:
+                self.assertIs(exc, sentinel)
+                return "passed_gate"
+        self.assertIsNone(result)
+        return "gated_off"
+
+    def test_min_tokens_gate_rejects_decode_even_when_large(self):
+        self.assertEqual(self._gate_call(4096, extend=False, min_tokens=256), "gated_off")
+
+    def test_min_tokens_gate_boundary_255_256_257(self):
+        self.assertEqual(self._gate_call(255, extend=True, min_tokens=256), "gated_off")
+        self.assertEqual(self._gate_call(256, extend=True, min_tokens=256), "passed_gate")
+        self.assertEqual(self._gate_call(257, extend=True, min_tokens=256), "passed_gate")
+
+    def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        hidden = torch.empty((8, 256), dtype=torch.bfloat16)
+        sentinel = RuntimeError("gate bypassed")
+        # With the default min_tokens=0 the gate must not touch the forward
+        # context at all: get_is_extend_in_batch would raise AssertionError
+        # if consulted, so reaching the get_tp_group sentinel proves bypass.
+        with mock.patch.object(
+            mok_fp8_native,
+            "get_is_extend_in_batch",
+            side_effect=AssertionError("must not be called"),
+        ), mock.patch.object(mok_fp8_native, "get_tp_group", side_effect=sentinel):
+            with self.assertRaises(RuntimeError) as ctx:
+                mok_fp8_native.maybe_run_mok_fp8_native(
+                    layer=mock.Mock(), hidden_states=hidden, topk_output=mock.Mock()
+                )
+        self.assertIs(ctx.exception, sentinel)
+        self.assertEqual(envs.SGLANG_OPT_MOK_MIN_TOKENS.default, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

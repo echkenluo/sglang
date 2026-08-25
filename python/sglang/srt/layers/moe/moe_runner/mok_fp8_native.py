@@ -15,6 +15,7 @@ import torch.distributed as dist
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 
 logger = logging.getLogger(__name__)
 
@@ -620,6 +621,18 @@ def maybe_run_mok_fp8_native(
     layer, hidden_states, topk_output, *, pre_quant_input=None
 ):
     """Return native output, or ``None`` before any MoK collective on fallback."""
+    # Policy gate, not a contract error: when armed (min_tokens > 0) the
+    # native path only takes extend batches of at least min_tokens tokens.
+    # get_is_extend_in_batch() is the same predicate DeepEP auto uses to
+    # pick normal vs low-latency dispatch, and graph runners force it to
+    # False around capture, so gated-off batches (all decode, short extend)
+    # fall through to the stock DeepEP path -- where the warp masked kernel
+    # may take decode -- before any collective or strict-contract check.
+    min_tokens = envs.SGLANG_OPT_MOK_MIN_TOKENS.get()
+    if min_tokens > 0 and (
+        not get_is_extend_in_batch() or hidden_states.shape[0] < min_tokens
+    ):
+        return None
     group = get_tp_group().device_group
     reason = (
         "pre-quantized MoE input is unsupported"
