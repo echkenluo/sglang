@@ -1451,42 +1451,57 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        if self._dwdp_bound:
-            dwdp_mgr = get_global_dwdp_manager()
-            dwdp_mgr.wait_prefetch(self.layer_id)
-
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
-        if (
-            pre_quant_input is not None
-            and dispatch_output.format.is_standard()
-            and dispatch_output.hidden_states_scale is None
-        ):
-            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
-            # passthrough, so the caller's pre-quantized (q, scale) pair still
-            # matches dispatch_output.hidden_states; attach it for the triton
-            # fused runner to skip its own activation quant.
-            dispatch_output = dispatch_output._replace(
-                hidden_states_pre_quant=pre_quant_input
+        final_hidden_states = None
+        if envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.get():
+            from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+                maybe_run_mok_fp8_native,
             )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+            final_hidden_states = maybe_run_mok_fp8_native(
+                self,
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+            )
 
-        if self._dwdp_bound:
-            dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
+        if final_hidden_states is None:
+            if self._dwdp_bound:
+                dwdp_mgr = get_global_dwdp_manager()
+                dwdp_mgr.wait_prefetch(self.layer_id)
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
+            if (
+                pre_quant_input is not None
+                and dispatch_output.format.is_standard()
+                and dispatch_output.hidden_states_scale is None
+            ):
+                # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
+                # passthrough, so the caller's pre-quantized (q, scale) pair
+                # still matches dispatch_output.hidden_states.
+                dispatch_output = dispatch_output._replace(
+                    hidden_states_pre_quant=pre_quant_input
+                )
 
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
+
+            if self._dwdp_bound:
+                dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
+
+        # TODO: should we add some conditions here?
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

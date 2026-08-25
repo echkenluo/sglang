@@ -1214,6 +1214,13 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
+    # H20/SM90 opt-in: replace DeepEP dispatch, routed expert compute, and
+    # combine with the non-fused MoK split path. Strict mode rejects any
+    # unsupported layer or shape instead of silently mixing implementations.
+    SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
+    SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
+
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
