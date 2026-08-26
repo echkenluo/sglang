@@ -71,6 +71,11 @@ else:
 logger = logging.getLogger(__name__)
 
 
+# Token-aligned internal telemetry. The scheduler emits a non-null marker on
+# the accepted </think> token; the Responses layer reduces it to close_kind.
+REASONING_CLOSE_KIND_CUSTOM_INFO_KEY = "__sglang_reasoning_close_kind__"
+
+
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
 
@@ -283,6 +288,12 @@ class GenerateReqInput:
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
+    # Per-request TTFT profiling breadcrumbs (SGLANG_REQUEST_PROF=1): dict of
+    # serving-layer timestamps/durations attached by serving_base, consumed at
+    # the TokenizerManager first-token point ([req-prof] line). Deliberately
+    # not propagated to batched sub-requests (single-request streaming chat is
+    # the covered path).
+    req_prof: Optional[Dict[str, Any]] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None

@@ -475,6 +475,22 @@ def _handle_ngram(server_args: ServerArgs) -> None:
 
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
+    if server_args.speculative_ngram_draft_tiers is not None:
+        tiers = sorted(set(server_args.speculative_ngram_draft_tiers))
+        if not tiers or any(t <= 0 for t in tiers):
+            raise ValueError(
+                "--speculative-ngram-draft-tiers must be positive integers, got "
+                f"{server_args.speculative_ngram_draft_tiers}."
+            )
+        server_args.speculative_ngram_draft_tiers = tiers
+        # The cap drives every size-dependent path (corpus query budget, KV
+        # reserve per decode, mamba intermediate buffers, CUDA graph shape).
+        server_args.speculative_num_draft_tokens = tiers[-1]
+        logger.info(
+            "Ngram draft tiers %s; speculative_num_draft_tokens set to cap %d.",
+            tiers,
+            tiers[-1],
+        )
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 12
         logger.warning(

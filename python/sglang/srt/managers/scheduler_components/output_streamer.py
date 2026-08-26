@@ -19,6 +19,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    REASONING_CLOSE_KIND_CUSTOM_INFO_KEY,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -512,6 +513,26 @@ class _GenerationStreamAccumulator:
                     if req_values is None
                     else req_values[send_token_offset : len(output_ids_)]
                 )
+
+        # Emit close-kind exactly on the accepted </think> token. The existing
+        # token-aligned customized_info path handles streaming and speculative
+        # output without introducing another IPC shape.
+        grammar = getattr(req, "grammar", None)
+        close_kind = getattr(grammar, "thinking_close_kind", None)
+        think_end_id = getattr(grammar, "think_end_id", None)
+        if close_kind is not None and think_end_id is not None:
+            close_markers = [
+                close_kind if token_id == think_end_id else None
+                for token_id in output_ids_[send_token_offset:]
+            ]
+            if any(marker is not None for marker in close_markers):
+                key = REASONING_CLOSE_KIND_CUSTOM_INFO_KEY
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [None] * len(prev_output_ids)
+                        for prev_output_ids in self.output_ids[:-1]
+                    ]
+                self.customized_info[key].append(close_markers)
 
         for per_request_values in self.customized_info.values():
             if len(per_request_values) < len(self.output_ids):

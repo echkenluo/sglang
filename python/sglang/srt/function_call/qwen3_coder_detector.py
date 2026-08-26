@@ -33,7 +33,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            r"<parameter=(.*?)(?:</parameter>|</parameter(?=\s*(?:<parameter=|</function>|$))|(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
         )
 
@@ -313,12 +313,24 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
+                    incomplete_end_token = self.parameter_end_token[:-1]
+                    cand_incomplete_end_param = rest_of_slice.find(
+                        incomplete_end_token
+                    )
 
                     candidates = []
                     if cand_end_param != -1:
                         candidates.append(
                             (cand_end_param, len(self.parameter_end_token))
                         )
+                    if cand_incomplete_end_param != -1:
+                        tail = rest_of_slice[
+                            cand_incomplete_end_param + len(incomplete_end_token) :
+                        ]
+                        if re.match(r"\s*(?:<parameter=|</function>)", tail):
+                            candidates.append(
+                                (cand_incomplete_end_param, len(incomplete_end_token))
+                            )
                     if cand_next_param != -1:
                         candidates.append((cand_next_param, 0))
                     if cand_end_func != -1:

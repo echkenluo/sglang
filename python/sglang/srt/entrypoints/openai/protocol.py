@@ -1308,6 +1308,29 @@ class ResponseReasoningParam(BaseModel):
         default=None,
         description="Include a summary of the model's reasoning trace on the response.",
     )
+    thinking_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "SGLang extension: emergency hard ceiling for tokens inside the "
+            "current thinking segment. Overrides the effort-to-budget mapping."
+        ),
+    )
+    soft_thinking_target: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "SGLang extension: after this many thinking tokens, close at the "
+            "next natural boundary while retaining thinking_budget as a ceiling."
+        ),
+    )
+
+
+RESPONSES_REASONING_EFFORT_BUDGETS = {
+    "low": 128,
+    "medium": 512,
+    "high": 2048,
+}
 
 
 # Only ``function`` / ``web_search*`` / ``code_interpreter`` are wired to
@@ -1381,6 +1404,14 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
     reasoning: Optional[ResponseReasoningParam] = None
+    thinking_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "SGLang-compatible emergency hard thinking-token ceiling. Takes precedence "
+            "over reasoning.thinking_budget and reasoning.effort."
+        ),
+    )
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
     store: Optional[bool] = True
     stream: Optional[bool] = False
@@ -1440,6 +1471,35 @@ class ResponsesRequest(BaseModel):
         ]
         return values
 
+    @model_validator(mode="after")
+    def validate_soft_thinking_target(self):
+        target = self.resolved_soft_thinking_target()
+        if target is None:
+            return self
+        budget = self.resolved_thinking_budget()
+        if budget is None:
+            raise ValueError("soft_thinking_target requires a hard thinking budget")
+        if target >= budget:
+            raise ValueError("soft_thinking_target must be smaller than thinking_budget")
+        return self
+
+    def resolved_thinking_budget(self) -> Optional[int]:
+        """Resolve exact hard ceiling first, then the effort mapping."""
+        if self.thinking_budget is not None:
+            return self.thinking_budget
+        if self.reasoning is None:
+            return None
+        if self.reasoning.thinking_budget is not None:
+            return self.reasoning.thinking_budget
+        if self.reasoning.effort is None:
+            return None
+        return RESPONSES_REASONING_EFFORT_BUDGETS[self.reasoning.effort]
+
+    def resolved_soft_thinking_target(self) -> Optional[int]:
+        if self.reasoning is None:
+            return None
+        return self.reasoning.soft_thinking_target
+
     @staticmethod
     def _normalize_input_item_for_validation(item):
         if not isinstance(item, dict):
@@ -1462,6 +1522,11 @@ class ResponsesRequest(BaseModel):
             return part
 
         part_type = part.get("type")
+        if part_type == "output_text" and part.get("logprobs") is None:
+            part = part.copy()
+            part.pop("logprobs", None)
+            return part
+
         if part_type != "input_image" or part.get("detail") is not None:
             return part
 
@@ -1662,6 +1727,8 @@ class ResponsesResponse(BaseModel):
             reasoning={
                 "effort": request.reasoning.effort if request.reasoning else None,
                 "summary": None,  # unused
+                "thinking_budget": request.resolved_thinking_budget(),
+                "soft_thinking_target": request.resolved_soft_thinking_target(),
             },
             store=request.store,
             temperature=request.temperature,

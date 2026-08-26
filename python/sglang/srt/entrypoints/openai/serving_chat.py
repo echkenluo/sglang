@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from enum import Enum
+from time import perf_counter
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -65,7 +66,15 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.entrypoints.openai.incremental_encode import (
+    IncrementalTokenizeCache,
+    inc_tok_mode,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_prof import (
+    add_mark as req_prof_add_mark,
+    req_prof_enabled,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -231,6 +240,24 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        # Incremental prompt tokenization cache (SGLANG_INCREMENTAL_TOKENIZE);
+        # created lazily on first use so the off mode allocates nothing.
+        self._inc_tok_cache = None
+
+    def _encode_prompt_ids(self, rendered_prompt: str, encode_kwargs: dict):
+        """Encode the rendered chat prompt, via the incremental cache when
+        SGLANG_INCREMENTAL_TOKENIZE is on/verify (append-only agent prompts
+        re-encode only the tail). Off mode is a straight passthrough."""
+        if inc_tok_mode():
+            if self._inc_tok_cache is None:
+                self._inc_tok_cache = IncrementalTokenizeCache()
+            return self._inc_tok_cache.encode(
+                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+            )
+        return self.tokenizer_manager.tokenizer.encode(
+            rendered_prompt, **encode_kwargs
+        )
 
     def _handle_last_assistant_message(
         self,
@@ -862,6 +889,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
+                _rp_t = perf_counter() if req_prof_enabled() else 0.0
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=False,
@@ -870,9 +898,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
+                if req_prof_enabled():
+                    req_prof_add_mark("template", perf_counter() - _rp_t)
+                    _rp_t = perf_counter()
+                prompt_ids = self._encode_prompt_ids(rendered_prompt, encode_kwargs)
+                if req_prof_enabled():
+                    req_prof_add_mark("encode", perf_counter() - _rp_t)
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -882,6 +913,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
+                    _rp_t = perf_counter() if req_prof_enabled() else 0.0
                     rendered_prompt = (
                         self.tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
@@ -892,9 +924,14 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
+                    if req_prof_enabled():
+                        req_prof_add_mark("template", perf_counter() - _rp_t)
+                        _rp_t = perf_counter()
+                    prompt_ids = self._encode_prompt_ids(
+                        rendered_prompt, encode_kwargs
                     )
+                    if req_prof_enabled():
+                        req_prof_add_mark("encode", perf_counter() - _rp_t)
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)

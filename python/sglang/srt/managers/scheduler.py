@@ -861,6 +861,16 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+        # Temporary diagnostic (SGLANG_BOOT_MODE_PROBE=1): classify this
+        # boot's CUDA API service-latency ticket. Runs after ALL graph
+        # captures (target cap-width above, then NGRAM per-tier graphs via
+        # draft_worker.init_cuda_graphs) so the probe sees steady state.
+        from sglang.srt.observability.boot_mode_probe import (
+            maybe_run_boot_mode_probe,
+        )
+
+        maybe_run_boot_mode_probe(self.ps.tp_rank)
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -1532,9 +1542,18 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        from sglang.srt.observability.step_prof import StepProf
+
+        # Per-iteration segment profiler (SGLANG_STEP_PROF=1); decode-only
+        # stats. Only meaningful under --disable-overlap-schedule (this loop);
+        # overlap lanes rely on the worker-side profilers + torch profiler.
+        step_prof = StepProf.maybe_create("sched_loop", self.ps.tp_rank)
+
         while True:
             if self.gracefully_exit:
                 break
+
+            t0 = time.perf_counter() if step_prof else 0.0
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1542,14 +1561,26 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            t1 = time.perf_counter() if step_prof else 0.0
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            t2 = time.perf_counter() if step_prof else 0.0
+
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                t3 = time.perf_counter() if step_prof else 0.0
                 self.process_batch_result(batch, result)
+                if step_prof and batch.forward_mode.is_decode():
+                    t4 = time.perf_counter()
+                    step_prof.add("recv", t1 - t0)
+                    step_prof.add("schedule", t2 - t1)
+                    step_prof.add("launch", t3 - t2)
+                    step_prof.add("process", t4 - t3)
+                    step_prof.end_step(t4 - t0)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1558,6 +1589,16 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _needs_spec_grammar_sync_before_schedule(self) -> bool:
+        """Whether a speculative grammar result must retire before scheduling."""
+        last_batch = self.last_batch
+        return bool(
+            self.result_queue
+            and last_batch
+            and not last_batch.spec_algorithm.is_none()
+            and last_batch.has_grammar
+        )
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -1582,6 +1623,14 @@ class Scheduler(
                 continue
 
             self._apply_war_barrier()
+            processed_last_batch = False
+            # Speculative grammar batches are already a no-overlap path. Drain
+            # their prior result before building the next batch so a completed
+            # request cannot free Mamba state after scheduling selected it.
+            if self._needs_spec_grammar_sync_before_schedule():
+                pop_and_process()
+                processed_last_batch = True
+
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1590,7 +1639,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not processed_last_batch:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1610,7 +1659,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not processed_last_batch
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states

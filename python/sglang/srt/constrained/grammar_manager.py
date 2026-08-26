@@ -79,12 +79,26 @@ class GrammarManager:
         thinking_budget = custom_params.get("thinking_budget")
         return thinking_budget if isinstance(thinking_budget, int) else None
 
+    def _get_request_soft_thinking_target(self, req: Req) -> int | None:
+        custom_params = req.sampling_params.custom_params
+        if not isinstance(custom_params, dict):
+            return None
+        target = custom_params.get("soft_thinking_target")
+        return target if isinstance(target, int) else None
+
     def _apply_request_reasoning_budget(self, req: Req) -> None:
         thinking_budget = self._get_request_thinking_budget(req)
         if thinking_budget is None:
             return
         if isinstance(req.grammar, ReasonerGrammarObject):
             req.grammar.max_think_tokens = thinking_budget
+            req.grammar.enable_token_filter = True
+            target = self._get_request_soft_thinking_target(req)
+            if target is not None:
+                req.grammar.soft_think_tokens = target
+                req.grammar.soft_close_after_token_ids = set(
+                    self.grammar_backend.soft_close_after_token_ids
+                )
 
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
@@ -133,6 +147,28 @@ class GrammarManager:
             if grammar_obj is not None:
                 req.grammar = grammar_obj
                 self._apply_request_reasoning_budget(req)
+        elif self._get_request_thinking_budget(req) is not None:
+            if self.grammar_backend is None or not hasattr(
+                self.grammar_backend, "init_budget_reasoning_grammar"
+            ):
+                req.set_finish_with_abort(
+                    "Per-request thinking controls require a reasoning parser and "
+                    "a grammar backend with token filtering support."
+                )
+            else:
+                target = self._get_request_soft_thinking_target(req)
+                if target is None:
+                    grammar_obj = self.grammar_backend.init_budget_reasoning_grammar(
+                        req.require_reasoning,
+                        self._get_request_thinking_budget(req),
+                    )
+                else:
+                    grammar_obj = self.grammar_backend.init_budget_reasoning_grammar(
+                        req.require_reasoning,
+                        self._get_request_thinking_budget(req),
+                        target,
+                    )
+                req.grammar = grammar_obj
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)

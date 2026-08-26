@@ -94,6 +94,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.observability.moe_expert_prof import (
+    moe_expert_prof_enabled,
+    record_moe_experts,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -2175,6 +2179,11 @@ def select_experts(
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids
     )
+
+    # Distinct-routed-expert counter (SGLANG_MOE_EXPERT_PROF=1). Observation
+    # only — reads the finalized ids, never mutates routing. Default OFF.
+    if moe_expert_prof_enabled():
+        record_moe_experts(recorder_topk_ids, router_logits)
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:

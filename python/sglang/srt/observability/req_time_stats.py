@@ -626,6 +626,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
+            # Must survive multi-hop serialization: the detokenizer unpickles
+            # this object (enable_metrics falls back to the False class
+            # default since it was not in the state) and re-serializes it on
+            # the way to the tokenizer — without carrying the flag, that
+            # second __getstate__ takes the `return {}` branch and strips the
+            # timestamps, so downstream consumers only ever see zeros.
+            "enable_metrics": True,
         }
         return state
 

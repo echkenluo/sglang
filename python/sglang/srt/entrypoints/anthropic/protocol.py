@@ -46,6 +46,12 @@ class AnthropicUsage(BaseModel):
     output_tokens: Optional[NonNegativeInt] = None
     cache_creation_input_tokens: Optional[NonNegativeInt] = None
     cache_read_input_tokens: Optional[NonNegativeInt] = None
+    # sglang extensions (GASR cache export): raw OpenAI-style prompt token
+    # details (``{"cached_tokens": N}``) and the device/host/storage
+    # cache-tier breakdown. Omitted entirely when the backend does not
+    # report cache details.
+    prompt_tokens_details: Optional[dict[str, Any]] = None
+    sglang_cached_tokens_details: Optional[dict[str, Any]] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
@@ -378,6 +384,14 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # sglang extensions (GASR cache export / request tracing). ``None`` on
+    # ``return_cached_tokens_details`` falls back to the server's
+    # ``enable_cache_report`` setting; the other keys are forwarded to the
+    # OpenAI-compatible layer unchanged.
+    return_cached_tokens_details: Optional[bool] = None
+    rid: Optional[Union[str, list[str]]] = None
+    extra_key: Optional[Union[str, list[str]]] = None
+    cache_salt: Optional[Union[str, list[str]]] = None
 
     @field_validator("model")
     @classmethod
@@ -451,6 +465,9 @@ class MessageDeltaEvent(BaseModel):
     type: Literal["message_delta"] = "message_delta"
     delta: AnthropicMessageEndDelta
     usage: AnthropicUsage
+    # sglang extension (GASR cache export): response-level extension
+    # payload mirroring the OpenAI ``sglext`` field. Omitted when absent.
+    sglext: Optional[dict[str, Any]] = None
 
 
 class MessageStopEvent(BaseModel):
@@ -511,6 +528,9 @@ class AnthropicMessagesResponse(BaseModel):
     ] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
+    # sglang extension (GASR cache export): response-level extension
+    # payload mirroring the OpenAI ``sglext`` field. Omitted when absent.
+    sglext: Optional[dict[str, Any]] = None
 
 
 # Resolve forward references for nested types.

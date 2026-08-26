@@ -1,4 +1,5 @@
 import logging
+from time import perf_counter
 from typing import List, Optional
 
 import numpy as np
@@ -11,6 +12,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.step_prof import StepProf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -43,6 +45,78 @@ class NGRAMWorker(BaseSpecWorker):
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
 
+    def init_cuda_graphs(self):
+        """Build one (target attn backend, decode graph runner) pair per
+        non-cap tier so every tier's verify runs on a CUDA graph.
+
+        The scheduler calls this after the target worker captured its own
+        decode graphs (at the cap width), so ``model_runner.decode_cuda_graph_runner``
+        already exists. Each tier gets its own attention backend instance
+        because the backend's cuda-graph state (e.g. the mamba verify
+        query_start_loc cache) is width-shaped; runtime switching is two
+        pointer swaps before the verify forward (same mechanism as the
+        adaptive SpecRuntimeState swap in eagle_worker_v2).
+        """
+        mr = self.model_runner
+        cap = self.draft_token_num
+        main_runner = getattr(mr, "decode_cuda_graph_runner", None)
+        self._tier_runtime = {cap: (mr.attn_backend, main_runner)}
+        self._active_tier = cap
+        if len(self.draft_tiers) == 1:
+            return
+        if main_runner is None:
+            # Graphs disabled: the eager metadata path is fully shape-dynamic,
+            # so all tiers run eager on the main backend.
+            logger.info(
+                "[ngram-bet-short] cuda graphs disabled; tiers %s run eager",
+                self.draft_tiers,
+            )
+            return
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.utils import get_available_gpu_memory
+
+        for d in self.draft_tiers[:-1]:
+            tic = perf_counter()
+            before_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+            backup_ws = mr.init_new_workspace
+            try:
+                tier_backend = mr._get_attention_backend(init_new_workspace=True)
+            finally:
+                mr.init_new_workspace = backup_ws
+            tier_runner = DecodeCudaGraphRunner(
+                mr,
+                attn_backend=tier_backend,
+                speculative_num_draft_tokens=d,
+            )
+            self._tier_runtime[d] = (tier_backend, tier_runner)
+            after_mem = get_available_gpu_memory(mr.device, mr.gpu_id)
+            logger.info(
+                "[ngram-bet-short] captured tier d=%d verify graphs: "
+                "elapsed=%.1fs mem=%.2fGB avail=%.2fGB",
+                d,
+                perf_counter() - tic,
+                before_mem - after_mem,
+                after_mem,
+            )
+
+    def _activate_tier(self, d: int) -> None:
+        """Point the target model_runner at tier ``d``'s verify runtime.
+
+        Lazy switch: only swaps when the tier changes. With graphs disabled
+        (no prebuilt pair) the main backend stays active — its eager path
+        reads all widths from spec_info dynamically.
+        """
+        if d == self._active_tier:
+            return
+        pair = self._tier_runtime.get(d)
+        if pair is not None:
+            mr = self.model_runner
+            mr.attn_backend, mr.decode_cuda_graph_runner = pair
+        self._active_tier = d
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -74,6 +148,40 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+
+        # Variable-length drafting, bet-short policy: candidate per-step draft
+        # lengths. The corpus is always queried at the cap (= max tier =
+        # speculative_num_draft_tokens) and the draft tree is truncated to the
+        # chosen tier. Default is the SMALLEST tier (verify width is the
+        # dominant per-step cost: MoE expert amplification grows with token
+        # count); the largest tier is bet only on a strong current-step match
+        # signal (draft-tree depth >= bet_long_depth). A single tier keeps
+        # static behavior.
+        self.draft_tiers: List[int] = sorted(
+            server_args.speculative_ngram_draft_tiers
+            or [server_args.speculative_num_draft_tokens]
+        )
+        assert self.draft_tiers[-1] == self.draft_token_num
+        self._bet_long_depth = server_args.speculative_ngram_bet_long_depth
+        # EMA of accepted drafts per verify step. Observability only — NOT a
+        # tier gate: it lags one step and pins the tier at the minimum
+        # (Phase 0 finding); up-tiering keys on the current-step tree depth.
+        self._accept_len_ema = 0.0
+        self._verify_step_count = 0
+        self._last_step_stats = None  # (chosen_tier, can_run_cuda_graph)
+        # Per-tier verify runtime pairs (target attn backend, decode graph
+        # runner), keyed by draft length; built in init_cuda_graphs after the
+        # target worker captured its cap-width graphs.
+        self._tier_runtime: dict = {}
+        self._active_tier = self.draft_token_num
+        # Stride of the accept_tokens staging consumed from batch.spec_info in
+        # _prepare_draft_tokens; _update_ngram_corpus reuses it after
+        # batch.spec_info has been replaced by this step's verify input.
+        self._prev_stride = self.draft_token_num
+
+        # Sampling step-segment profiler (SGLANG_STEP_PROF=1). None when
+        # disabled: every instrumentation site is guarded, zero overhead.
+        self._step_prof = StepProf.maybe_create("ngram_spec", tp_rank)
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -179,30 +287,65 @@ class NGRAMWorker(BaseSpecWorker):
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
 
-        self.draft_tokens_batch = []
-        self.tree_mask_batch = []
-        self.retrieve_indexes_batch = []
-        self.retrieve_next_token_batch = []
-        self.retrieve_next_sibling_batch = []
-        self.positions_batch = []
+        # Pinned host staging for the per-step numpy -> GPU uploads. A pageable
+        # `torch.from_numpy(...)` source forces cudaMemcpyAsync through a
+        # sync-ing driver staging buffer (profiling: ~8 pageable H2D + stream
+        # syncs per step); writing into these reused pinned buffers first
+        # (cheap CPU memcpy + dtype cast, <30KB) makes both H2D copies truly
+        # async. Cross-step reuse is safe: before the next CPU write, the
+        # accept tensors of the previous verify are read back with `.cpu()`
+        # (in _prepare_draft_tokens under overlap, or in the result processor
+        # in sync mode), which drains the stream past the previous H2D.
+        self._drafts_pin = torch.empty(
+            (max_total_drafts,), dtype=torch.int64, pin_memory=True
+        )
+        self._mask_pin = torch.empty(
+            (max_total_mask_size,), dtype=torch.bool, pin_memory=True
+        )
+        self._drafts_pin_np = self._drafts_pin.numpy()
+        self._mask_pin_np = self._mask_pin.numpy()
 
-        for bs in range(0, self.max_batch_size + 1):
-            self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
-            self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
-            self.positions_batch.append(self.positions[: bs * self.draft_token_num])
-            self.draft_tokens_batch.append(
-                self.draft_tokens[: bs * self.draft_token_num]
-            )
-            self.tree_mask_batch.append(
-                self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
-            )
+    def _get_step_views(self, bs: int, d: int):
+        """Carve contiguous (bs, d)/flat views over the cap-sized backings.
+
+        The 2-D backings are (max_batch_size, cap); a [:bs, :d] slice would be
+        non-contiguous for d < cap, so carve from the flat storage instead
+        (downstream kernels assume dense (bs, d) layout).
+        """
+        n = bs * d
+        return (
+            self.retrieve_indexes.view(-1)[:n].view(bs, d),
+            self.retrieve_next_token.view(-1)[:n].view(bs, d),
+            self.retrieve_next_sibling.view(-1)[:n].view(bs, d),
+            self.positions[:n],
+            self.tree_mask[: n * d],
+            self.draft_tokens[:n],
+        )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
         # result processor calls it with batch_size as a keyword argument.
+        if num_correct_drafts_per_req and len(self.draft_tiers) > 1:
+            batch_avg = sum(num_correct_drafts_per_req) / len(
+                num_correct_drafts_per_req
+            )
+            self._accept_len_ema = 0.7 * self._accept_len_ema + 0.3 * batch_avg
+            self._verify_step_count += 1
+            if self._verify_step_count % 32 == 0 and self._last_step_stats is not None:
+                # Under overlap this result lags the stashed step by one
+                # iteration; good enough for low-frequency observability.
+                tier, can_run_graph = self._last_step_stats
+                logger.info(
+                    "[ngram-var-draft] step=%d tier=%d accept_ema=%.2f "
+                    "last_accept=%s cuda_graph=%s",
+                    self._verify_step_count,
+                    tier,
+                    self._accept_len_ema,
+                    num_correct_drafts_per_req,
+                    can_run_graph,
+                )
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
@@ -210,12 +353,19 @@ class NGRAMWorker(BaseSpecWorker):
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
         bs = len(batch.reqs)
-        stride = self.draft_token_num
+        # accept_tokens was laid out by the step that produced batch.spec_info;
+        # with variable drafting its stride can differ from this step's tier,
+        # so always read the producer's stride (and stash it for
+        # _update_ngram_corpus, which runs after spec_info is replaced).
+        stride = batch.spec_info.draft_token_num
+        self._prev_stride = stride
 
         prev_token_ids, prev_accept_lens = (
             batch.spec_info.accept_tokens,
             batch.spec_info.accept_lens,
         )
+        prof = self._step_prof
+        t = perf_counter() if prof else 0.0
         if not prev_token_ids.is_cpu:
             prev_token_ids = prev_token_ids.cpu()
             prev_accept_lens = prev_accept_lens.cpu()
@@ -223,6 +373,10 @@ class NGRAMWorker(BaseSpecWorker):
         # _update_ngram_corpus after verify within the same forward call.
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
+        if prof:
+            # GPU wait: D2H sync on the previous step's accept tensors.
+            prof.add("accept_sync", perf_counter() - t)
+            t = perf_counter()
 
         self.ngram_corpus.synchronize()
         req_ids = []
@@ -256,6 +410,9 @@ class NGRAMWorker(BaseSpecWorker):
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
+        if prof:
+            # Corpus insert-thread sync + token-tail assembly + cpp batchMatch.
+            prof.add("draft_lookup", perf_counter() - t)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -272,17 +429,47 @@ class NGRAMWorker(BaseSpecWorker):
             return
 
         bs = len(batch.reqs)
-
-        retrieve_index = self.retrieve_indexes_batch[bs]
-        retrieve_next_token = self.retrieve_next_token_batch[bs]
-        retrieve_next_sibling = self.retrieve_next_sibling_batch[bs]
-        positions = self.positions_batch[bs]
-        tree_mask = self.tree_mask_batch[bs]
-        draft_tokens = self.draft_tokens_batch[bs]
+        cap = self.draft_token_num
 
         req_drafts, mask = self._prepare_draft_tokens(batch)
-        tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
-        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+        prof = self._step_prof
+        t = perf_counter() if prof else 0.0
+        d = self._choose_draft_tier(bs, mask)
+        if d < cap:
+            # fillResult emits BFS order, so the first d nodes of each
+            # request's tree form a prefix-closed subtree: plain truncation
+            # keeps tokens/mask a valid draft tree.
+            req_drafts = np.ascontiguousarray(
+                req_drafts.reshape(bs, cap)[:, :d]
+            ).reshape(-1)
+            mask = np.ascontiguousarray(
+                mask.reshape(bs, cap, cap)[:, :d, :d]
+            ).reshape(-1)
+        if prof:
+            prof.add("tier_select", perf_counter() - t)
+            t = perf_counter()
+
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            positions,
+            tree_mask,
+            draft_tokens,
+        ) = self._get_step_views(bs, d)
+
+        n_tok = bs * d
+        n_mask = n_tok * d
+        # CPU write into pinned staging (int64 -> bool cast for the mask
+        # happens here, on <=27K elements), then same-dtype async H2D.
+        self._drafts_pin_np[:n_tok] = req_drafts
+        self._mask_pin_np[:n_mask] = mask
+        tree_mask.copy_(self._mask_pin[:n_mask], non_blocking=True)
+        draft_tokens.copy_(self._drafts_pin[:n_tok], non_blocking=True)
+        if prof:
+            # Pinned staging write + async H2D of draft tokens + qlen mask.
+            prof.add("staging_h2d", perf_counter() - t)
+            t = perf_counter()
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
@@ -293,31 +480,39 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token,  # mutable
             retrieve_next_sibling,  # mutable
             bs,
-            self.draft_token_num,
+            d,
         )
+        if prof:
+            prof.add("tree_reconstruct", perf_counter() - t)
+            t = perf_counter()
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
+            # Assemble the full mask on GPU from the qlen mask already staged
+            # in `tree_mask`. The old path re-uploaded each request's (d, d)
+            # block from pageable numpy (sync-forcing cudaMemcpyAsync) and
+            # paid per-req ones/cat/cast kernels; this is one fused ones-fill
+            # plus bs strided D2D writes, bit-identical bool layout
+            # (row r of request i = [True x seq_len_i | tree row r]).
+            qlen_mask = tree_mask.view(bs, d, d)
+            # [:bs] guard: total below sums the list, so any padded tail in
+            # seq_lens_cpu (unlike the old per-index reads) must be excluded.
+            seq_lens_list = batch.seq_lens_cpu[:bs].tolist()
+            total = d * (sum(seq_lens_list) + bs * d)
+            full_mask_out = torch.ones(total, dtype=torch.bool, device=self.device)
+            off = 0
             for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
-                req_mask = torch.cat(
-                    (
-                        req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+                s = seq_lens_list[i]
+                full_mask_out[off : off + d * (s + d)].view(d, s + d)[
+                    :, s:
+                ] = qlen_mask[i]
+                off += d * (s + d)
+            tree_mask = full_mask_out
+        if prof:
+            # Full-mask GPU assembly (ones fill + bs strided D2D writes).
+            prof.add("full_mask", perf_counter() - t)
+            t = perf_counter()
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -325,9 +520,9 @@ class NGRAMWorker(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             req_to_token=batch.req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + self.draft_token_num,
+            end_offset=batch.seq_lens + d,
             batch_size=bs,
-            draft_token_num=self.draft_token_num,
+            draft_token_num=d,
             device=self.device,
         )
 
@@ -340,12 +535,38 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
-            draft_token_num=self.draft_token_num,
+            draft_token_num=d,
         )
+        if prof:
+            prof.add("alloc_prep", perf_counter() - t)
+
+    def _choose_draft_tier(self, bs: int, mask: np.ndarray) -> int:
+        """Cost-driven bet-short tier policy.
+
+        Verify width is the dominant per-step cost on this stack (profiling:
+        MoE expert weight traffic amplifies ~5x from 1 to 16 verify tokens),
+        so default to the SMALLEST tier and bet the largest one only on a
+        strong current-step signal: the draft tree's deepest chain reaching
+        --speculative-ngram-bet-long-depth tokens. The accept-length EMA is
+        deliberately not a gate — it lags one step and pins the tier at the
+        minimum after any miss run (Phase 0 finding).
+        """
+        if len(self.draft_tiers) == 1:
+            return self.draft_tiers[0]
+        cap = self.draft_token_num
+        # A mask row sums root + ancestors + self, so node depth in draft
+        # tokens = row sum - 1; zero-padded rows read as depth 1 and never
+        # dominate a real chain.
+        tree_depth = int(mask.reshape(bs, cap, cap).sum(axis=2).max()) - 1
+        if tree_depth >= self._bet_long_depth:
+            return self.draft_tiers[-1]
+        return self.draft_tiers[0]
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
-        i, stride = 0, self.draft_token_num
+        # prev_token_ids was staged by _prepare_draft_tokens with the stride of
+        # the PREVIOUS step's spec_info (batch.spec_info now holds this step's).
+        i, stride = 0, self._prev_stride
         # Same splice condition as _prepare_draft_tokens: only overlap mode
         # has accepted tokens missing from req.output_ids.
         use_prev_tokens = self.enable_overlap and not batch.has_grammar
@@ -376,6 +597,9 @@ class NGRAMWorker(BaseSpecWorker):
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
+        prof = self._step_prof
+        t_step = perf_counter() if prof else 0.0
+
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -384,6 +608,10 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
+            # Point the target at this tier's (attn backend, graph runner)
+            # pair so the verify runs on a width-matching CUDA graph.
+            self._activate_tier(verify_input.draft_token_num)
+
             # Prepare grammar data on CPU if needed
             if batch.has_grammar:
                 retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
@@ -392,9 +620,14 @@ class NGRAMWorker(BaseSpecWorker):
                     verify_input.retrieve_next_token.shape
                 ).cpu()
 
+            t = perf_counter() if prof else 0.0
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
+            if prof:
+                # Target verify forward, launch-to-return on this thread
+                # (graph replay dispatch or eager launch; not kernel time).
+                prof.add("verify_fwd", perf_counter() - t)
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -429,19 +662,31 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
+            t = perf_counter() if prof else 0.0
             (
                 predict,
                 accept_lens,
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+            if prof:
+                prof.add("verify_sample", perf_counter() - t)
+                t = perf_counter()
             new_seq_lens = batch.seq_lens + accept_lens
+            # This step's draft length; with variable drafting it can differ
+            # from self.draft_token_num (the cap), so every layout-stride
+            # consumer below must use it.
+            step_draft_token_num = verify_input.draft_token_num
+            self._last_step_stats = (step_draft_token_num, can_run_cuda_graph)
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,
                 accept_lens,
                 accept_index,
-                self.draft_token_num,
+                step_draft_token_num,
             )
+            if prof:
+                prof.add("mamba_commit", perf_counter() - t)
+                t = perf_counter()
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
@@ -454,6 +699,9 @@ class NGRAMWorker(BaseSpecWorker):
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
             )
+            if prof:
+                # Accept gather + accepted-KV relocation launches.
+                prof.add("kv_move", perf_counter() - t)
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's
                 # accept_index is (bs, draft_token_num) -- the tree depth is not
@@ -463,12 +711,13 @@ class NGRAMWorker(BaseSpecWorker):
                     logits_output,
                     predict,
                     accept_index,
-                    self.draft_token_num - 1,
+                    step_draft_token_num - 1,
                 )
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
+            t = perf_counter() if prof else 0.0
             self._update_ngram_corpus(batch)
             # Erase match state of requests that left the decode batch.
             # req.finished() is unusable here: under overlap it flips at result
@@ -480,6 +729,12 @@ class NGRAMWorker(BaseSpecWorker):
                 self.ngram_corpus.erase_match_state(list(departed_rids))
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
+            # Row stride of accept_tokens/next_token_ids in this result.
+            result_stride = step_draft_token_num
+            if prof:
+                # CPU corpus insert enqueue + match-state GC.
+                prof.add("corpus_update", perf_counter() - t)
+                prof.end_step(perf_counter() - t_step)
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)
@@ -496,13 +751,17 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens[:, 0] = predict
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
+            result_stride = self.draft_token_num
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
-        # Construct the next draft input
+        # Construct the next draft input. draft_token_num must be the stride
+        # accept_tokens was laid out with (this step's tier), NOT the cap: the
+        # next step's _prepare_draft_tokens and the result processor both
+        # unpack with it.
         next_draft_input = NgramVerifyInput(
-            draft_token_num=self.draft_token_num,
+            draft_token_num=result_stride,
             new_seq_lens=new_seq_lens,
             accept_tokens=accept_tokens,
             accept_lens=accept_lens,
@@ -517,5 +776,5 @@ class NGRAMWorker(BaseSpecWorker):
             # it via on_publish instead.
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=result_stride,
         )

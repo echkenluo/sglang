@@ -158,6 +158,49 @@ def _wrap_sse_event(data: str, event_type: str) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+def _model_dump_optional(value: Any) -> Optional[dict[str, Any]]:
+    """Dump a pydantic model (or plain dict) to a dict, dropping ``None``s.
+
+    Returns ``None`` for anything that is not a model/dict so callers can
+    simply omit the field instead of crashing on unexpected shapes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if v is not None}
+    return None
+
+
+def _apply_cache_export_fields(
+    usage: AnthropicUsage,
+    prompt_tokens_details: Optional[dict[str, Any]],
+    sglext_info: Optional[dict[str, Any]],
+) -> AnthropicUsage:
+    """Attach GASR cache-export fields to an ``AnthropicUsage``.
+
+    ``prompt_tokens_details`` is the raw OpenAI-style dict
+    (``{"cached_tokens": N}``); ``sglext_info`` is the dumped response-level
+    ``sglext`` payload whose ``cached_tokens_details`` carries the
+    device/host/storage tier breakdown. All fields are simply omitted when
+    the backend did not report cache details.
+    """
+    update: dict[str, Any] = {}
+    if prompt_tokens_details:
+        update["prompt_tokens_details"] = prompt_tokens_details
+        cached = prompt_tokens_details.get("cached_tokens")
+        if isinstance(cached, int) and usage.cache_read_input_tokens is None:
+            update["cache_read_input_tokens"] = cached
+    if sglext_info:
+        details = sglext_info.get("cached_tokens_details")
+        if isinstance(details, dict):
+            update["sglang_cached_tokens_details"] = details
+    if not update:
+        return usage
+    return usage.model_copy(update=update)
+
+
 def _scrub_error_message(message: str, status_code: int) -> str:
     """Return a safe outward-facing error message.
 
@@ -202,6 +245,17 @@ class AnthropicServing:
         if tokenizer is None:
             return None
         return getattr(tokenizer, "chat_template", None)
+
+    def _should_return_cached_tokens_details(
+        self,
+        anthropic_request: AnthropicMessagesRequest,
+    ) -> bool:
+        """Per-request override, else the server's ``enable_cache_report``."""
+        if anthropic_request.return_cached_tokens_details is not None:
+            return bool(anthropic_request.return_cached_tokens_details)
+        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
+        server_args = getattr(tokenizer_manager, "server_args", None)
+        return bool(getattr(server_args, "enable_cache_report", False))
 
     async def handle_messages(
         self,
@@ -553,6 +607,16 @@ class AnthropicServing:
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
 
+        # sglang extension (GASR cache export): ask the OpenAI layer for the
+        # cache-tier breakdown and forward request tracing keys unchanged.
+        request_data["return_cached_tokens_details"] = (
+            self._should_return_cached_tokens_details(anthropic_request)
+        )
+        for key in ("rid", "extra_key", "cache_salt"):
+            value = getattr(anthropic_request, key, None)
+            if value is not None:
+                request_data[key] = value
+
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
             request_data["stream_options"] = StreamOptions(
@@ -828,6 +892,10 @@ class AnthropicServing:
         captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
         final_usage: Optional[AnthropicUsage] = None
+        # GASR cache export: latest non-None raw prompt token details and the
+        # response-level sglext payload captured from the OpenAI stream.
+        final_prompt_tokens_details: Optional[dict[str, Any]] = None
+        sglext_info: Optional[dict[str, Any]] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1049,10 +1117,16 @@ class AnthropicServing:
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
+                delta_usage = _apply_cache_export_fields(
+                    final_usage or AnthropicUsage(output_tokens=0),
+                    final_prompt_tokens_details,
+                    sglext_info,
+                )
                 yield _emit(
                     MessageDeltaEvent(
                         delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
-                        usage=final_usage or AnthropicUsage(output_tokens=0),
+                        usage=delta_usage,
+                        sglext=sglext_info,
                     )
                 )
 
@@ -1090,12 +1164,26 @@ class AnthropicServing:
                     yield frame
                 return
 
+            # GASR cache export: the OpenAI layer emits a dedicated
+            # response-level sglext chunk (``choices=[]``, no usage) when
+            # ``return_cached_tokens_details`` is set; capture it here. The
+            # empty-choices guards below skip the chunk afterwards.
+            if chunk.sglext is not None:
+                sglext_info = _model_dump_optional(chunk.sglext) or sglext_info
+
             if chunk.usage is not None:
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
                     include_input=False,
                     include_output=True,
                 )
+                # Keep the last non-None prompt token details; a final
+                # usage chunk without details must not wipe an earlier one.
+                prompt_details = _model_dump_optional(
+                    getattr(chunk.usage, "prompt_tokens_details", None)
+                )
+                if prompt_details:
+                    final_prompt_tokens_details = prompt_details
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
@@ -1241,6 +1329,7 @@ class AnthropicServing:
                 model=response.model,
                 stop_reason="end_turn",
                 usage=AnthropicUsage(input_tokens=0, output_tokens=0),
+                sglext=_model_dump_optional(response.sglext),
             )
 
         choice = response.choices[0]
@@ -1297,16 +1386,32 @@ class AnthropicServing:
         if not content:
             content.append(TextBlock(text=""))
 
+        # GASR cache export: attach raw prompt token details and the
+        # cache-tier breakdown when the backend reported them.
+        sglext_info = _model_dump_optional(response.sglext)
+        usage = _apply_cache_export_fields(
+            _anthropic_usage_from_openai(
+                response.usage,
+                include_input=True,
+                include_output=True,
+            ),
+            (
+                _model_dump_optional(
+                    getattr(response.usage, "prompt_tokens_details", None)
+                )
+                if response.usage is not None
+                else None
+            ),
+            sglext_info,
+        )
+
         return AnthropicMessagesResponse(
             id=f"msg_{uuid.uuid4().hex}",
             content=content,
             model=response.model,
             stop_reason=stop_reason,
-            usage=_anthropic_usage_from_openai(
-                response.usage,
-                include_input=True,
-                include_output=True,
-            ),
+            usage=usage,
+            sglext=sglext_info,
         )
 
     def _convert_openai_error_response(self, response) -> JSONResponse:

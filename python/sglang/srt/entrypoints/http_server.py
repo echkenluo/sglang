@@ -411,6 +411,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+# NOTE(req-prof v2): the v1 ASGI arrival middleware was removed — Starlette's
+# BaseHTTPMiddleware deadlocks the kick-started StreamingResponse pattern used
+# by /v1/chat/completions (live symptom: requests never reach the scheduler,
+# shutdown raises "aclose(): asynchronous generator is already running").
+# http_parse is therefore not measured; approximate it from the uvicorn access
+# log timestamp when needed.
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
