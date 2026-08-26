@@ -87,6 +87,23 @@ class TestReasonerGrammarObject(unittest.TestCase):
             apply_vocab_mask_fn=lambda logits, vocab_mask: None,
         )
 
+    def _make_soft_object(self):
+        return ReasonerGrammarObject(
+            grammar=None,
+            think_end_id=7,
+            think_excluded_token_ids=[3, 5],
+            max_think_tokens=5,
+            soft_think_tokens=2,
+            soft_close_after_token_ids=[6],
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+            allocate_vocab_mask_fn=lambda vocab_size, batch_size, device: torch.zeros(
+                (batch_size, (vocab_size + 31) // 32), dtype=torch.int32
+            ),
+            move_vocab_mask_fn=lambda vocab_mask, device: vocab_mask,
+            apply_vocab_mask_fn=lambda logits, vocab_mask: None,
+        )
+
     def test_strict_thinking_phase_excludes_configured_tokens(self):
         obj = self._make_strict_object()
         obj.maybe_init_reasoning(True)
@@ -108,6 +125,10 @@ class TestReasonerGrammarObject(unittest.TestCase):
 
         allowed = _allowed_token_ids(mask, [0, 1, 3, 5, 7, 8, 10, 11])
         self.assertEqual(allowed, [7])
+        self.assertEqual(obj.think_token_history, [])
+        obj.accept_token(7)
+        self.assertEqual(obj.thinking_close_kind, "hard_ceiling")
+        self.assertEqual(obj.last_accepted_close_kind, "hard_ceiling")
 
     def test_strict_only_wrapper_exposes_backend_mask_hooks(self):
         obj = self._make_strict_object()
@@ -116,6 +137,77 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertEqual(mask.shape, (2, 2))
         self.assertIs(obj.move_vocab_mask(mask, "cpu"), mask)
         self.assertIsNotNone(obj.apply_vocab_mask)
+
+    def test_soft_target_waits_for_boundary_then_closes(self):
+        obj = self._make_soft_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(11)
+        before_boundary = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(before_boundary, 0)
+
+        self.assertEqual(
+            _allowed_token_ids(before_boundary, [3, 5, 6, 7, 10, 11]),
+            [6, 7, 10, 11],
+        )
+        obj.accept_token(6)
+        at_boundary = obj.allocate_vocab_mask(64, 1, "cpu")
+        obj.fill_vocab_mask(at_boundary, 0)
+        self.assertEqual(_allowed_token_ids(at_boundary, [6, 7, 10, 11]), [7])
+        obj.accept_token(7)
+        self.assertEqual(obj.thinking_close_kind, "soft_boundary")
+
+    def test_early_think_end_is_recorded_as_natural(self):
+        obj = self._make_soft_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+
+        obj.accept_token(7)
+
+        self.assertEqual(obj.thinking_close_kind, "natural")
+        self.assertEqual(obj.last_accepted_close_kind, "natural")
+
+    def test_soft_target_rollback_restores_preboundary_state(self):
+        obj = self._make_soft_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(11)
+        obj.accept_token(6)
+
+        obj.rollback(1)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(obj.think_token_history, [10, 11])
+        self.assertEqual(
+            _allowed_token_ids(mask, [3, 5, 6, 7, 10, 11]),
+            [6, 7, 10, 11],
+        )
+
+    def test_soft_target_copy_preserves_boundary_history(self):
+        obj = self._make_soft_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(6)
+
+        copied = obj.copy()
+
+        self.assertEqual(copied.think_token_history, [10, 6])
+        self.assertIsNot(copied.think_token_history, obj.think_token_history)
+        self.assertEqual(copied.soft_think_tokens, 2)
+        self.assertEqual(copied.soft_close_after_token_ids, {6})
+
+    def test_rollback_think_end_clears_close_kind(self):
+        obj = self._make_soft_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(7)
+
+        obj.rollback(1)
+
+        self.assertTrue(obj._is_thinking())
+        self.assertIsNone(obj.thinking_close_kind)
 
 
 class TestReasonerGrammarBackend(unittest.TestCase):
@@ -143,6 +235,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
                 "</think>": [2] if end_ids is None else end_ids,
                 "<tool_call>": [3],
                 "</tool_call>": [4],
+                "\n": [5],
             }
         )
 
@@ -173,6 +266,29 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         )
 
         self.assertIsNone(reasoner.init_strict_reasoning_grammar(reasoning=True))
+
+    def test_request_soft_target_closes_on_tokenizer_newline(self):
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        obj = reasoner.init_budget_reasoning_grammar(
+            reasoning=True,
+            thinking_budget=5,
+            soft_thinking_target=2,
+        )
+        obj.accept_token(10)
+        obj.accept_token(5)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(obj.max_think_tokens, 5)
+        self.assertEqual(obj.soft_think_tokens, 2)
+        self.assertEqual(_allowed_token_ids(mask, [2, 5, 10]), [2])
 
     def test_wraps_inner_grammar_with_reasoning_state_machine(self):
         os.environ["SGLANG_MAX_THINK_TOKENS"] = "1"

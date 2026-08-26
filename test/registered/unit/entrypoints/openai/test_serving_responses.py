@@ -18,9 +18,43 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.io_struct import REASONING_CLOSE_KIND_CUSTOM_INFO_KEY
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class ThinkingSamplingParamsTestCase(unittest.TestCase):
+    def test_natural_request_does_not_install_thinking_controls(self):
+        request = ResponsesRequest(model="x", input="test")
+
+        params = OpenAIServingResponses._thinking_sampling_params(request)
+
+        self.assertIsNone(params)
+
+    def test_effort_only_installs_emergency_ceiling(self):
+        request = ResponsesRequest(
+            model="x", input="test", reasoning={"effort": "high"}
+        )
+
+        params = OpenAIServingResponses._thinking_sampling_params(request)
+
+        self.assertEqual(params, {"thinking_budget": 2048})
+
+    def test_soft_target_is_forwarded_with_hard_ceiling(self):
+        request = ResponsesRequest(
+            model="x",
+            input="test",
+            thinking_budget=96,
+            reasoning={"soft_thinking_target": 24},
+        )
+
+        params = OpenAIServingResponses._thinking_sampling_params(request)
+
+        self.assertEqual(
+            params,
+            {"thinking_budget": 96, "soft_thinking_target": 24},
+        )
 
 
 class InputMessageConstructionTestCase(unittest.TestCase):
@@ -300,6 +334,47 @@ class FullResponseUsageTestCase(unittest.TestCase):
         self.assertEqual(response.usage.completion_tokens, 7)
         self.assertEqual(response.usage.reasoning_tokens, 2)
         self.assertEqual(metadata.final_usage_info, response.usage)
+
+    def test_full_response_reports_reasoning_close_kind(self):
+        serving = make_serving()
+        context = SimpleContext()
+        context.last_output = {
+            "text": "done",
+            "meta_info": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "cached_tokens": 3,
+                "reasoning_tokens": 2,
+                REASONING_CLOSE_KIND_CUSTOM_INFO_KEY: [
+                    None,
+                    "soft_boundary",
+                    None,
+                ],
+            },
+        }
+        request = ResponsesRequest(
+            model="x", input="hello", request_id="resp_close_kind", store=False
+        )
+        metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        async def empty_generator():
+            for _ in ():
+                yield None
+
+        response = asyncio.run(
+            serving.responses_full_generator(
+                request,
+                sampling_params={},
+                result_generator=empty_generator(),
+                context=context,
+                model_name="x",
+                tokenizer=serving.tokenizer_manager.tokenizer,
+                request_metadata=metadata,
+                created_time=123,
+            )
+        )
+
+        self.assertEqual(response.reasoning["close_kind"], "soft_boundary")
 
 
 class MultimodalRequestTestCase(unittest.TestCase):

@@ -42,6 +42,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
     When enable_token_filter=True (strict mode), fill_vocab_mask filters
     excluded tokens during THINKING and enforces max_think_tokens budget.
+    If soft_think_tokens is configured, the model may continue past that target
+    until it emits a configured boundary token; the next token is then forced
+    to think_end_id. This avoids an arbitrary mid-sentence cliff while retaining
+    max_think_tokens as an emergency ceiling.
     When the budget is exhausted, only think_end_id is allowed, forcing the
     model to exit the thinking phase.
     When enable_token_filter=False (non-strict mode), fill_vocab_mask is
@@ -59,12 +63,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
+        soft_think_tokens: int = -1,
+        soft_close_after_token_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
+        self.soft_think_tokens = soft_think_tokens
+        self.soft_close_after_token_ids = set(soft_close_after_token_ids or [])
         self.enable_token_filter = enable_token_filter
         self.token_filter_fn = token_filter_fn
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
@@ -74,8 +82,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
+        self.think_token_history: List[int] = []
+        self.thinking_close_kind: Optional[str] = None
+        self.last_accepted_close_kind: Optional[str] = None
 
     def maybe_init_reasoning(self, reasoning: bool):
+        self.think_token_history = []
+        self.thinking_close_kind = None
+        self.last_accepted_close_kind = None
         if reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
@@ -99,12 +113,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_end += 1
 
     def rollback_state(self):
+        self.last_accepted_close_kind = None
         if self._is_thinking():
             if self.tokens_in_think > 0:
                 self.tokens_in_think -= 1
+                if self.think_token_history:
+                    self.think_token_history.pop()
         elif self._is_generation():
             if self.tokens_after_end == 0:
                 self.tokens_after_end = -1
+                self.thinking_close_kind = None
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
 
@@ -117,6 +135,21 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # grammar's is updated, not the wrapper's), so the guard never fires and
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
         self.current_token = token
+        self.last_accepted_close_kind = None
+        if self._is_thinking() and token == self.think_end_id:
+            if not self._can_think_more():
+                self.thinking_close_kind = "hard_ceiling"
+            elif self._should_soft_close():
+                self.thinking_close_kind = "soft_boundary"
+            else:
+                self.thinking_close_kind = "natural"
+            self.last_accepted_close_kind = self.thinking_close_kind
+        if (
+            self._is_thinking()
+            and token != self.think_end_id
+            and self.soft_think_tokens >= 0
+        ):
+            self.think_token_history.append(token)
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)
@@ -137,6 +170,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _can_think_more(self):
         return self.max_think_tokens < 0 or self.tokens_in_think < self.max_think_tokens
 
+    def _should_soft_close(self) -> bool:
+        return bool(
+            self.soft_think_tokens >= 0
+            and self.tokens_in_think >= self.soft_think_tokens
+            and self.think_token_history
+            and self.think_token_history[-1] in self.soft_close_after_token_ids
+        )
+
     def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
         if self.token_filter_fn is not None:
             self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
@@ -145,10 +186,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self._is_thinking():
             if not self.enable_token_filter:
                 return
-            if self._can_think_more():
-                self._do_token_filter(
-                    vocab_mask, self.think_excluded_token_ids, idx, is_allowed=False
-                )
+            if self._can_think_more() and not self._should_soft_close():
+                if self.think_excluded_token_ids:
+                    self._do_token_filter(
+                        vocab_mask,
+                        self.think_excluded_token_ids,
+                        idx,
+                        is_allowed=False,
+                    )
             else:
                 self._do_token_filter(
                     vocab_mask, self._think_end_id_list, idx, is_allowed=True
@@ -188,9 +233,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.allocate_vocab_mask_fn,
             self.move_vocab_mask_fn,
             self.apply_vocab_mask_fn,
+            soft_think_tokens=self.soft_think_tokens,
+            soft_close_after_token_ids=list(self.soft_close_after_token_ids),
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
+        new_obj.think_token_history = self.think_token_history.copy()
+        new_obj.thinking_close_kind = self.thinking_close_kind
+        new_obj.last_accepted_close_kind = self.last_accepted_close_kind
         new_obj._finished = self._finished
         return new_obj
 
@@ -248,6 +298,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "must encode to exactly one token for constrained reasoning."
             )
         self.think_end_id = think_end_ids[0]
+        soft_close_ids = tokenizer.encode("\n", add_special_tokens=False)
+        self.soft_close_after_token_ids = (
+            soft_close_ids if len(soft_close_ids) == 1 else []
+        )
         self._enable_strict_thinking = enable_strict_thinking
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -269,7 +323,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             and self.grammar_backend.is_support_token_filter
         )
         self._token_filter_fn = (
-            self.grammar_backend.set_token_filter if self.enable_token_filter else None
+            self.grammar_backend.set_token_filter
+            if self.grammar_backend.is_support_token_filter
+            else None
         )
 
     def _get_think_excluded_token_ids(
@@ -294,20 +350,49 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return excluded_ids
 
     def _make_grammar_object(
-        self, grammar: Optional[BaseGrammarObject], reasoning: bool
+        self,
+        grammar: Optional[BaseGrammarObject],
+        reasoning: bool,
+        *,
+        enable_token_filter: Optional[bool] = None,
     ) -> ReasonerGrammarObject:
+        if enable_token_filter is None:
+            enable_token_filter = self.enable_token_filter
         obj = ReasonerGrammarObject(
             grammar=grammar,
             think_end_id=self.think_end_id,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
-            enable_token_filter=self.enable_token_filter,
+            enable_token_filter=enable_token_filter,
             token_filter_fn=self._token_filter_fn,
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
         )
         obj.maybe_init_reasoning(reasoning)
+        return obj
+
+    def init_budget_reasoning_grammar(
+        self,
+        reasoning: bool,
+        thinking_budget: int,
+        soft_thinking_target: Optional[int] = None,
+    ) -> ReasonerGrammarObject:
+        """Create a request-local hard budget with optional boundary close."""
+        if not self.grammar_backend.is_support_token_filter:
+            raise ValueError(
+                "Per-request thinking controls require a grammar backend with "
+                "token filtering support (for example xgrammar)."
+            )
+        if soft_thinking_target is not None and not self.soft_close_after_token_ids:
+            raise ValueError(
+                "soft_thinking_target requires a single-token newline boundary"
+            )
+        obj = self._make_grammar_object(None, reasoning, enable_token_filter=True)
+        obj.max_think_tokens = thinking_budget
+        if soft_thinking_target is not None:
+            obj.soft_think_tokens = soft_thinking_target
+            obj.soft_close_after_token_ids = set(self.soft_close_after_token_ids)
         return obj
 
     def init_strict_reasoning_grammar(

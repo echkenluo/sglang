@@ -2,7 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.managers.io_struct import (
+    REASONING_CLOSE_KIND_CUSTOM_INFO_KEY,
+    unwrap_from_pickle,
+)
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -13,7 +16,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    def __init__(self, rid, output_ids, customized_info=None):
+    def __init__(self, rid, output_ids, customized_info=None, grammar=None):
         self.rid = rid
         self.http_worker_ipc = None
         self.finished_reason = None
@@ -42,6 +45,7 @@ class _FakeReq:
         self.mm_video_tokens = 0
         self.multimodal_inputs = None
         self.customized_info = customized_info
+        self.grammar = grammar
 
     def finished(self):
         return False
@@ -88,6 +92,32 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.assertEqual(
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
+        )
+
+    def test_reasoning_close_kind_is_aligned_to_think_end_token(self):
+        accumulator = _GenerationStreamAccumulator(
+            return_logprob=False,
+            return_hidden_states=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            default_stream_interval=1,
+            default_force_stream_interval=1,
+            get_cached_tokens_details=lambda req: None,
+        )
+        grammar = SimpleNamespace(
+            think_end_id=2,
+            thinking_close_kind="soft_boundary",
+        )
+
+        accumulator.accept(req=_FakeReq("r0", [10, 2, 20], grammar=grammar))
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        customized_info = unwrap_from_pickle(payload.customized_info)
+        self.assertEqual(
+            customized_info[REASONING_CLOSE_KIND_CUSTOM_INFO_KEY],
+            [[None, "soft_boundary", None]],
         )
 
 

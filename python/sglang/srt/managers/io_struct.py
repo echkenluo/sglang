@@ -71,6 +71,12 @@ else:
 logger = logging.getLogger(__name__)
 
 
+# Token-aligned internal telemetry.  The scheduler emits a non-null marker on
+# the accepted </think> token; TokenizerManager preserves it in meta_info and
+# the Responses layer reduces it to a scalar close_kind.
+REASONING_CLOSE_KIND_CUSTOM_INFO_KEY = "__sglang_reasoning_close_kind__"
+
+
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
 

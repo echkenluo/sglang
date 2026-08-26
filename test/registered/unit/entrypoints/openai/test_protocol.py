@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -339,6 +340,43 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+
+class TestResponsesSoftThinkingTarget(unittest.TestCase):
+    def test_effort_maps_to_emergency_ceiling(self):
+        expected = {"low": 128, "medium": 512, "high": 2048}
+        for effort, budget in expected.items():
+            with self.subTest(effort=effort):
+                request = ResponsesRequest(
+                    input="test", reasoning={"effort": effort}
+                )
+                self.assertEqual(request.resolved_thinking_budget(), budget)
+
+    def test_exact_budget_and_soft_target(self):
+        request = ResponsesRequest(
+            input="test",
+            thinking_budget=96,
+            reasoning={
+                "effort": "high",
+                "thinking_budget": 128,
+                "soft_thinking_target": 24,
+            },
+        )
+        self.assertEqual(request.resolved_thinking_budget(), 96)
+        self.assertEqual(request.resolved_soft_thinking_target(), 24)
+
+    def test_soft_target_must_precede_hard_ceiling(self):
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(
+                input="test",
+                thinking_budget=32,
+                reasoning={"soft_thinking_target": 32},
+            )
+
+    def test_unspecified_controls_preserve_natural_behavior(self):
+        request = ResponsesRequest(input="test")
+        self.assertIsNone(request.resolved_thinking_budget())
+        self.assertIsNone(request.resolved_soft_thinking_target())
 
 
 class TestModelSerialization(unittest.TestCase):

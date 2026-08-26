@@ -141,6 +141,29 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
         )
         self.assertFalse(response.parallel_tool_calls)
 
+    def test_resolved_thinking_controls_are_reported(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            thinking_budget=96,
+            reasoning={"soft_thinking_target": 24},
+            store=False,
+        )
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        self.assertEqual(response.reasoning["thinking_budget"], 96)
+        self.assertEqual(response.reasoning["soft_thinking_target"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()

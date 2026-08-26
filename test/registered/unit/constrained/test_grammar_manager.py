@@ -281,6 +281,30 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         self.assertEqual(req.grammar.max_think_tokens, 7)
+        self.assertTrue(req.grammar.enable_token_filter)
+
+    def test_budgeted_request_gets_soft_target_grammar(self):
+        mgr = self._make_mgr()
+        mgr.grammar_backend = MagicMock()
+        grammar_obj = ReasonerGrammarObject(
+            grammar=None, think_end_id=17, max_think_tokens=99
+        )
+        mgr.grammar_backend.init_budget_reasoning_grammar.return_value = grammar_obj
+
+        req = _make_req(
+            custom_params={
+                "thinking_budget": 128,
+                "soft_thinking_target": 32,
+            }
+        )
+        req.require_reasoning = True
+        result = mgr.process_req_with_grammar(req)
+
+        self.assertFalse(result)
+        self.assertIs(req.grammar, grammar_obj)
+        mgr.grammar_backend.init_budget_reasoning_grammar.assert_called_once_with(
+            True, 128, 32
+        )
 
     def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
         mgr = self._make_mgr()

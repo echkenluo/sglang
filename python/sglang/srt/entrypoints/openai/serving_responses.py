@@ -69,7 +69,10 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    REASONING_CLOSE_KIND_CUSTOM_INFO_KEY,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -319,6 +322,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    thinking_params = self._thinking_sampling_params(request)
+                    if thinking_params is not None:
+                        existing_custom = sampling_params.get("custom_params") or {}
+                        if not isinstance(existing_custom, dict):
+                            raise ValueError("sampling custom_params must be an object")
+                        sampling_params["custom_params"] = {
+                            **existing_custom,
+                            **thinking_params,
+                        }
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -361,6 +373,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         session_id=request.session_id,
+                        require_reasoning=self._is_thinking_enabled_for_request(request),
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
@@ -466,6 +479,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        thinking_budget = request.resolved_thinking_budget()
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -478,6 +492,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
+            chat_template_kwargs=(
+                {"enable_thinking": True} if thinking_budget is not None else None
+            ),
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
@@ -491,6 +509,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             engine_prompts = [processed_messages.prompt_ids]
 
         return messages, request_prompts, engine_prompts, processed_messages
+
+    @staticmethod
+    def _thinking_sampling_params(request: ResponsesRequest):
+        thinking_budget = request.resolved_thinking_budget()
+        if thinking_budget is None:
+            return None
+        params = {"thinking_budget": thinking_budget}
+        soft_target = request.resolved_soft_thinking_target()
+        if soft_target is not None:
+            params["soft_thinking_target"] = soft_target
+        return params
 
     def _make_request_with_harmony(
         self,
@@ -611,6 +640,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
+        if not self.use_harmony and meta_info is not None:
+            close_kind = self._reasoning_close_kind_from_meta_info(meta_info)
+            if close_kind is not None:
+                if response.reasoning is None:
+                    response.reasoning = {}
+                response.reasoning["close_kind"] = close_kind
+
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -619,6 +655,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[response.id] = response
 
         return response
+
+    @staticmethod
+    def _reasoning_close_kind_from_meta_info(meta_info: dict) -> Optional[str]:
+        values = meta_info.get(REASONING_CLOSE_KIND_CUSTOM_INFO_KEY)
+        if isinstance(values, str):
+            return values
+        if not isinstance(values, list):
+            return None
+        return next(
+            (value for value in reversed(values) if isinstance(value, str)),
+            None,
+        )
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
