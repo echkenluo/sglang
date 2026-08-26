@@ -113,6 +113,7 @@ from sglang.srt.model_executor.runner import (
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    break_graph,
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -232,6 +233,18 @@ _BCG_EAGER_TARGET_MHC_PRE = get_bool_env_var(
     "SGLANG_BCG_EAGER_TARGET_MHC_PRE"
 )
 _BCG_EAGER_TARGET_MHC_POST = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC_POST")
+_BCG_EAGER_TARGET_MHC_POST_ATTN = get_bool_env_var(
+    "SGLANG_BCG_EAGER_TARGET_MHC_POST_ATTN"
+)
+_BCG_EAGER_TARGET_MHC_POST_FFN = get_bool_env_var(
+    "SGLANG_BCG_EAGER_TARGET_MHC_POST_FFN"
+)
+_BCG_BREAK_TARGET_MHC_POST_FFN_PRE = get_bool_env_var(
+    "SGLANG_BCG_BREAK_TARGET_MHC_POST_FFN_PRE"
+)
+_BCG_BRIDGE_TARGET_MHC_POST_FFN_OUTPUT = get_bool_env_var(
+    "SGLANG_BCG_BRIDGE_TARGET_MHC_POST_FFN_OUTPUT"
+)
 _BCG_EAGER_TARGET_FFN = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_FFN")
 _BCG_EAGER_TARGET_LOGITS = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_LOGITS")
 _is_gfx95_supported = is_gfx95_supported()
@@ -1464,16 +1477,39 @@ class DeepseekV4DecoderLayer(nn.Module):
         # This contract intentionally rejects fused mHC, where hc_pre/hc_post
         # are bypassed and this gate would otherwise become a silent no-op.
         eager_mhc_pre = _BCG_EAGER_TARGET_MHC or _BCG_EAGER_TARGET_MHC_PRE
-        eager_mhc_post = _BCG_EAGER_TARGET_MHC or _BCG_EAGER_TARGET_MHC_POST
-        if (eager_mhc_pre or eager_mhc_post) and not is_nextn:
+        any_mhc_post_gate = (
+            _BCG_EAGER_TARGET_MHC
+            or _BCG_EAGER_TARGET_MHC_POST
+            or _BCG_EAGER_TARGET_MHC_POST_ATTN
+            or _BCG_EAGER_TARGET_MHC_POST_FFN
+            or _BCG_BREAK_TARGET_MHC_POST_FFN_PRE
+            or _BCG_BRIDGE_TARGET_MHC_POST_FFN_OUTPUT
+        )
+        if (eager_mhc_pre or any_mhc_post_gate) and not is_nextn:
             if self.use_fused_mhc_post_pre:
                 raise RuntimeError(
                     "target mHC Breakable Graph gates require unfused mHC"
                 )
             if eager_mhc_pre:
                 self.hc_pre = eager_on_graph(True)(self.hc_pre)
-            if eager_mhc_post:
+            if _BCG_EAGER_TARGET_MHC or _BCG_EAGER_TARGET_MHC_POST:
                 self.hc_post = eager_on_graph(True)(self.hc_post)
+        self.hc_post_attn = self.hc_post
+        self.hc_post_ffn = self.hc_post
+        if _BCG_EAGER_TARGET_MHC_POST_ATTN and not is_nextn:
+            self.hc_post_attn = eager_on_graph(True)(self.hc_post_attn)
+        if _BCG_EAGER_TARGET_MHC_POST_FFN and not is_nextn:
+            self.hc_post_ffn = eager_on_graph(True)(self.hc_post_ffn)
+        self._bcg_break_target_mhc_post_ffn_pre = (
+            _BCG_BREAK_TARGET_MHC_POST_FFN_PRE and not is_nextn
+        )
+        self.hc_post_ffn_output_bridge = lambda x: x
+        if _BCG_BRIDGE_TARGET_MHC_POST_FFN_OUTPUT and not is_nextn:
+            # Allocate a strong bridge buffer after the captured FFN hc_post;
+            # replay copies the fresh tensor into this fixed-address buffer.
+            self.hc_post_ffn_output_bridge = eager_on_graph(True)(
+                lambda x: x.clone()
+            )
         # Diagnostic-only: keep the target router, expert call, and TP combine
         # outside Breakable CUDA Graph while leaving the DSpark draft unchanged.
         # ``is_nextn`` is true for DSparkV4Stage and false for target layers.
@@ -1784,7 +1820,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
                 norm_fused = True
         else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            hidden_states = self.hc_post_attn(hidden_states, residual, post, comb)
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -1805,7 +1841,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if self._bcg_break_target_mhc_post_ffn_pre:
+                break_graph()
+            hidden_states = self.hc_post_ffn(hidden_states, residual, post, comb)
+            hidden_states = self.hc_post_ffn_output_bridge(hidden_states)
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
