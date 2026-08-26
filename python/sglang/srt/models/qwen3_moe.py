@@ -117,6 +117,13 @@ _FLUX_FUSE = os.environ.get("SGLANG_USE_FUSED_OVERLAP", "0") == "1"
 # Flux fused AG + grouped GEMM1 on the MoE FFN (M3 slice 1; scattered flow,
 # TP-only, bf16). Orthogonal to _FLUX_FUSE. See layers/moe/flux_moe.py.
 _FLUX_MOE = os.environ.get("SGLANG_FLUX_MOE", "0") == "1"
+_MOE_TOPK_CAPTURE_DIR = os.environ.get("SGLANG_MOE_TOPK_CAPTURE_DIR", "")
+_MOE_TOPK_CAPTURE_MIN_TOKENS = int(
+    os.environ.get("SGLANG_MOE_TOPK_CAPTURE_MIN_TOKENS", "1024")
+)
+_MOE_TOPK_CAPTURE_MAX_PER_LAYER = int(
+    os.environ.get("SGLANG_MOE_TOPK_CAPTURE_MAX_PER_LAYER", "2")
+)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -298,6 +305,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.config = config
 
+    def _maybe_capture_topk_ids(self, topk_output) -> None:
+        """Save representative routing IDs for offline MoE kernel tuning."""
+        if not _MOE_TOPK_CAPTURE_DIR or get_tensor_model_parallel_rank() != 0:
+            return
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if topk_ids is None or topk_ids.shape[0] < _MOE_TOPK_CAPTURE_MIN_TOKENS:
+            return
+        capture_index = getattr(self, "_moe_topk_capture_index", 0)
+        if capture_index >= _MOE_TOPK_CAPTURE_MAX_PER_LAYER:
+            return
+        shape_dir = os.path.join(_MOE_TOPK_CAPTURE_DIR, f"tokens-{topk_ids.shape[0]}")
+        os.makedirs(shape_dir, exist_ok=True)
+        output_path = os.path.join(
+            shape_dir,
+            f"topk_ids_layer{self.layer_id}_idx{capture_index}.pt",
+        )
+        torch.save(topk_ids.detach().cpu(), output_path)
+        self._moe_topk_capture_index = capture_index + 1
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -382,6 +408,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states = hidden_states.view(-1, hidden_dim)
                 router_logits, _ = self.gate(hidden_states)
                 topk_output = self.topk(hidden_states, router_logits)
+                self._maybe_capture_topk_ids(topk_output)
                 final_hidden_states = self.experts(hidden_states, topk_output)
         else:
             hidden_states = ctx.fetch_mlp_latent(last_layer=last_layer)
@@ -391,6 +418,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
+            self._maybe_capture_topk_ids(topk_output)
 
             final_hidden_states = None
             if _FLUX_MOE and not last_layer:

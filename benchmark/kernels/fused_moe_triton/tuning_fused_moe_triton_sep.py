@@ -6,9 +6,9 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import ray
 import torch
 import triton
 import triton.language as tl
@@ -20,7 +20,13 @@ from common_utils import (
     get_model_config,
     sort_config,
 )
-from ray.experimental.tqdm_ray import tqdm
+try:
+    from ray.experimental.tqdm_ray import tqdm
+except ModuleNotFoundError:
+    # Single-GPU/single-batch tuning does not use Ray. Keep that path usable in
+    # serving images that intentionally omit the distributed tuning dependency.
+    def tqdm(iterable):
+        return iterable
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_dtype_str,
@@ -117,12 +123,10 @@ class KernelWrapper:
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
-    moe_layers = num_layers - dense_layers
-    return torch.load(
-        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
-    )
+    topk_files = sorted(Path(topk_ids_dir).glob("topk_ids_layer*_idx*.pt"))
+    if not topk_files:
+        raise FileNotFoundError(f"No captured topk_ids files in {topk_ids_dir}")
+    return torch.load(topk_files[i % len(topk_files)], map_location="cpu")
 
 
 def benchmark_config(
@@ -513,7 +517,19 @@ class BenchmarkWorker:
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
 
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
-            for config in tqdm(search_space):
+            search_count = len(search_space)
+            print(
+                f"Starting exhaustive tuning for batch_size={num_tokens}: "
+                f"{search_count} candidate configs",
+                flush=True,
+            )
+            for config_index, config in enumerate(tqdm(search_space), start=1):
+                if config_index == 1 or config_index % 50 == 0:
+                    print(
+                        f"Tuning progress batch_size={num_tokens}: "
+                        f"{config_index}/{search_count}",
+                        flush=True,
+                    )
                 try:
                     kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
                         config,
@@ -714,7 +730,14 @@ def main(args: argparse.Namespace):
         worker = BenchmarkWorker(args.seed, server_args)
         if args.tune:
             search_space = get_configs_compute_bound()
-            worker.tune(
+            if block_shape is not None:
+                block_k = block_shape[1]
+                search_space = [
+                    config
+                    for config in search_space
+                    if block_k % config["BLOCK_SIZE_K"] == 0
+                ]
+            config0, config1, cost0, cost1 = worker.tune(
                 batch_sizes[0],
                 E,
                 shard_intermediate_size,
@@ -729,6 +752,38 @@ def main(args: argparse.Namespace):
                 search_space,
                 topk_ids_dir,
                 args.ep_size,
+            )
+            save_configs_sep(
+                {batch_sizes[0]: sort_config(config0)},
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                block_shape,
+            )
+            save_configs_sep(
+                {batch_sizes[0]: sort_config(config1)},
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                block_shape,
+                down_moe=True,
+            )
+            print(
+                f"Saved single-batch tuning results for M={batch_sizes[0]} "
+                f"with up_cost={cost0:.3f}us and down_cost={cost1:.3f}us",
+                flush=True,
             )
         else:
             cfg = {
@@ -760,6 +815,8 @@ def main(args: argparse.Namespace):
         return
 
     assert args.tune
+
+    import ray
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])

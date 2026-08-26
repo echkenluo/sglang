@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -35,6 +37,11 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 from sglang.srt.distributed import get_tp_group
+
+logger = logging.getLogger(__name__)
+_FLUX_AUDIT_LOG = os.environ.get("SGLANG_FLUX_AUDIT_LOG", "0") == "1"
+_FLUX_GEMM_RS_CLAIMS = set()
+_FLUX_AG_GEMM_CLAIMS = set()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -741,6 +748,17 @@ class GemmRS(LinearMethodBase):
             output = rs_gemm_op.forward(x, layer.weight)
             if bias is not None:
                 output = output + bias
+            if _FLUX_AUDIT_LOG:
+                claim = (tuple(x.shape), tuple(layer.weight.shape), tuple(output.shape))
+                if claim not in _FLUX_GEMM_RS_CLAIMS:
+                    _FLUX_GEMM_RS_CLAIMS.add(claim)
+                    logger.info(
+                        "[FLUX-AUDIT] GemmRS engaged: input=%s weight=%s output=%s dtype=%s",
+                        tuple(x.shape),
+                        tuple(layer.weight.shape),
+                        tuple(output.shape),
+                        x.dtype,
+                    )
             return output
         else:
             return F.linear(x, layer.weight, bias)
@@ -804,6 +822,17 @@ class AGCook(LinearMethodBase):
             output = ag_gemm_op.forward(x, layer.weight )
             if bias is not None:
                 output = output + bias
+            if _FLUX_AUDIT_LOG:
+                claim = (tuple(x.shape), tuple(layer.weight.shape), tuple(output.shape))
+                if claim not in _FLUX_AG_GEMM_CLAIMS:
+                    _FLUX_AG_GEMM_CLAIMS.add(claim)
+                    logger.info(
+                        "[FLUX-AUDIT] AG-GEMM engaged: input=%s weight=%s output=%s dtype=%s",
+                        tuple(x.shape),
+                        tuple(layer.weight.shape),
+                        tuple(output.shape),
+                        x.dtype,
+                    )
             return output
         else:
             return F.linear(x, layer.weight, bias)
