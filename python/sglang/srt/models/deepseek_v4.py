@@ -227,6 +227,11 @@ _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _BCG_EAGER_TARGET_SELF_ATTN = get_bool_env_var(
     "SGLANG_BCG_EAGER_TARGET_SELF_ATTN"
 )
+_BCG_EAGER_TARGET_MHC = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC")
+_BCG_EAGER_TARGET_MHC_PRE = get_bool_env_var(
+    "SGLANG_BCG_EAGER_TARGET_MHC_PRE"
+)
+_BCG_EAGER_TARGET_MHC_POST = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC_POST")
 _BCG_EAGER_TARGET_FFN = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_FFN")
 _BCG_EAGER_TARGET_LOGITS = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_LOGITS")
 _is_gfx95_supported = is_gfx95_supported()
@@ -1455,6 +1460,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        # Diagnostic-only: isolate target mHC mixing from Breakable CUDA Graph.
+        # This contract intentionally rejects fused mHC, where hc_pre/hc_post
+        # are bypassed and this gate would otherwise become a silent no-op.
+        eager_mhc_pre = _BCG_EAGER_TARGET_MHC or _BCG_EAGER_TARGET_MHC_PRE
+        eager_mhc_post = _BCG_EAGER_TARGET_MHC or _BCG_EAGER_TARGET_MHC_POST
+        if (eager_mhc_pre or eager_mhc_post) and not is_nextn:
+            if self.use_fused_mhc_post_pre:
+                raise RuntimeError(
+                    "target mHC Breakable Graph gates require unfused mHC"
+                )
+            if eager_mhc_pre:
+                self.hc_pre = eager_on_graph(True)(self.hc_pre)
+            if eager_mhc_post:
+                self.hc_post = eager_on_graph(True)(self.hc_post)
         # Diagnostic-only: keep the target router, expert call, and TP combine
         # outside Breakable CUDA Graph while leaving the DSpark draft unchanged.
         # ``is_nextn`` is true for DSparkV4Stage and false for target layers.
