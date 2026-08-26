@@ -434,6 +434,44 @@ def _report_fallback(reason: str) -> None:
         logger.info("MoK full-native fallback: %s", reason)
 
 
+def _maybe_clear_workspace_caches(mok_functional) -> None:
+    """Bound the extension's per-geometry workspace caches.
+
+    The extension caches one workspace per (tokens, hidden, topk,
+    capacity-factor) geometry and never evicts; big-geometry route buffers
+    scale with the token count, so shape-diverse traffic accumulates
+    gigabytes of resident storage across cells until an unrelated transient
+    allocation OOMs.  When the caches exceed
+    SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP distinct geometries, clear them all
+    with the extension's collective clear_workspace_cache().  Safety: under
+    the rank-consistent policy gate every rank sees the same batch shapes,
+    so the cache key sequence -- and this trigger -- is rank-symmetric, and
+    the clear itself barriers per workspace.  0 (default) preserves the old
+    unbounded behavior; the cap is never applied while captured prefill
+    graphs hold workspace references.
+    """
+    cap = envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.get()
+    if cap <= 0:
+        return
+    try:
+        n = len(mok_functional._FP8_ROUTE_WORKSPACE_CACHE) + len(
+            mok_functional._WORKSPACE_CACHE
+        )
+    except AttributeError:
+        _report_fallback("workspace cache cap unsupported by extension")
+        return
+    if n < cap:
+        return
+    if _PREFILL_GRAPHS:
+        _report_fallback("workspace cache cap skipped: live prefill graphs")
+        return
+    mok_functional.clear_workspace_cache()
+    with _TRAP_WATCHDOG_LOCK:
+        _TRAP_WATCHDOG_ENTRIES.clear()
+    torch.cuda.empty_cache()
+    logger.info("MoK workspace caches cleared at cap=%d (had %d)", cap, n)
+
+
 class _PrefillGraphEntry:
     __slots__ = ("graph", "in_hidden", "in_ids", "in_weights", "out")
 
@@ -735,6 +773,7 @@ def maybe_run_mok_fp8_native(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=route_chunk_bytes,
     )
+    _maybe_clear_workspace_caches(mok_functional)
     workspace = mok_functional.get_fp8_route_workspace(
         config,
         group,
