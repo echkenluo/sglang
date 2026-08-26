@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
@@ -404,6 +405,24 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         return no_capture
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
+
+    if model_runner.spec_algorithm.is_dspark():
+        if (
+            not model_runner.is_draft_worker
+            and envs.SGLANG_DSPARK_DISABLE_TARGET_VERIFY_CUDA_GRAPH.get()
+        ):
+            logger.info(
+                "Disable DSpark target-verify CUDA graph by role-specific A/B switch."
+            )
+            return no_capture
+        if (
+            model_runner.is_draft_worker
+            and envs.SGLANG_DSPARK_DISABLE_DRAFT_VERIFY_CUDA_GRAPH.get()
+        ):
+            logger.info(
+                "Disable DSpark draft-verify CUDA graph by role-specific A/B switch."
+            )
+            return no_capture
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

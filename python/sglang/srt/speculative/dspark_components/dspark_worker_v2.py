@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import Optional
 
@@ -8,8 +8,13 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -123,6 +128,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._linear_accept_index_cache = None
 
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
@@ -293,10 +299,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        with ExitStack() as stack:
+            if self._draft_dp_context_enabled:
+                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
+            stack.enter_context(speculative_moe_backend_context())
+            stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -381,17 +391,25 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
+        num_indices = bs * self.verify_num_draft_tokens
+        if (
+            self._linear_accept_index_cache is None
+            or self._linear_accept_index_cache.numel() < num_indices
+        ):
+            self._linear_accept_index_cache = torch.arange(
+                num_indices, dtype=torch.int64, device=self.device
+            )
+        return self._linear_accept_index_cache[:num_indices].view(
+            bs, self.verify_num_draft_tokens
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -669,6 +687,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                self._linear_accept_indices(bs),
+                self.verify_num_draft_tokens - 1,
+            )
+
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

@@ -70,6 +70,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    compute_attention_and_moe_layers,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
@@ -81,6 +84,9 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    set_tc_piecewise_forward_context,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
@@ -91,6 +97,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
@@ -451,6 +458,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+        )
+
+    def _ensure_breakable_layer_context(self):
+        required = (
+            "attention_layers",
+            "moe_layers",
+            "moe_fusions",
+            "dsa_indexers",
+            "mha_companion_layers",
+        )
+        if all(hasattr(self.model_runner, name) for name in required):
+            return
+        root_model = self.model_runner.model
+        if hasattr(root_model, "stages"):
+            layer_model = SimpleNamespace(layers=root_model.stages)
+        else:
+            layer_model = resolve_language_model(root_model)
+            while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+                layer_model = layer_model.model
+        if not hasattr(layer_model, "layers"):
+            raise AttributeError("Breakable decode graph requires decoder layers")
+        values = compute_attention_and_moe_layers(layer_model)
+        for name, value in zip(required, values):
+            setattr(self.model_runner, name, value)
+
+    def _breakable_forward_context(self, forward_batch: ForwardBatch):
+        if not isinstance(self.backend, BreakableCudaGraphBackend):
+            return contextlib.nullcontext()
+        self._ensure_breakable_layer_context()
+        return set_tc_piecewise_forward_context(
+            forward_batch,
+            self.model_runner.attention_layers,
+            getattr(self.model_runner.model, "quant_config", None),
+            self.model_runner.moe_layers,
+            self.model_runner.moe_fusions,
+            dsa_indexers=self.model_runner.dsa_indexers,
+            mha_companion_layers=self.model_runner.mha_companion_layers,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -982,12 +1026,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                out = forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                with self._breakable_forward_context(forward_batch):
+                    out = forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
                 for capture_hook in self.model_runner.capture_tail_hooks:
                     capture_hook(self, out, forward_batch, num_tokens)
                 return out
@@ -1230,7 +1275,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            with self._breakable_forward_context(forward_batch):
+                output = self.backend.replay(
+                    self._replay_graph_key, forward_batch
+                )
             if read_done_post_replay:
                 read_done = self.device_module.Event()
                 read_done.record()

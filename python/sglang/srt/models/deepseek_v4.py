@@ -224,6 +224,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+_BCG_EAGER_TARGET_FFN = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_FFN")
+_BCG_EAGER_TARGET_LOGITS = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_LOGITS")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 
@@ -1440,6 +1442,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        # Diagnostic-only: keep the target router, expert call, and TP combine
+        # outside Breakable CUDA Graph while leaving the DSpark draft unchanged.
+        # ``is_nextn`` is true for DSparkV4Stage and false for target layers.
+        if _BCG_EAGER_TARGET_FFN and not is_nextn:
+            self._run_moe_ffn_dp_sync = eager_on_graph(True)(
+                self._run_moe_ffn_dp_sync
+            )
 
     def _build_self_attn(
         self,
@@ -2508,6 +2517,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
+        # Diagnostic-only: isolate target LM-head/logits capture with one eager
+        # break, leaving target decoder layers and the DSpark draft unchanged.
+        if _BCG_EAGER_TARGET_LOGITS:
+            self.logits_processor.forward = eager_on_graph(True)(
+                self.logits_processor.forward
+            )
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 

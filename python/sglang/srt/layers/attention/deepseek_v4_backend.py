@@ -84,6 +84,13 @@ _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
+# The packaged FlashMLA extension starts at SM90. L20 is Ada SM89.
+_is_sm89 = (
+    _is_cuda
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability() == (8, 9)
+)
+
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
@@ -136,7 +143,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if _is_sm120 or _is_xpu or _is_sm89:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -571,6 +578,11 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        if _is_sm89:
+            logger.info(
+                "Using the Triton DSV4 sparse-attention fallback on SM89; "
+                "the packaged FlashMLA extension has no Ada cubin."
+            )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1702,6 +1714,7 @@ class DeepseekV4AttnBackend(
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
+                and not _is_sm89
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1735,12 +1748,18 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                if _is_xpu:
-                    from sgl_kernel import flash_mla_with_kvcache
-                else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                if _is_sm89:
+                    from sglang.kernels.ops.attention.nsa_triton_decode import (
+                        triton_fp8_attention_fwd,
+                    )
 
-                o = flash_mla_with_kvcache(
+                    attention_fn = triton_fp8_attention_fwd
+                elif _is_xpu:
+                    from sgl_kernel import flash_mla_with_kvcache as attention_fn
+                else:
+                    from sgl_kernel.flash_mla import flash_mla_with_kvcache as attention_fn
+
+                o = attention_fn(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,

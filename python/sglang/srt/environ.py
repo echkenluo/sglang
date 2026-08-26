@@ -912,6 +912,10 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # DSpark graph correctness bisection. These role-specific switches retain
+    # the other side's verify graph instead of disabling every decode graph.
+    SGLANG_DSPARK_DISABLE_TARGET_VERIFY_CUDA_GRAPH = EnvBool(False)
+    SGLANG_DSPARK_DISABLE_DRAFT_VERIFY_CUDA_GRAPH = EnvBool(False)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

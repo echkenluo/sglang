@@ -65,6 +65,10 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -92,6 +96,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_bcg_eager_target_fp8_moe = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_FP8_MOE")
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
@@ -1411,9 +1416,43 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if (
+            _bcg_eager_target_fp8_moe
+            and is_in_breakable_cuda_graph()
+            and self.use_triton_kernels
+            and isinstance(self.quant_method, Fp8MoEMethod)
+        ):
+            if TopKOutputChecker.format_is_standard(topk_output):
+                return bcg_moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                return bcg_fused_moe_bypassed_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.router_logits,
+                    topk_output.topk_config.top_k,
+                    topk_output.topk_config.topk_group,
+                    topk_output.topk_config.num_expert_group,
+                    topk_output.topk_config.correction_bias,
+                    topk_output.topk_config.renormalize,
+                    self.layer_id,
+                    topk_output.topk_config.allow_routed_experts_capture,
+                )
+            return self.forward_impl(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
-                return moe_forward_piecewise_cuda_graph_impl(
+                forward_op = (
+                    bcg_moe_forward_piecewise_cuda_graph_impl
+                    if is_in_breakable_cuda_graph()
+                    else moe_forward_piecewise_cuda_graph_impl
+                )
+                return forward_op(
                     hidden_states,
                     topk_output.topk_weights,
                     topk_output.topk_ids,
@@ -1421,7 +1460,12 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id,
                 )
             elif TopKOutputChecker.format_is_bypassed(topk_output):
-                return fused_moe_bypassed_piecewise_cuda_graph_impl(
+                forward_op = (
+                    bcg_fused_moe_bypassed_piecewise_cuda_graph_impl
+                    if is_in_breakable_cuda_graph()
+                    else fused_moe_bypassed_piecewise_cuda_graph_impl
+                )
+                return forward_op(
                     hidden_states,
                     topk_output.router_logits,
                     topk_output.topk_config.top_k,
@@ -1726,3 +1770,11 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
     forward_context = get_tc_piecewise_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+bcg_moe_forward_piecewise_cuda_graph_impl = eager_on_graph(True)(
+    moe_forward_piecewise_cuda_graph_impl
+)
+bcg_fused_moe_bypassed_piecewise_cuda_graph_impl = eager_on_graph(True)(
+    fused_moe_bypassed_piecewise_cuda_graph_impl
+)

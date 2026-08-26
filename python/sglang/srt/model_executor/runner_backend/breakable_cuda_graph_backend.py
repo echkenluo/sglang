@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -143,16 +145,24 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs[shape_key] = capture_inputs
 
     def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+        """Leading-dim row count actually produced by the captured body.
 
-        A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        ``shape_key.size`` is a request batch size for static speculative graphs,
+        while a draft output has ``batch_size * gamma`` rows.  Therefore the
+        output tensor, rather than the graph key, defines the copy extent.
         """
         if torch.is_tensor(output):
-            return min(cap, output.shape[0])
+            return output.shape[0]
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
-            return min([cap, *rows])
+            return min(rows) if rows else cap
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                value.shape[0]
+                for field in dataclasses.fields(output)
+                if torch.is_tensor(value := getattr(output, field.name))
+            ]
+            return min(rows) if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
@@ -162,14 +172,28 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if output is None:
             return None
         if torch.is_tensor(output):
-            return output.new_empty((size, *output.shape[1:]))
+            return output.new_empty(output.shape)
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
                 {
-                    key: t.new_empty((size, *t.shape[1:]))
+                    key: t.new_empty(t.shape)
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            values = {}
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                if value is None:
+                    values[field.name] = None
+                elif torch.is_tensor(value):
+                    values[field.name] = value.new_empty(value.shape)
+                else:
+                    raise TypeError(
+                        "BCG cannot capture non-tensor LogitsProcessorOutput "
+                        f"field {field.name}: {type(value)}"
+                    )
+            return LogitsProcessorOutput(**values)
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -183,6 +207,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            values = {}
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                if value is None:
+                    values[field.name] = None
+                elif torch.is_tensor(value):
+                    values[field.name] = value[:num_tokens]
+                else:
+                    values[field.name] = value
+            return LogitsProcessorOutput(**values)
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -214,6 +249,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                buffer = getattr(output_buffer, field.name)
+                if value is None or buffer is None:
+                    if value is None and buffer is None:
+                        continue
+                    raise ValueError(
+                        "BCG logits output structure changed for field "
+                        f"{field.name}: {type(value)} vs {type(buffer)}"
+                    )
+                self._copy_output_to_buffer(value, buffer, num_tokens)
             return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)

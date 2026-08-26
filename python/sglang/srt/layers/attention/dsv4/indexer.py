@@ -78,13 +78,16 @@ def fp8_paged_mqa_logits_torch(
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
+    seq_lens_flat = (
+        seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
+    )
 
     assert head_dim == 128
     assert block_size == 64
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
-    assert seq_lens.shape == (batch_size,)
+    assert seq_lens_flat.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
@@ -119,7 +122,7 @@ def fp8_paged_mqa_logits_torch(
     if arange_key not in cache:
         cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
     positions = cache[arange_key].unsqueeze(0)
-    valid_mask = positions < seq_lens.unsqueeze(1)
+    valid_mask = positions < seq_lens_flat.unsqueeze(1)
     scores = scores.masked_fill(~valid_mask, 0.0)
 
     if padded_seq_len < max_seq_len:
