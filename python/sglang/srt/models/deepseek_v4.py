@@ -224,6 +224,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+_BCG_EAGER_TARGET_SELF_ATTN = get_bool_env_var(
+    "SGLANG_BCG_EAGER_TARGET_SELF_ATTN"
+)
 _BCG_EAGER_TARGET_FFN = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_FFN")
 _BCG_EAGER_TARGET_LOGITS = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_LOGITS")
 _is_gfx95_supported = is_gfx95_supported()
@@ -1272,7 +1275,11 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if (
+                forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+                and not getattr(self, "_bcg_eager_whole_block", False)
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -1399,6 +1406,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        # Diagnostic-only: run the complete target attention block outside
+        # Breakable CUDA Graph, including projections and RoPE around the
+        # already-eager sparse-attention kernel. Keep DSpark draft stages intact.
+        if _BCG_EAGER_TARGET_SELF_ATTN and not is_nextn:
+            self.self_attn._bcg_eager_whole_block = True
+            self.self_attn.forward = eager_on_graph(True)(self.self_attn.forward)
         moe_alt_stream = (
             alt_streams[0]
             if (
