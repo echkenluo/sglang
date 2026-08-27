@@ -255,6 +255,32 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+#ifndef USE_MUSA
+template <bool is_sender>
+DINLINE void directed_gpu_signal(const RankSignals& sg, Signal* self_sg, int rank, int peer) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    auto val = self_sg->self_counter[blockIdx.x][peer] += 1;
+    if constexpr (is_sender) {
+      auto peer_counter = &sg.signals[peer]->peer_counter[val % 2][blockIdx.x][rank];
+      st_flag_release(peer_counter, val);
+    } else {
+      auto self_counter = &self_sg->peer_counter[val % 2][blockIdx.x][peer];
+      while (ld_flag_acquire(self_counter) != val)
+        ;
+    }
+  }
+  __syncthreads();
+}
+
+template <typename P, typename A>
+DINLINE P packed_add_two(P lhs, P rhs) {
+  A tmp = upcast(lhs);
+  packed_assign_add(tmp, upcast(rhs));
+  return downcast<P>(tmp);
+}
+#endif
+
 #ifdef USE_MUSA
 template <typename T, int32_t nranks, int32_t vlen = 8>
 DINLINE void shfl_reduce(float* res) {
@@ -422,6 +448,112 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
     }
   }
 }
+
+#ifndef USE_MUSA
+template <typename T>
+__global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_pcie_hierarchical_world8(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  P* local_tmp = get_tmp_buf<P>(self_sg);
+
+  multi_gpu_barrier<8, true>(sg, self_sg, rank);
+
+  if ((rank & 1) == 0) {
+    const P* lhs = reinterpret_cast<const P*>(dp.ptrs[rank]);
+    const P* rhs = reinterpret_cast<const P*>(dp.ptrs[rank + 1]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = packed_add_two<P, A>(lhs[idx], rhs[idx]);
+    }
+  }
+
+  if (rank == 2) {
+    directed_gpu_signal<true>(sg, self_sg, rank, 0);
+  } else if (rank == 0) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 2);
+  }
+  if (rank == 6) {
+    directed_gpu_signal<true>(sg, self_sg, rank, 4);
+  } else if (rank == 4) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 6);
+  }
+
+  if (rank == 0 || rank == 4) {
+    const P* peer_tmp = get_tmp_buf<P>(sg.signals[rank + 2]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = packed_add_two<P, A>(local_tmp[idx], peer_tmp[idx]);
+    }
+  }
+
+  if (rank == 4) {
+    directed_gpu_signal<true>(sg, self_sg, rank, 0);
+  } else if (rank == 0) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 4);
+    const P* peer_tmp = get_tmp_buf<P>(sg.signals[4]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = packed_add_two<P, A>(local_tmp[idx], peer_tmp[idx]);
+    }
+  }
+
+  if (rank == 0) {
+    for (int idx = tid; idx < size; idx += stride)
+      reinterpret_cast<P*>(result)[idx] = local_tmp[idx];
+    directed_gpu_signal<true>(sg, self_sg, rank, 1);
+    directed_gpu_signal<true>(sg, self_sg, rank, 2);
+    directed_gpu_signal<true>(sg, self_sg, rank, 4);
+  } else if (rank == 1) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 0);
+    const P* source = get_tmp_buf<P>(sg.signals[0]);
+    for (int idx = tid; idx < size; idx += stride)
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+  } else if (rank == 2) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 0);
+    const P* source = get_tmp_buf<P>(sg.signals[0]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = source[idx];
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+    }
+    directed_gpu_signal<true>(sg, self_sg, rank, 3);
+  } else if (rank == 3) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 2);
+    const P* source = get_tmp_buf<P>(sg.signals[2]);
+    for (int idx = tid; idx < size; idx += stride)
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+  } else if (rank == 4) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 0);
+    const P* source = get_tmp_buf<P>(sg.signals[0]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = source[idx];
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+    }
+    directed_gpu_signal<true>(sg, self_sg, rank, 5);
+    directed_gpu_signal<true>(sg, self_sg, rank, 6);
+  } else if (rank == 5) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 4);
+    const P* source = get_tmp_buf<P>(sg.signals[4]);
+    for (int idx = tid; idx < size; idx += stride)
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+  } else if (rank == 6) {
+    directed_gpu_signal<false>(sg, self_sg, rank, 4);
+    const P* source = get_tmp_buf<P>(sg.signals[4]);
+    for (int idx = tid; idx < size; idx += stride) {
+      local_tmp[idx] = source[idx];
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+    }
+    directed_gpu_signal<true>(sg, self_sg, rank, 7);
+  } else {
+    directed_gpu_signal<false>(sg, self_sg, rank, 6);
+    const P* source = get_tmp_buf<P>(sg.signals[6]);
+    for (int idx = tid; idx < size; idx += stride)
+      reinterpret_cast<P*>(result)[idx] = source[idx];
+  }
+
+  multi_gpu_barrier<8, false>(sg, self_sg, rank);
+}
+#endif
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
@@ -611,15 +743,18 @@ class CustomAllreduce {
     const char* env_algo = std::getenv("SGLANG_CUSTOM_ALLREDUCE_ALGO");
     bool force_1stage = false;
     bool force_2stage = false;
+    bool force_pcie_hierarchical = false;
     if (env_algo != nullptr) {
       if (std::strcmp(env_algo, "1stage") == 0 || std::strcmp(env_algo, "oneshot") == 0) {
         force_1stage = true;
       } else if (std::strcmp(env_algo, "2stage") == 0 || std::strcmp(env_algo, "twoshot") == 0) {
         force_2stage = true;
+      } else if (std::strcmp(env_algo, "pcie_hierarchical") == 0 || std::strcmp(env_algo, "hierarchical") == 0) {
+        force_pcie_hierarchical = true;
       } else {
         throw std::runtime_error(
             "Invalid SGLANG_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
-            ". Valid values: 1stage, oneshot, 2stage, twoshot");
+            ". Valid values: 1stage, oneshot, 2stage, twoshot, pcie_hierarchical, hierarchical");
       }
     }
 
@@ -627,25 +762,32 @@ class CustomAllreduce {
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.
 #ifndef USE_MUSA
-#define REDUCE_CASE(ngpus)                                                             \
-  case ngpus: {                                                                        \
-    if (force_1stage) {                                                                \
-      KL(ngpus, cross_device_reduce_1stage);                                           \
-    } else if (force_2stage) {                                                         \
-      KL(ngpus, cross_device_reduce_2stage);                                           \
-    } else {                                                                           \
-      if (world_size_ == 2) {                                                          \
-        KL(ngpus, cross_device_reduce_1stage);                                         \
-      } else if (full_nvlink_) {                                                       \
-        if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) || \
-            (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) { \
-          KL(ngpus, cross_device_reduce_1stage);                                       \
-        } else {                                                                       \
-          KL(ngpus, cross_device_reduce_2stage);                                       \
-        }                                                                              \
-      }                                                                                \
-    }                                                                                  \
-    break;                                                                             \
+#define REDUCE_CASE(ngpus)                                                              \
+  case ngpus: {                                                                         \
+    if (force_pcie_hierarchical) {                                                      \
+      if constexpr (ngpus == 8) {                                                       \
+        cross_device_reduce_pcie_hierarchical_world8<T>                                 \
+            <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
+      } else {                                                                          \
+        throw std::runtime_error("pcie_hierarchical requires world size 8");            \
+      }                                                                                 \
+    } else if (force_1stage) {                                                          \
+      KL(ngpus, cross_device_reduce_1stage);                                            \
+    } else if (force_2stage) {                                                          \
+      KL(ngpus, cross_device_reduce_2stage);                                            \
+    } else {                                                                            \
+      if (world_size_ == 2) {                                                           \
+        KL(ngpus, cross_device_reduce_1stage);                                          \
+      } else if (full_nvlink_) {                                                        \
+        if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||  \
+            (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {  \
+          KL(ngpus, cross_device_reduce_1stage);                                        \
+        } else {                                                                        \
+          KL(ngpus, cross_device_reduce_2stage);                                        \
+        }                                                                               \
+      }                                                                                 \
+    }                                                                                   \
+    break;                                                                              \
   }
 #else
 #define REDUCE_CASE(ngpus)                                                                                         \
