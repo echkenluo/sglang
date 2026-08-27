@@ -201,7 +201,7 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def get_grouped_masked_output_signal_meta(
         self, configs: dict, valid_shape_m: int
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool, str]:
         for min_shape_m, max_shape_m, config in configs["w2_tuning_config"]:
             if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
                 break
@@ -214,15 +214,13 @@ class HummingRunnerCore(MoeRunnerCore):
         use_tma = bool(config.get("use_tma", False))
         use_tma_c = bool(config.get("use_tma_c", use_tma))
         if (
-            not use_tma_c
-            or config.get("use_stream_k", False)
-            or config.get("multi_cast_size_a", 1) != 1
+            config.get("multi_cast_size_a", 1) != 1
             or config.get("multi_cast_size_b", 1) != 1
             or config.get("num_write_splits", 1) != 1
         ):
             raise RuntimeError(
-                "Humming SBO requires grouped-masked W2 with TMA-C, no "
-                f"Stream-K/multicast/split writes; got {config}"
+                "Humming SBO requires grouped-masked W2 without "
+                f"multicast or split writes; got {config}"
             )
 
         output_width = self.layer.humming_metas["w2"].shape_n
@@ -231,7 +229,12 @@ class HummingRunnerCore(MoeRunnerCore):
                 f"Humming W2 output width {output_width} is not divisible by "
                 f"block_n {block_n}"
             )
-        return block_m, output_width // block_n
+        return (
+            block_m,
+            output_width // block_n,
+            bool(config.get("use_stream_k", False)),
+            "tma" if use_tma_c else "legacy",
+        )
 
     def estimate_local_valid_shape_m(
         self,
@@ -522,9 +525,9 @@ class HummingRunnerCore(MoeRunnerCore):
         if down_gemm_overlap_args is not None:
             import humming
 
-            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 1:
+            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 2:
                 raise RuntimeError(
-                    "Humming SBO requires OUTPUT_SIGNAL_ABI_VERSION=1"
+                    "Humming SBO requires OUTPUT_SIGNAL_ABI_VERSION=2"
                 )
             if runner_input.gemm_type != HummingGemmType.GROUPED_MASKED:
                 raise RuntimeError(
@@ -837,8 +840,8 @@ class HummingRunnerCore(MoeRunnerCore):
             overlap_args = self._active_down_gemm_overlap_args
             if overlap_args is None:
                 raise RuntimeError("Humming output signal has no overlap arguments")
-            block_m, threshold = self.get_grouped_masked_output_signal_meta(
-                configs, valid_shape_m
+            block_m, threshold, use_stream_k, store_mode = (
+                self.get_grouped_masked_output_signal_meta(configs, valid_shape_m)
             )
             if self._active_meta_overlap_args is None:
                 raise RuntimeError("Humming SBO has no meta overlap arguments")
@@ -847,7 +850,8 @@ class HummingRunnerCore(MoeRunnerCore):
             w2_compute_config = configs["output_signal_compute_config_str"]
             logger.info_once(
                 "Using Humming W2 output signaling for DeepEP combine overlap "
-                f"(block_m={block_m}, threshold={threshold})"
+                f"(block_m={block_m}, threshold={threshold}, "
+                f"stream_k={use_stream_k}, store={store_mode})"
             )
             overlap_args.start_event.record()
 

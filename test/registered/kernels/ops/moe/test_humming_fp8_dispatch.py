@@ -356,8 +356,8 @@ class TestHummingSboContract(unittest.TestCase):
             MoeRunnerConfig(
                 num_experts=64,
                 num_local_experts=64,
-                intermediate_size_per_partition=256,
-                top_k=8,
+                intermediate_size_per_partition=2048,
+                top_k=6,
                 activation="silu",
                 is_gated=True,
                 swiglu_limit=None,
@@ -365,7 +365,7 @@ class TestHummingSboContract(unittest.TestCase):
             )
         )
         runner.layer = SimpleNamespace(
-            humming_metas={"w2": SimpleNamespace(shape_n=7168)}
+            humming_metas={"w2": SimpleNamespace(shape_n=4096)}
         )
         configs = {
             "w2_tuning_config": [
@@ -374,21 +374,21 @@ class TestHummingSboContract(unittest.TestCase):
                     1 << 30,
                     {
                         "block_shape": [8, 128, 128],
-                        "use_tma": True,
-                        "use_stream_k": False,
+                        "use_tma": False,
+                        "use_stream_k": True,
                     },
                 ]
             ]
         }
 
         self.assertEqual(
-            runner.get_grouped_masked_output_signal_meta(configs, 4096),
-            (8, 56),
+            runner.get_grouped_masked_output_signal_meta(configs, 256),
+            (8, 32, True, "legacy"),
         )
 
-        configs["w2_tuning_config"][0][2]["use_stream_k"] = True
-        with self.assertRaisesRegex(RuntimeError, "no Stream-K"):
-            runner.get_grouped_masked_output_signal_meta(configs, 4096)
+        configs["w2_tuning_config"][0][2]["multi_cast_size_a"] = 2
+        with self.assertRaisesRegex(RuntimeError, "without multicast"):
+            runner.get_grouped_masked_output_signal_meta(configs, 256)
 
     def test_auto_normal_dispatch_uses_serial_event_contract(self):
         hidden_states = SimpleNamespace(shape=(64, 32, 7168), device="cuda")

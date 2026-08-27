@@ -329,10 +329,10 @@ def initialize_moe_config(server_args: ServerArgs):
                 raise ValueError(
                     "Humming SBO requires DeepEP low_latency or auto mode"
                 )
-            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 1:
+            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 2:
                 raise ValueError(
                     "Humming SBO requires a Humming build with "
-                    "OUTPUT_SIGNAL_ABI_VERSION=1"
+                    "OUTPUT_SIGNAL_ABI_VERSION=2"
                 )
         if torch.cuda.get_device_capability()[0] == 9 and not humming_sm90_sbo:
             raise ValueError(
