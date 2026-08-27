@@ -99,7 +99,7 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     layer: torch.nn.Module
 
 
-@register_custom_op()
+@register_custom_op(mutates_args=["output_signal"])
 def humming_moe_runner_core_run(
     moe_runner_id: int,
     gemm_type: str,
@@ -109,6 +109,7 @@ def humming_moe_runner_core_run(
     expert_num_tokens: torch.Tensor | None = None,
     expected_m: int | None = None,
     hidden_states_scale: torch.Tensor | None = None,
+    output_signal: torch.Tensor | None = None,
     apply_routed_scaling_factor: bool = True,
 ) -> torch.Tensor:
     runner = HummingRunnerCore.runner_cores[moe_runner_id]
@@ -137,6 +138,7 @@ def humming_moe_runner_core_run(
             expected_m=expected_m,
             expert_num_tokens=expert_num_tokens,
             hidden_states_scale=hidden_states_scale,
+            output_signal=output_signal,
         )
     else:
         raise ValueError(f"Unknown gemm type: {gemm_type}")
@@ -155,6 +157,8 @@ class HummingRunnerCore(MoeRunnerCore):
         self.swiglu_limit = config.swiglu_limit
         self.layer: torch.nn.Module | None = None
         self.humming_gemm_configs = {}
+        self._active_down_gemm_overlap_args = None
+        self._active_meta_overlap_args = None
         HummingRunnerCore.runner_cores[id(self)] = self
 
     @property
@@ -186,11 +190,48 @@ class HummingRunnerCore(MoeRunnerCore):
             "w13_tuning_config": w13_tuning_config,
             "w2_tuning_config": w2_tuning_config,
             "compute_config_str": json.dumps(compute_config),
+            "output_signal_compute_config_str": json.dumps(
+                compute_config | {"enable_output_signal": True}
+            ),
             "w13_tuning_config_str": json.dumps(w13_tuning_config),
             "w2_tuning_config_str": json.dumps(w2_tuning_config),
         }
 
         return self.humming_gemm_configs[humming_gemm_type.value]
+
+    def get_grouped_masked_output_signal_meta(
+        self, configs: dict, valid_shape_m: int
+    ) -> tuple[int, int]:
+        for min_shape_m, max_shape_m, config in configs["w2_tuning_config"]:
+            if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
+                break
+        else:
+            raise ValueError(
+                f"cannot find Humming W2 signal config for shape {valid_shape_m}"
+            )
+
+        block_m, block_n, _ = config["block_shape"]
+        use_tma = bool(config.get("use_tma", False))
+        use_tma_c = bool(config.get("use_tma_c", use_tma))
+        if (
+            not use_tma_c
+            or config.get("use_stream_k", False)
+            or config.get("multi_cast_size_a", 1) != 1
+            or config.get("multi_cast_size_b", 1) != 1
+            or config.get("num_write_splits", 1) != 1
+        ):
+            raise RuntimeError(
+                "Humming SBO requires grouped-masked W2 with TMA-C, no "
+                f"Stream-K/multicast/split writes; got {config}"
+            )
+
+        output_width = self.layer.humming_metas["w2"].shape_n
+        if output_width % block_n != 0:
+            raise RuntimeError(
+                f"Humming W2 output width {output_width} is not divisible by "
+                f"block_n {block_n}"
+            )
+        return block_m, output_width // block_n
 
     def estimate_local_valid_shape_m(
         self,
@@ -475,7 +516,26 @@ class HummingRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> HummingRunnerOutput:
         self.layer = quant_info.layer
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args")
+        meta_overlap_args = running_state.get("meta_overlap_args")
+        output_signal = None
+        if down_gemm_overlap_args is not None:
+            import humming
+
+            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 1:
+                raise RuntimeError(
+                    "Humming SBO requires OUTPUT_SIGNAL_ABI_VERSION=1"
+                )
+            if runner_input.gemm_type != HummingGemmType.GROUPED_MASKED:
+                raise RuntimeError(
+                    "Humming SBO only supports DeepEP LL grouped-masked W2"
+                )
+            output_signal = down_gemm_overlap_args.signal
+        self._active_down_gemm_overlap_args = down_gemm_overlap_args
+        self._active_meta_overlap_args = meta_overlap_args
         if runner_input.hidden_states.size(0) == 0:
+            self._active_down_gemm_overlap_args = None
+            self._active_meta_overlap_args = None
             return HummingRunnerOutput(
                 hidden_states=torch.empty_like(
                     runner_input.hidden_states, dtype=self.config.params_dtype
@@ -485,17 +545,22 @@ class HummingRunnerCore(MoeRunnerCore):
         # To make it compatible with dynamic shapes in torch.compile,
         # we wrap the main logic inside a torch op.
         # (the moe_block_size selection in indexed gemm would break dynamic shapes).
-        output = humming_moe_runner_core_run(
-            moe_runner_id=id(self),
-            gemm_type=runner_input.gemm_type.value,
-            hidden_states=runner_input.hidden_states,
-            topk_weights=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
-            expected_m=runner_input.expected_m,
-            expert_num_tokens=runner_input.expert_num_tokens,
-            hidden_states_scale=runner_input.hidden_states_scale,
-            apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
-        )
+        try:
+            output = humming_moe_runner_core_run(
+                moe_runner_id=id(self),
+                gemm_type=runner_input.gemm_type.value,
+                hidden_states=runner_input.hidden_states,
+                topk_weights=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                expected_m=runner_input.expected_m,
+                expert_num_tokens=runner_input.expert_num_tokens,
+                hidden_states_scale=runner_input.hidden_states_scale,
+                output_signal=output_signal,
+                apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
+            )
+        finally:
+            self._active_down_gemm_overlap_args = None
+            self._active_meta_overlap_args = None
 
         return HummingRunnerOutput(hidden_states=output)
 
@@ -722,6 +787,7 @@ class HummingRunnerCore(MoeRunnerCore):
         expert_num_tokens: torch.Tensor,
         expected_m: int,
         hidden_states_scale: torch.Tensor | None = None,
+        output_signal: torch.Tensor | None = None,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_MASKED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids, expected_m)
@@ -766,6 +832,25 @@ class HummingRunnerCore(MoeRunnerCore):
             gate_up, expert_num_tokens, buffers
         )
 
+        w2_compute_config = configs["compute_config_str"]
+        if output_signal is not None:
+            overlap_args = self._active_down_gemm_overlap_args
+            if overlap_args is None:
+                raise RuntimeError("Humming output signal has no overlap arguments")
+            block_m, threshold = self.get_grouped_masked_output_signal_meta(
+                configs, valid_shape_m
+            )
+            if self._active_meta_overlap_args is None:
+                raise RuntimeError("Humming SBO has no meta overlap arguments")
+            self._active_meta_overlap_args["block_m"] = block_m
+            self._active_meta_overlap_args["threshold"] = threshold
+            w2_compute_config = configs["output_signal_compute_config_str"]
+            logger.info_once(
+                "Using Humming W2 output signaling for DeepEP combine overlap "
+                f"(block_m={block_m}, threshold={threshold})"
+            )
+            overlap_args.start_event.record()
+
         HummingMethod.forward_layer(
             layer=self.layer,
             inputs=down_input,
@@ -773,9 +858,10 @@ class HummingRunnerCore(MoeRunnerCore):
             outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
-            compute_config=configs["compute_config_str"],
+            compute_config=w2_compute_config,
             tuning_config=configs["w2_tuning_config_str"],
             sublayer_name="w2",
+            output_signal=output_signal,
         )
 
         return buffers["down_output"]

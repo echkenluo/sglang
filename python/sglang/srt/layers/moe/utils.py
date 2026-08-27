@@ -314,7 +314,27 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.tbo_enabled = server_args.enable_two_batch_overlap
     moe.sbo_enabled = server_args.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
-        if torch.cuda.get_device_capability()[0] == 9:
+        humming_sm90_sbo = (
+            moe.runner_backend.is_humming()
+            and envs.SGLANG_HUMMING_ENABLE_SBO.get()
+        )
+        if humming_sm90_sbo:
+            import humming
+
+            if torch.cuda.get_device_capability()[0] != 9:
+                raise ValueError("Humming SBO is currently supported only on SM90")
+            if not moe.a2a_backend.is_deepep():
+                raise ValueError("Humming SBO requires the DeepEP A2A backend")
+            if not moe.deepep_mode.enable_low_latency():
+                raise ValueError(
+                    "Humming SBO requires DeepEP low_latency or auto mode"
+                )
+            if getattr(humming, "OUTPUT_SIGNAL_ABI_VERSION", None) != 1:
+                raise ValueError(
+                    "Humming SBO requires a Humming build with "
+                    "OUTPUT_SIGNAL_ABI_VERSION=1"
+                )
+        if torch.cuda.get_device_capability()[0] == 9 and not humming_sm90_sbo:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )

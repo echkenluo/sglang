@@ -32,10 +32,15 @@ class SboFlags:
     def enable_combine_down_gemm_two_stream_overlap(cls):
         return (
             is_sbo_enabled()
-            # currently only cutedsl backend supports it
+            # Each admitted backend must publish the same per-tile signal ABI.
             and (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell())
+                or (
+                    get_moe_runner_backend().is_humming()
+                    and envs.SGLANG_HUMMING_ENABLE_SBO.get()
+                    and not is_blackwell()
+                )
             )
         )
 
@@ -112,7 +117,18 @@ def compute_overlap_args(dispatch_output, alt_stream):
     )
     down_gemm_overlap_args = None
 
-    if SboFlags.enable_combine_down_gemm_two_stream_overlap():
+    enable_down_gemm_overlap = SboFlags.enable_combine_down_gemm_two_stream_overlap()
+    if (
+        enable_down_gemm_overlap
+        and get_moe_runner_backend().is_humming()
+        and not dispatch_output.format.is_deepep_ll()
+    ):
+        # DeepEP AUTO uses the normal dispatcher for extend/prefill. Humming's
+        # producer is intentionally limited to the grouped-masked LL W2 path;
+        # keep the normal path on the existing event-ordered serial combine.
+        enable_down_gemm_overlap = False
+
+    if enable_down_gemm_overlap:
         # TODO use zero_allocator to remove this `torch.zeros` call
         # NOTE ours v2 use uint32 not int32 currently
         if is_blackwell():
@@ -120,7 +136,12 @@ def compute_overlap_args(dispatch_output, alt_stream):
                 num_local_experts, dtype=torch.uint32, device=hidden_states.device
             )
         else:
-            MIN_BLOCK_M = 64
+            MIN_BLOCK_M = (
+                8
+                if get_moe_runner_backend().is_humming()
+                and envs.SGLANG_HUMMING_ENABLE_SBO.get()
+                else 64
+            )
             combine_signal_size = num_local_experts * (
                 (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
             )

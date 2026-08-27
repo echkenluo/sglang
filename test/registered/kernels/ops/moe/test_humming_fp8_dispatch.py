@@ -10,8 +10,10 @@ from sglang.kernels.ops.attention.dsv4.moe import (
     silu_and_mul_masked_post_quant,
 )
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
+from sglang.srt.batch_overlap import single_batch_overlap as sbo
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputFormat
 from sglang.srt.layers.quantization import humming_utils
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -346,6 +348,130 @@ class TestHummingFp8Dispatch(CustomTestCase):
         fused_silu.assert_not_called()
         self.assertIs(down_input, expected_down_input)
         self.assertIs(down_scale, expected_down_scale)
+
+
+class TestHummingSboContract(unittest.TestCase):
+    def test_grouped_masked_output_signal_metadata(self):
+        runner = humming_runner.HummingRunnerCore(
+            MoeRunnerConfig(
+                num_experts=64,
+                num_local_experts=64,
+                intermediate_size_per_partition=256,
+                top_k=8,
+                activation="silu",
+                is_gated=True,
+                swiglu_limit=None,
+                gate_up_interleaved=False,
+            )
+        )
+        runner.layer = SimpleNamespace(
+            humming_metas={"w2": SimpleNamespace(shape_n=7168)}
+        )
+        configs = {
+            "w2_tuning_config": [
+                [
+                    0,
+                    1 << 30,
+                    {
+                        "block_shape": [8, 128, 128],
+                        "use_tma": True,
+                        "use_stream_k": False,
+                    },
+                ]
+            ]
+        }
+
+        self.assertEqual(
+            runner.get_grouped_masked_output_signal_meta(configs, 4096),
+            (8, 56),
+        )
+
+        configs["w2_tuning_config"][0][2]["use_stream_k"] = True
+        with self.assertRaisesRegex(RuntimeError, "no Stream-K"):
+            runner.get_grouped_masked_output_signal_meta(configs, 4096)
+
+    def test_auto_normal_dispatch_uses_serial_event_contract(self):
+        hidden_states = SimpleNamespace(shape=(64, 32, 7168), device="cuda")
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            format=DispatchOutputFormat.DEEPEP_NORMAL,
+        )
+        wait_event = object()
+        humming_backend = SimpleNamespace(is_humming=lambda: True)
+
+        with (
+            patch.object(
+                sbo.SboFlags,
+                "enable_combine_down_gemm_two_stream_overlap",
+                return_value=True,
+            ),
+            patch.object(
+                sbo.SboFlags,
+                "enable_combine_shared_two_stream_overlap",
+                return_value=True,
+            ),
+            patch.object(sbo, "get_moe_runner_backend", return_value=humming_backend),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=132),
+            ),
+            patch.object(torch.cuda, "Event", return_value=wait_event),
+            patch.object(torch, "zeros") as zeros,
+        ):
+            combine, down_gemm, meta = sbo.compute_overlap_args(
+                dispatch_output, alt_stream=object()
+            )
+
+        zeros.assert_not_called()
+        self.assertFalse(combine.overlap)
+        self.assertIsNone(combine.signal)
+        self.assertIsNone(down_gemm)
+        self.assertIs(meta["record_event_after_down"], wait_event)
+
+    def test_ll_dispatch_allocates_for_humming_min_block_m(self):
+        hidden_states = SimpleNamespace(shape=(64, 32, 7168), device="cuda")
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            format=DispatchOutputFormat.DEEPEP_LL,
+        )
+        wait_event = object()
+        signal = object()
+        humming_backend = SimpleNamespace(is_humming=lambda: True)
+
+        with (
+            patch.object(
+                sbo.SboFlags,
+                "enable_combine_down_gemm_two_stream_overlap",
+                return_value=True,
+            ),
+            patch.object(
+                sbo.SboFlags,
+                "enable_combine_shared_two_stream_overlap",
+                return_value=True,
+            ),
+            patch.object(sbo, "get_moe_runner_backend", return_value=humming_backend),
+            patch.object(
+                sbo.envs.SGLANG_HUMMING_ENABLE_SBO, "get", return_value=True
+            ),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=132),
+            ),
+            patch.object(torch.cuda, "Event", return_value=wait_event),
+            patch.object(torch, "zeros", return_value=signal) as zeros,
+        ):
+            combine, down_gemm, meta = sbo.compute_overlap_args(
+                dispatch_output, alt_stream=object()
+            )
+
+        zeros.assert_called_once_with(256, dtype=torch.int32, device="cuda")
+        self.assertTrue(combine.overlap)
+        self.assertIs(combine.signal, signal)
+        self.assertIs(down_gemm.signal, signal)
+        self.assertIs(down_gemm.start_event, wait_event)
+        self.assertNotIn("record_event_after_down", meta)
 
 
 if __name__ == "__main__":
