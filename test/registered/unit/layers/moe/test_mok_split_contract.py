@@ -73,7 +73,7 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertFalse(envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.default)
-        self.assertEqual(envs.SGLANG_OPT_MOK_MAX_TOKENS.default, 16384)
+        self.assertEqual(envs.SGLANG_OPT_MOK_MAX_TOKENS.default, 4096)
         self.assertEqual(envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.default, 16384)
         self.assertEqual(envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.default, 6)
 
