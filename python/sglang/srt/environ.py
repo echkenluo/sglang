@@ -1223,7 +1223,10 @@ class Envs:
     SGLANG_OPT_MOK_MIN_TOKENS = EnvInt(0)
     # Keep the experimental native path inside its measured-safe token and
     # resident-workspace bounds. Non-positive values explicitly disable a bound.
-    SGLANG_OPT_MOK_MAX_TOKENS = EnvInt(16384)
+    # Keep large prefill batches on stock DeepEP. Besides bounding the MoK
+    # workspace region, this keeps the stock fallback kernels warm before a
+    # rare long request is routed away from MoK.
+    SGLANG_OPT_MOK_MAX_TOKENS = EnvInt(4096)
     SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS = EnvInt(16384)
     SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP = EnvInt(6)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
