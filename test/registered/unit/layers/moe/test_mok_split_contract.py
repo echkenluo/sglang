@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+    _admit_workspace_geometry,
     _conservative_route_capacity_factor,
     _route_padding_config,
     native_shape_contract_error,
@@ -72,6 +73,8 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertFalse(envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.default)
+        self.assertEqual(envs.SGLANG_OPT_MOK_MAX_TOKENS.default, 16384)
+        self.assertEqual(envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.default, 6)
 
     def _gate_call(self, tokens, extend, min_tokens):
         from unittest import mock
@@ -100,6 +103,56 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertEqual(self._gate_call(255, extend=True, min_tokens=256), "gated_off")
         self.assertEqual(self._gate_call(256, extend=True, min_tokens=256), "passed_gate")
         self.assertEqual(self._gate_call(257, extend=True, min_tokens=256), "passed_gate")
+
+    def test_max_tokens_gate_falls_back_before_runtime_contract(self):
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        hidden = torch.empty((16385, 256), dtype=torch.bfloat16)
+        with (
+            envs.SGLANG_OPT_MOK_MIN_TOKENS.override(256),
+            envs.SGLANG_OPT_MOK_MAX_TOKENS.override(16384),
+            mock.patch.object(
+                mok_fp8_native, "get_is_extend_in_batch", return_value=True
+            ),
+            mock.patch.object(
+                mok_fp8_native,
+                "get_tp_group",
+                side_effect=AssertionError("must fall back before group lookup"),
+            ),
+        ):
+            self.assertIsNone(
+                mok_fp8_native.maybe_run_mok_fp8_native(
+                    layer=mock.Mock(), hidden_states=hidden, topk_output=mock.Mock()
+                )
+            )
+
+    def test_workspace_geometry_cap_keeps_hits_and_rejects_only_misses(self):
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        group = mock.Mock(group_name="ep")
+        base = {
+            "group": group,
+            "device": torch.device("cuda", 0),
+            "hidden_size": 7168,
+            "topk": 8,
+            "num_local_experts": 64,
+            "schedule_capacity_factor": 5,
+        }
+        with mok_fp8_native._WORKSPACE_GEOMETRY_LOCK:
+            mok_fp8_native._WORKSPACE_GEOMETRIES.clear()
+        with envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.override(2):
+            self.assertTrue(_admit_workspace_geometry(num_local_tokens=256, **base))
+            self.assertTrue(_admit_workspace_geometry(num_local_tokens=512, **base))
+            # A hit at the cap remains admitted: it must not trigger a clear.
+            self.assertTrue(_admit_workspace_geometry(num_local_tokens=256, **base))
+            self.assertFalse(_admit_workspace_geometry(num_local_tokens=768, **base))
+        with mok_fp8_native._WORKSPACE_GEOMETRY_LOCK:
+            self.assertEqual(len(mok_fp8_native._WORKSPACE_GEOMETRIES), 2)
+            mok_fp8_native._WORKSPACE_GEOMETRIES.clear()
 
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
         from unittest import mock

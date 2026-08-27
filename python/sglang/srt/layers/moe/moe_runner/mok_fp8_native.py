@@ -100,6 +100,8 @@ def _die_if_trapped(workspace, mok_functional) -> None:
 _REPORTED_FALLBACKS: set[str] = set()
 _REPORTED_ACTIVE = False
 _ROUTE_EXPERT_PADDING = 64
+_WORKSPACE_GEOMETRY_LOCK = threading.Lock()
+_WORKSPACE_GEOMETRIES: set[tuple] = set()
 
 
 def native_shape_contract_error(
@@ -434,42 +436,62 @@ def _report_fallback(reason: str) -> None:
         logger.info("MoK full-native fallback: %s", reason)
 
 
-def _maybe_clear_workspace_caches(mok_functional) -> None:
-    """Bound the extension's per-geometry workspace caches.
+def _admit_workspace_geometry(
+    *,
+    group,
+    device: torch.device,
+    num_local_tokens: int,
+    hidden_size: int,
+    topk: int,
+    num_local_experts: int,
+    schedule_capacity_factor: int,
+) -> bool:
+    """Admit a bounded set of extension workspace geometries.
 
-    The extension caches one workspace per (tokens, hidden, topk,
-    capacity-factor) geometry and never evicts; big-geometry route buffers
-    scale with the token count, so shape-diverse traffic accumulates
-    gigabytes of resident storage across cells until an unrelated transient
-    allocation OOMs.  When the caches exceed
-    SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP distinct geometries, clear them all
-    with the extension's collective clear_workspace_cache().  Safety: under
-    the rank-consistent policy gate every rank sees the same batch shapes,
-    so the cache key sequence -- and this trigger -- is rank-symmetric, and
-    the clear itself barriers per workspace.  0 (default) preserves the old
-    unbounded behavior; the cap is never applied while captured prefill
-    graphs hold workspace references.
+    The extension caches one workspace per geometry and does not evict.  The
+    previous integration cleared every cached workspace synchronously from
+    the forward hot path once the count reached the cap.  Besides clearing on
+    cache hits, that policy inserted collective barriers, device-wide
+    synchronization, allocator release, and workspace rebuilds into timed
+    requests.
+
+    Keep already admitted geometries hot.  Once the per-process cap is full,
+    reject only unseen geometries so the caller can fall back to stock DeepEP
+    before any MoK collective or allocation.  Every EP rank observes the same
+    model batch shape, so admission remains rank-symmetric.  A non-positive
+    cap explicitly restores the extension's unbounded behavior.
     """
     cap = envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.get()
     if cap <= 0:
-        return
-    try:
-        n = len(mok_functional._FP8_ROUTE_WORKSPACE_CACHE) + len(
-            mok_functional._WORKSPACE_CACHE
+        return True
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    key = (
+        group.group_name,
+        device_index,
+        num_local_tokens,
+        hidden_size,
+        topk,
+        num_local_experts,
+        schedule_capacity_factor,
+    )
+    with _WORKSPACE_GEOMETRY_LOCK:
+        if key in _WORKSPACE_GEOMETRIES:
+            return True
+        if len(_WORKSPACE_GEOMETRIES) >= cap:
+            return False
+        _WORKSPACE_GEOMETRIES.add(key)
+        logger.info(
+            "MoK workspace geometry admitted: count=%d cap=%d tokens=%d "
+            "capacity_factor=%d",
+            len(_WORKSPACE_GEOMETRIES),
+            cap,
+            num_local_tokens,
+            schedule_capacity_factor,
         )
-    except AttributeError:
-        _report_fallback("workspace cache cap unsupported by extension")
-        return
-    if n < cap:
-        return
-    if _PREFILL_GRAPHS:
-        _report_fallback("workspace cache cap skipped: live prefill graphs")
-        return
-    mok_functional.clear_workspace_cache()
-    with _TRAP_WATCHDOG_LOCK:
-        _TRAP_WATCHDOG_ENTRIES.clear()
-    torch.cuda.empty_cache()
-    logger.info("MoK workspace caches cleared at cap=%d (had %d)", cap, n)
+        return True
 
 
 class _PrefillGraphEntry:
@@ -707,6 +729,12 @@ def maybe_run_mok_fp8_native(
         not get_is_extend_in_batch() or hidden_states.shape[0] < min_tokens
     ):
         return None
+    max_tokens = envs.SGLANG_OPT_MOK_MAX_TOKENS.get()
+    if max_tokens > 0 and hidden_states.shape[0] > max_tokens:
+        _report_fallback(
+            f"batch tokens exceed SGLANG_OPT_MOK_MAX_TOKENS={max_tokens}"
+        )
+        return None
     group = get_tp_group().device_group
     reason = (
         "pre-quantized MoE input is unsupported"
@@ -773,7 +801,19 @@ def maybe_run_mok_fp8_native(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=route_chunk_bytes,
     )
-    _maybe_clear_workspace_caches(mok_functional)
+    if not _admit_workspace_geometry(
+        group=group,
+        device=hidden_states.device,
+        num_local_tokens=padded_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        num_local_experts=layer.num_local_experts,
+        schedule_capacity_factor=capacity_factor,
+    ):
+        _report_fallback(
+            "workspace geometry cap reached; unseen geometry uses stock DeepEP"
+        )
+        return None
     workspace = mok_functional.get_fp8_route_workspace(
         config,
         group,
