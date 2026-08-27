@@ -310,6 +310,19 @@ def get_is_extend_in_batch() -> bool:
     return get_forward().is_extend_in_batch
 
 
+def set_max_sequence_length(max_sequence_length: int):
+    """Publish the longest unchunked request length for the current forward."""
+    from sglang.srt.runtime_context import get_forward
+
+    get_forward().set("max_sequence_length", max_sequence_length)
+
+
+def get_max_sequence_length() -> int:
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().max_sequence_length
+
+
 def is_dp_max_padding() -> bool:
     return _DpGatheredBufferWrapper.is_dp_max_padding()
 

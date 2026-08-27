@@ -74,6 +74,7 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.default)
         self.assertEqual(envs.SGLANG_OPT_MOK_MAX_TOKENS.default, 16384)
+        self.assertEqual(envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.default, 16384)
         self.assertEqual(envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.default, 6)
 
     def _gate_call(self, tokens, extend, min_tokens):
@@ -115,6 +116,36 @@ class TestMoKSplitContract(unittest.TestCase):
             envs.SGLANG_OPT_MOK_MAX_TOKENS.override(16384),
             mock.patch.object(
                 mok_fp8_native, "get_is_extend_in_batch", return_value=True
+            ),
+            mock.patch.object(
+                mok_fp8_native,
+                "get_tp_group",
+                side_effect=AssertionError("must fall back before group lookup"),
+            ),
+        ):
+            self.assertIsNone(
+                mok_fp8_native.maybe_run_mok_fp8_native(
+                    layer=mock.Mock(), hidden_states=hidden, topk_output=mock.Mock()
+                )
+            )
+
+    def test_max_sequence_gate_catches_chunked_long_request(self):
+        from unittest import mock
+
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        # A 32K request reaches the model in <=16K chunks. The aggregate-token
+        # gate alone therefore cannot protect the unsafe long-sequence region.
+        hidden = torch.empty((16384, 256), dtype=torch.bfloat16)
+        with (
+            envs.SGLANG_OPT_MOK_MIN_TOKENS.override(256),
+            envs.SGLANG_OPT_MOK_MAX_TOKENS.override(16384),
+            envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.override(16384),
+            mock.patch.object(
+                mok_fp8_native, "get_is_extend_in_batch", return_value=True
+            ),
+            mock.patch.object(
+                mok_fp8_native, "get_max_sequence_length", return_value=32768
             ),
             mock.patch.object(
                 mok_fp8_native,
