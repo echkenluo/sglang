@@ -1496,6 +1496,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post = eager_on_graph(True)(self.hc_post)
         self.hc_post_attn = self.hc_post
         self.hc_post_ffn = self.hc_post
+        if envs.SGLANG_DSV4_TARGET_FFN_FLASHINFER_MHC_POST.get() and not is_nextn:
+            # Upstream uses FlashInfer for both mHC sides. Keep this backport
+            # limited to the target FFN boundary implicated by DSpark replay.
+            self.hc_post_ffn = self.hc_post_flashinfer
         if _BCG_EAGER_TARGET_MHC_POST_ATTN and not is_nextn:
             self.hc_post_attn = eager_on_graph(True)(self.hc_post_attn)
         if _BCG_EAGER_TARGET_MHC_POST_FFN and not is_nextn:
@@ -1666,6 +1670,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
+
+    def hc_post_flashinfer(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        from flashinfer.mhc import mhc_post
+
+        return mhc_post(x, residual, post, comb)
 
     def hc_post(
         self,

@@ -1174,6 +1174,10 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # Narrow v0.5.17 backport: use FlashInfer only for target-layer FFN hc_post.
+    # This avoids changing the draft or attention-side mHC paths while fixing
+    # the DSpark target-verify CUDA Graph boundary isolated on L20/SM89.
+    SGLANG_DSV4_TARGET_FFN_FLASHINFER_MHC_POST = EnvBool(False)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
