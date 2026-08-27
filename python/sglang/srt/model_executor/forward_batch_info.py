@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    set_max_sequence_length,
     world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -511,6 +512,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Longest original request before chunked prefill split.
+    max_sequence_length: int = 0
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -801,6 +804,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            max_sequence_length=max(
+                (len(req.origin_input_ids) for req in batch.reqs),
+                default=0,
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -1313,6 +1320,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        set_max_sequence_length(self.max_sequence_length)
 
         bs = self.batch_size
 

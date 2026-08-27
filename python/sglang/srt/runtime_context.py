@@ -474,6 +474,9 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # Longest original (unchunked) request in the current forward. This is
+        # host metadata used by eager-path safety gates.
+        "max_sequence_length": 0,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.

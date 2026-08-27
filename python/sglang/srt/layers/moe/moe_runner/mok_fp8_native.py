@@ -15,7 +15,10 @@ import torch.distributed as dist
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    get_max_sequence_length,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -733,6 +736,16 @@ def maybe_run_mok_fp8_native(
     if max_tokens > 0 and hidden_states.shape[0] > max_tokens:
         _report_fallback(
             f"batch tokens exceed SGLANG_OPT_MOK_MAX_TOKENS={max_tokens}"
+        )
+        return None
+    max_sequence_tokens = envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.get()
+    if (
+        max_sequence_tokens > 0
+        and get_max_sequence_length() > max_sequence_tokens
+    ):
+        _report_fallback(
+            "request length exceeds "
+            f"SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS={max_sequence_tokens}"
         )
         return None
     group = get_tp_group().device_group

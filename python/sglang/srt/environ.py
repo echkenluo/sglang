@@ -1224,6 +1224,7 @@ class Envs:
     # Keep the experimental native path inside its measured-safe token and
     # resident-workspace bounds. Non-positive values explicitly disable a bound.
     SGLANG_OPT_MOK_MAX_TOKENS = EnvInt(16384)
+    SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS = EnvInt(16384)
     SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP = EnvInt(6)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
 
