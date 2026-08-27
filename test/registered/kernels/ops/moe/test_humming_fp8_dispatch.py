@@ -260,6 +260,93 @@ class TestHummingFp8Dispatch(CustomTestCase):
                             bool(actual_scale[expert, valid:].isnan().all())
                         )
 
+    def test_silu_fused_masked_quant_can_be_disabled(self):
+        num_experts = 8
+        max_tokens = 4
+        intermediate = 768
+        gate_up = torch.empty(
+            num_experts,
+            max_tokens,
+            2 * intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        expert_num_tokens = torch.full(
+            (num_experts,), max_tokens, device="cuda", dtype=torch.int32
+        )
+        activation_output = torch.empty(
+            num_experts * max_tokens,
+            intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        buffers = {
+            "gate_up_output": gate_up.flatten(0, 1),
+            "activation_output": activation_output,
+        }
+        expected_down_input = torch.empty_like(activation_output)
+        expected_down_scale = torch.empty(
+            num_experts * max_tokens,
+            intermediate // 128,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        runner = humming_runner.HummingRunnerCore(
+            MoeRunnerConfig(
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                intermediate_size_per_partition=intermediate,
+                top_k=8,
+                activation="silu",
+                is_gated=True,
+                swiglu_limit=None,
+                gate_up_interleaved=False,
+            )
+        )
+        runner.layer = SimpleNamespace(
+            humming_metas={
+                "w2": SimpleNamespace(
+                    a_dtype=humming_runner.dtypes.float8e4m3,
+                    input_scale_group_size=128,
+                )
+            }
+        )
+
+        with (
+            patch.object(
+                humming_runner.envs.SGLANG_HUMMING_FUSED_MASKED_ACT_QUANT,
+                "get",
+                return_value=False,
+            ),
+            patch.object(runner, "apply_activation") as fallback_activation,
+            patch.object(
+                humming_runner.HummingMethod,
+                "may_quant_input",
+                return_value=(expected_down_input, expected_down_scale),
+            ) as fallback_quant,
+            patch(
+                "sglang.kernels.ops.attention.dsv4.moe."
+                "silu_and_mul_masked_post_quant"
+            ) as fused_silu,
+        ):
+            down_input, down_scale = runner._grouped_masked_act_quant(
+                gate_up, expert_num_tokens, buffers
+            )
+
+        fallback_activation.assert_called_once_with(
+            inputs=buffers["gate_up_output"], outputs=activation_output
+        )
+        fallback_quant.assert_called_once_with(
+            layer=runner.layer,
+            inputs=activation_output,
+            quanted_input=None,
+            sublayer_name="w2",
+        )
+        fused_silu.assert_not_called()
+        self.assertIs(down_input, expected_down_input)
+        self.assertIs(down_scale, expected_down_scale)
+
 
 if __name__ == "__main__":
     unittest.main()

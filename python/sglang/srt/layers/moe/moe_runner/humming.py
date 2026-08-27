@@ -417,7 +417,8 @@ class HummingRunnerCore(MoeRunnerCore):
         groups = intermediate // 128
         num_threads = intermediate // 8
         use_fused_masked_act_quant = (
-            w2_meta.a_dtype == dtypes.float8e4m3
+            envs.SGLANG_HUMMING_FUSED_MASKED_ACT_QUANT.get()
+            and w2_meta.a_dtype == dtypes.float8e4m3
             and w2_meta.input_scale_group_size == 128
             and self.activation == "silu"
             and gate_up.dtype == torch.bfloat16
@@ -426,6 +427,9 @@ class HummingRunnerCore(MoeRunnerCore):
             and num_experts <= min(256, num_threads)
         )
         if use_fused_masked_act_quant:
+            logger.info_once(
+                "Using Humming fused grouped-masked activation and FP8 quantization"
+            )
             from sglang.kernels.ops.attention.dsv4.moe import (
                 silu_and_mul_masked_post_quant,
             )
