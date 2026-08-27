@@ -201,7 +201,7 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def get_grouped_masked_output_signal_meta(
         self, configs: dict, valid_shape_m: int
-    ) -> tuple[int, int, bool, str]:
+    ) -> tuple[int, int, bool, str, int]:
         for min_shape_m, max_shape_m, config in configs["w2_tuning_config"]:
             if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
                 break
@@ -234,7 +234,29 @@ class HummingRunnerCore(MoeRunnerCore):
             output_width // block_n,
             bool(config.get("use_stream_k", False)),
             "tma" if use_tma_c else "legacy",
+            int(config.get("num_sms", 0)),
         )
+
+    @staticmethod
+    def get_grouped_masked_output_signal_tuning_config(
+        configs: dict, max_num_sms: int
+    ) -> tuple[list, str]:
+        """Cap the Humming producer grid so DeepEP combine can make progress."""
+        if max_num_sms <= 0:
+            raise ValueError(f"invalid Humming SBO SM cap: {max_num_sms}")
+
+        cache = configs.setdefault("output_signal_w2_tuning_configs", {})
+        if max_num_sms not in cache:
+            tuning_config = []
+            for min_shape_m, max_shape_m, config in configs["w2_tuning_config"]:
+                signal_config = config.copy()
+                tuned_num_sms = int(signal_config.get("num_sms", 0))
+                if tuned_num_sms <= 0:
+                    tuned_num_sms = max_num_sms
+                signal_config["num_sms"] = min(tuned_num_sms, max_num_sms)
+                tuning_config.append([min_shape_m, max_shape_m, signal_config])
+            cache[max_num_sms] = (tuning_config, json.dumps(tuning_config))
+        return cache[max_num_sms]
 
     def estimate_local_valid_shape_m(
         self,
@@ -836,12 +858,21 @@ class HummingRunnerCore(MoeRunnerCore):
         )
 
         w2_compute_config = configs["compute_config_str"]
+        w2_tuning_config = configs["w2_tuning_config_str"]
         if output_signal is not None:
             overlap_args = self._active_down_gemm_overlap_args
             if overlap_args is None:
                 raise RuntimeError("Humming output signal has no overlap arguments")
-            block_m, threshold, use_stream_k, store_mode = (
-                self.get_grouped_masked_output_signal_meta(configs, valid_shape_m)
+            signal_tuning_config, w2_tuning_config = (
+                self.get_grouped_masked_output_signal_tuning_config(
+                    configs, overlap_args.num_sms
+                )
+            )
+            signal_configs = configs | {"w2_tuning_config": signal_tuning_config}
+            block_m, threshold, use_stream_k, store_mode, producer_num_sms = (
+                self.get_grouped_masked_output_signal_meta(
+                    signal_configs, valid_shape_m
+                )
             )
             if self._active_meta_overlap_args is None:
                 raise RuntimeError("Humming SBO has no meta overlap arguments")
@@ -851,7 +882,9 @@ class HummingRunnerCore(MoeRunnerCore):
             logger.info_once(
                 "Using Humming W2 output signaling for DeepEP combine overlap "
                 f"(block_m={block_m}, threshold={threshold}, "
-                f"stream_k={use_stream_k}, store={store_mode})"
+                f"stream_k={use_stream_k}, store={store_mode}, "
+                f"producer_sms={producer_num_sms}, "
+                f"producer_sms_cap={overlap_args.num_sms})"
             )
             overlap_args.start_event.record()
 
@@ -863,7 +896,7 @@ class HummingRunnerCore(MoeRunnerCore):
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
             compute_config=w2_compute_config,
-            tuning_config=configs["w2_tuning_config_str"],
+            tuning_config=w2_tuning_config,
             sublayer_name="w2",
             output_signal=output_signal,
         )

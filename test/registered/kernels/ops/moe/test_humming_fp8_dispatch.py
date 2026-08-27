@@ -1,5 +1,6 @@
 """SM90 component CI for Humming FP8 DeepEP dispatch and fused SiLU quant."""
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -351,6 +352,30 @@ class TestHummingFp8Dispatch(CustomTestCase):
 
 
 class TestHummingSboContract(unittest.TestCase):
+    def test_humming_down_gemm_overlap_has_independent_kill_switch(self):
+        humming_backend = SimpleNamespace(
+            is_flashinfer_cutedsl=lambda: False,
+            is_deep_gemm=lambda: False,
+            is_humming=lambda: True,
+        )
+
+        with (
+            patch.object(sbo, "is_sbo_enabled", return_value=True),
+            patch.object(sbo, "get_moe_runner_backend", return_value=humming_backend),
+            patch.object(sbo, "is_blackwell", return_value=False),
+            patch.object(
+                sbo.envs.SGLANG_HUMMING_ENABLE_SBO, "get", return_value=True
+            ),
+            patch.object(
+                sbo.envs.SGLANG_HUMMING_DISABLE_DOWN_GEMM_OVERLAP,
+                "get",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(
+                sbo.SboFlags.enable_combine_down_gemm_two_stream_overlap()
+            )
+
     def test_grouped_masked_output_signal_metadata(self):
         runner = humming_runner.HummingRunnerCore(
             MoeRunnerConfig(
@@ -374,6 +399,7 @@ class TestHummingSboContract(unittest.TestCase):
                     1 << 30,
                     {
                         "block_shape": [8, 128, 128],
+                        "num_sms": 78,
                         "use_tma": False,
                         "use_stream_k": True,
                     },
@@ -383,15 +409,40 @@ class TestHummingSboContract(unittest.TestCase):
 
         self.assertEqual(
             runner.get_grouped_masked_output_signal_meta(configs, 256),
-            (8, 32, True, "legacy"),
+            (8, 32, True, "legacy", 78),
         )
 
         configs["w2_tuning_config"][0][2]["multi_cast_size_a"] = 2
         with self.assertRaisesRegex(RuntimeError, "without multicast"):
             runner.get_grouped_masked_output_signal_meta(configs, 256)
 
+    def test_output_signal_tuning_reserves_combine_sms(self):
+        configs = {
+            "w2_tuning_config": [
+                [0, 64, {"block_shape": [8, 128, 128], "num_sms": 78}],
+                [64, 128, {"block_shape": [16, 128, 128], "num_sms": 32}],
+                [128, 256, {"block_shape": [32, 128, 128]}],
+            ]
+        }
+
+        runner_cls = humming_runner.HummingRunnerCore
+        tuning_config, tuning_config_str = (
+            runner_cls.get_grouped_masked_output_signal_tuning_config(configs, 75)
+        )
+
+        self.assertEqual(
+            [entry[2]["num_sms"] for entry in tuning_config], [75, 32, 75]
+        )
+        self.assertEqual(configs["w2_tuning_config"][0][2]["num_sms"], 78)
+        self.assertEqual(json.loads(tuning_config_str), tuning_config)
+        self.assertIs(
+            runner_cls.get_grouped_masked_output_signal_tuning_config(configs, 75)[0],
+            tuning_config,
+        )
+
     def test_auto_normal_dispatch_uses_serial_event_contract(self):
-        hidden_states = SimpleNamespace(shape=(64, 32, 7168), device="cuda")
+        # DeepEP AUTO returns a flattened 2D tensor for normal extend/prefill.
+        hidden_states = SimpleNamespace(shape=(2048, 7168), device="cuda")
         dispatch_output = SimpleNamespace(
             hidden_states=hidden_states,
             format=DispatchOutputFormat.DEEPEP_NORMAL,

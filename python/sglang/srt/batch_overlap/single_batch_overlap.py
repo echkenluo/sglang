@@ -39,6 +39,7 @@ class SboFlags:
                 or (
                     get_moe_runner_backend().is_humming()
                     and envs.SGLANG_HUMMING_ENABLE_SBO.get()
+                    and not envs.SGLANG_HUMMING_DISABLE_DOWN_GEMM_OVERLAP.get()
                     and not is_blackwell()
                 )
             )
@@ -92,8 +93,6 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
     hidden_states = dispatch_output.hidden_states
 
-    num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
-
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
@@ -129,6 +128,12 @@ def compute_overlap_args(dispatch_output, alt_stream):
         enable_down_gemm_overlap = False
 
     if enable_down_gemm_overlap:
+        if len(hidden_states.shape) != 3:
+            raise RuntimeError(
+                "SBO down-GEMM overlap requires a 3D low-latency dispatch "
+                f"tensor, got shape={hidden_states.shape}"
+            )
+        num_local_experts, num_tokens_static, _ = hidden_states.shape
         # TODO use zero_allocator to remove this `torch.zeros` call
         # NOTE ours v2 use uint32 not int32 currently
         if is_blackwell():
