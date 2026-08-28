@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tune_humming_moe import (  # noqa: E402
     DEFAULT_ATOL,
     DEFAULT_RTOL,
-    cap_ladder_configs,
+    cap_candidate_configs,
     choose_representative_points,
     deduplicate_configs,
     load_capture,
@@ -58,11 +58,11 @@ class TuneHummingCommonTest(unittest.TestCase):
 
     def test_candidate_cap_supports_full_ladder_and_smoke(self):
         configs = [{"id": index} for index in range(10)]
-        self.assertEqual(cap_ladder_configs(configs, 4), configs[:4])
-        self.assertEqual(cap_ladder_configs(configs, 1), configs[:1])
-        self.assertEqual(cap_ladder_configs(configs, 0), configs)
+        self.assertEqual(cap_candidate_configs(configs, 4), configs[:4])
+        self.assertEqual(cap_candidate_configs(configs, 1), configs[:1])
+        self.assertEqual(cap_candidate_configs(configs, 0), configs)
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            cap_ladder_configs(configs, -1)
+            cap_candidate_configs(configs, -1)
 
     def test_deduplicate_configs_normalizes_tuples(self):
         configs = [

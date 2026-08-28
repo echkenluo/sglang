@@ -77,8 +77,8 @@ def deduplicate_configs(configs: list[dict]) -> list[dict]:
     return result
 
 
-def cap_ladder_configs(configs: list[dict], candidate_count: int) -> list[dict]:
-    """Use zero for the complete production ladder; positive values are smoke caps."""
+def cap_candidate_configs(configs: list[dict], candidate_count: int) -> list[dict]:
+    """Use zero for the complete candidate set; positive values are smoke caps."""
     if candidate_count < 0:
         raise ValueError("candidate count must be non-negative")
     return configs if candidate_count == 0 else configs[:candidate_count]
@@ -292,7 +292,7 @@ def build_candidates(
         layer.humming_metas[sublayer],
         compute,
     )
-    candidates = cap_ladder_configs(
+    candidates = cap_candidate_configs(
         deduplicate_configs([heuristic, *sampled]),
         candidate_count,
     )
@@ -671,7 +671,7 @@ def parse_args() -> argparse.Namespace:
         "--candidate-count",
         type=int,
         default=0,
-        help="0 tests the complete deduplicated Humming production ladder",
+        help="0 tests the complete deduplicated Humming sampled candidate set",
     )
     parser.add_argument("--route-samples", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=5)
