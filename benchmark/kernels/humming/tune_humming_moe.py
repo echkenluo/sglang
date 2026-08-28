@@ -32,7 +32,6 @@ from humming.schema import BaseInputSchema, BaseWeightSchema, HummingInputSchema
 from humming.tune import get_heuristics_config
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-
 BIG_M = 1 << 40
 FORMAT_VERSION = 2
 DEFAULT_RTOL = 0.01
@@ -90,7 +89,9 @@ def choose_representative_points(points: list[dict], count: int) -> list[dict]:
     if count <= 0:
         raise ValueError("route sample count must be positive")
     if len(points) <= count:
-        return sorted(points, key=lambda point: (point["chunk_index"], point["layer_id"]))
+        return sorted(
+            points, key=lambda point: (point["chunk_index"], point["layer_id"])
+        )
     ordered = sorted(
         points,
         key=lambda point: (
@@ -99,10 +100,11 @@ def choose_representative_points(points: list[dict], count: int) -> list[dict]:
             point["layer_id"],
         ),
     )
-    indices = {
-        round(index * (len(ordered) - 1) / (count - 1))
-        for index in range(count)
-    } if count > 1 else {len(ordered) // 2}
+    indices = (
+        {round(index * (len(ordered) - 1) / (count - 1)) for index in range(count)}
+        if count > 1
+        else {len(ordered) // 2}
+    )
     return [ordered[index] for index in sorted(indices)]
 
 
@@ -119,7 +121,9 @@ def load_capture(manifest_path: Path, shape_m: int | None, route_samples: int):
     if len(raw_shape) != 3:
         raise ValueError(f"invalid raw shape: {raw_shape}")
 
-    available_shape_ms = sorted({int(point["valid_shape_m"]) for point in manifest["points"]})
+    available_shape_ms = sorted(
+        {int(point["valid_shape_m"]) for point in manifest["points"]}
+    )
     if shape_m is None:
         if len(available_shape_ms) != 1:
             raise ValueError(
@@ -129,7 +133,9 @@ def load_capture(manifest_path: Path, shape_m: int | None, route_samples: int):
     if shape_m not in available_shape_ms:
         raise ValueError(f"shape_m {shape_m} is not in capture {available_shape_ms}")
 
-    points = [point for point in manifest["points"] if point["valid_shape_m"] == shape_m]
+    points = [
+        point for point in manifest["points"] if point["valid_shape_m"] == shape_m
+    ]
     selected = choose_representative_points(points, route_samples)
     raw_path = manifest_path.parent / manifest["raw_file"]
     raw = raw_path.read_bytes()
@@ -168,7 +174,11 @@ def _initialize_tensor(name: str, tensor: torch.Tensor) -> None:
         # Expert-dependent values make expert-indexing mistakes observable while
         # avoiding a full-size temporary random FP32 tensor.
         for expert in range(tensor.shape[0]):
-            value = ((expert % 7) + 1) / 16 if tensor.dtype.is_floating_point else expert % 7
+            value = (
+                ((expert % 7) + 1) / 16
+                if tensor.dtype.is_floating_point
+                else expert % 7
+            )
             tensor[expert].fill_(value)
     else:
         tensor.fill_(1)
@@ -180,7 +190,9 @@ def build_layer(model_config: dict, tp_size: int, device: str):
     intermediate = int(text_config["moe_intermediate_size"])
     num_experts = int(text_config["n_routed_experts"])
     if intermediate % tp_size:
-        raise ValueError(f"moe_intermediate_size {intermediate} is not divisible by TP {tp_size}")
+        raise ValueError(
+            f"moe_intermediate_size {intermediate} is not divisible by TP {tp_size}"
+        )
     quant_config = dict(text_config["quantization_config"])
     param_dtype = torch.bfloat16
     weight_schema = BaseWeightSchema.from_config(quant_config)
@@ -239,7 +251,9 @@ def build_layer(model_config: dict, tp_size: int, device: str):
             num_experts=num_experts,
         )
         for name in [
-            name for name, _ in layer.named_parameters() if name.startswith(sublayer + "_")
+            name
+            for name, _ in layer.named_parameters()
+            if name.startswith(sublayer + "_")
         ]:
             delattr(layer, name)
         for name, tensor in tensors.items():
@@ -665,8 +679,7 @@ def tune_sublayer(
                     metrics
                     if worst is None
                     else {
-                        name: max(worst[name], value)
-                        for name, value in metrics.items()
+                        name: max(worst[name], value) for name, value in metrics.items()
                     }
                 )
                 torch.testing.assert_close(
@@ -733,7 +746,9 @@ def tune_sublayer(
             }
         )
     table.sort(key=lambda row: (row["median_us"], row["p95_us"]))
-    heuristic_row = next(row for row in table if row["config_id"] == config_id(heuristic))
+    heuristic_row = next(
+        row for row in table if row["config_id"] == config_id(heuristic)
+    )
     best = table[0]
     result.update(
         {
@@ -810,7 +825,9 @@ def main() -> None:
         "format_version": FORMAT_VERSION,
         "state": "RUNNING",
         "capture_manifest": str(args.capture_manifest),
-        "capture_sha256": hashlib.sha256(args.capture_manifest.read_bytes()).hexdigest(),
+        "capture_sha256": hashlib.sha256(
+            args.capture_manifest.read_bytes()
+        ).hexdigest(),
         "model_config_sha256": hashlib.sha256(model_config_bytes).hexdigest(),
         "tp_size": args.tp_size,
         "shape_m": shape_m,
@@ -851,14 +868,13 @@ def main() -> None:
             seed=args.seed + (0 if sublayer == "w13" else 1000),
             w13_alignment_config=selected_w13_config,
         )
-        if (
-            sublayer == "w13"
-            and result["sublayers"][sublayer]["state"] == "MEASURED"
-        ):
+        if sublayer == "w13" and result["sublayers"][sublayer]["state"] == "MEASURED":
             selected_w13_config = result["sublayers"][sublayer]["best_config"]
         atomic_write_json(args.out, result)
     states = [value["state"] for value in result["sublayers"].values()]
-    result["state"] = "MEASURED" if all(state == "MEASURED" for state in states) else "INVALID"
+    result["state"] = (
+        "MEASURED" if all(state == "MEASURED" for state in states) else "INVALID"
+    )
     atomic_write_json(args.out, result)
     print(
         json.dumps(
@@ -867,7 +883,12 @@ def main() -> None:
                 "sublayers": {
                     name: {
                         key: value.get(key)
-                        for key in ("state", "candidate_count", "valid_candidate_count", "headroom")
+                        for key in (
+                            "state",
+                            "candidate_count",
+                            "valid_candidate_count",
+                            "headroom",
+                        )
                     }
                     for name, value in result["sublayers"].items()
                 },

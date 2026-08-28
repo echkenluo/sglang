@@ -38,9 +38,7 @@ sys.modules["humming.schema"].BaseInputSchema = object
 sys.modules["humming.schema"].BaseWeightSchema = object
 sys.modules["humming.schema"].HummingInputSchema = object
 sys.modules["humming.tune"].get_heuristics_config = object
-sys.modules[
-    "sglang.srt.layers.moe.fused_moe_triton"
-].moe_align_block_size = object
+sys.modules["sglang.srt.layers.moe.fused_moe_triton"].moe_align_block_size = object
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tune_humming_moe import (  # noqa: E402
@@ -98,24 +96,21 @@ class TuneHummingCommonTest(unittest.TestCase):
             sorted({config["num_sms"] for config in candidates}),
             [39, 52, 78, 104, 156],
         )
-        self.assertEqual(
-            {config["num_stages"] for config in candidates}, {3, 4}
-        )
-        self.assertEqual(
-            {config["num_ctas_per_sm"] for config in candidates}, {1, 2}
-        )
+        self.assertEqual({config["num_stages"] for config in candidates}, {3, 4})
+        self.assertEqual({config["num_ctas_per_sm"] for config in candidates}, {1, 2})
         self.assertTrue(
-            all(config["block_shape"] == heuristic["block_shape"] for config in candidates)
-        )
-        self.assertTrue(
-            all(config["warp_shape"] == heuristic["warp_shape"] for config in candidates)
-        )
-        self.assertEqual(
-            {
-                config["num_sms"]
+            all(
+                config["block_shape"] == heuristic["block_shape"]
                 for config in candidates
-                if not config["use_stream_k"]
-            },
+            )
+        )
+        self.assertTrue(
+            all(
+                config["warp_shape"] == heuristic["warp_shape"] for config in candidates
+            )
+        )
+        self.assertEqual(
+            {config["num_sms"] for config in candidates if not config["use_stream_k"]},
             {78},
         )
 
@@ -138,11 +133,18 @@ class TuneHummingCommonTest(unittest.TestCase):
             {"block_shape": (64, 128, 128)},
             {"block_shape": [64, 128, 128]},
         ]
-        self.assertEqual(deduplicate_configs(configs), [{"block_shape": [64, 128, 128]}])
+        self.assertEqual(
+            deduplicate_configs(configs), [{"block_shape": [64, 128, 128]}]
+        )
 
     def test_representative_points_cover_extremes(self):
         points = [
-            {"chunk_index": 0, "layer_id": index, "max_expert_rows": index, "active_experts": 8}
+            {
+                "chunk_index": 0,
+                "layer_id": index,
+                "max_expert_rows": index,
+                "active_experts": 8,
+            }
             for index in range(9)
         ]
         selected = choose_representative_points(points, 3)
