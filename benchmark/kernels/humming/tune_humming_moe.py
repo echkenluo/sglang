@@ -298,6 +298,57 @@ def persistent_grid_values(baseline: int, direct: int) -> list[int]:
     return sorted(values)
 
 
+def w13_schedule_grid(heuristic: dict) -> list[dict]:
+    """Sweep W13 scheduling while preserving exact-shape kernel geometry.
+
+    The deployed mixed Humming wheel does not ship its own legal candidate
+    sampler.  A sampler copied from a later release can emit geometries that
+    compile but fault in the older runtime.  Keep block/warp and transfer
+    choices on the installed H20 heuristic's known-good path, and vary only
+    scheduling knobs whose lower-resource combinations retain that geometry.
+    """
+    baseline_num_sms = int(heuristic.get("num_sms", 0))
+    if baseline_num_sms <= 0:
+        raise ValueError("W13 heuristic must provide a positive num_sms")
+    baseline_stages = int(heuristic.get("num_stages", 0))
+    if baseline_stages < 3:
+        raise ValueError("W13 WGMMA heuristic must use at least three stages")
+    baseline_ctas = int(heuristic.get("num_ctas_per_sm", 1))
+    if baseline_ctas <= 0:
+        raise ValueError("W13 heuristic must provide positive num_ctas_per_sm")
+
+    num_sms_values = sorted(
+        {
+            max(1, round(baseline_num_sms * numerator / denominator))
+            for numerator, denominator in ((1, 2), (2, 3), (1, 1), (4, 3), (2, 1))
+        }
+    )
+    stage_values = sorted({3, baseline_stages})
+    cta_values = sorted({1, baseline_ctas})
+    candidates = []
+    for num_stages in stage_values:
+        for num_ctas_per_sm in cta_values:
+            for num_sms in num_sms_values:
+                config = dict(heuristic)
+                config.update(
+                    num_stages=num_stages,
+                    num_ctas_per_sm=num_ctas_per_sm,
+                    num_sms=num_sms,
+                    use_stream_k=True,
+                )
+                candidates.append(config)
+            # A non-stream-K control does not need a persistent-grid sweep.
+            config = dict(heuristic)
+            config.update(
+                num_stages=num_stages,
+                num_ctas_per_sm=num_ctas_per_sm,
+                num_sms=baseline_num_sms,
+                use_stream_k=False,
+            )
+            candidates.append(config)
+    return deduplicate_configs(candidates)
+
+
 def normalize_sampled_config(config: dict) -> dict:
     tuning_fields = {field.name for field in dataclasses.fields(TuningConfig)}
     normalized = {
@@ -319,8 +370,8 @@ def build_candidates(
     layer, sublayer: str, shape_m: int, candidate_count: int
 ) -> tuple[dict, list[dict], str]:
     heuristic = exact_heuristic_config(layer, sublayer, shape_m)
-    direct = direct_shape_config(layer, sublayer, shape_m)
     if sublayer == "w2":
+        direct = direct_shape_config(layer, sublayer, shape_m)
         baseline_num_sms = int(heuristic["num_sms"])
         direct_num_sms = int(direct["num_sms"])
         grid_candidates = []
@@ -335,23 +386,17 @@ def build_candidates(
         return heuristic, candidates, "shape_specific_w2_persistent_grid"
 
     # The production ladder is a piecewise dispatch table.  Configs from a
-    # different M interval are not guaranteed to be safe at this shape (a
-    # small-M W2 config can issue an illegal access at production prefill M).
-    # Humming v0.1.12 ships a resource-filtered deterministic sampler in its
-    # source tree, but omits it from the wheel; use the benchmark-local copy.
-    from humming_tuning_candidates import sample_test_tuning_configs
-
-    compute = ComputeConfig(use_f16_accum=False, gemm_type=GemmType.INDEXED)
-    sampled = sample_test_tuning_configs(
-        layer.humming_metas[sublayer],
-        compute,
-    )
-    sampled = [normalize_sampled_config(config) for config in sampled]
+    # different M interval are not guaranteed to be safe at this shape.  The
+    # deployed mixed wheel also lacks its own legal sampler; the v0.1.12 test
+    # sampler can emit geometries that compile but fault in this runtime.
+    # Preserve the installed exact-shape heuristic geometry and sweep only the
+    # bounded scheduling surface described in ``w13_schedule_grid``.
+    schedule_grid = w13_schedule_grid(heuristic)
     candidates = cap_candidate_configs(
-        deduplicate_configs([heuristic, direct, *sampled]),
+        deduplicate_configs([heuristic, *schedule_grid]),
         candidate_count,
     )
-    return heuristic, candidates, "humming_v0.1.12_sampler_compat_humming_v0.1.10"
+    return heuristic, candidates, "exact_shape_w13_schedule_grid"
 
 
 def precompile_candidate(layer, sublayer: str, config: dict) -> None:
@@ -728,7 +773,7 @@ def parse_args() -> argparse.Namespace:
         "--candidate-count",
         type=int,
         default=0,
-        help="0 tests the complete deduplicated Humming sampled candidate set",
+        help="0 tests the complete shape-specific candidate set",
     )
     parser.add_argument("--route-samples", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=5)

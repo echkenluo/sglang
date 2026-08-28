@@ -61,14 +61,15 @@ CUDA_VISIBLE_DEVICES=0 python benchmark/kernels/humming/tune_humming_moe.py \
   --out /path/to/tuning-result.json
 ```
 
-Candidate count zero tests a complete deterministic sampled set; a positive
-value is only a smoke-test cap.  The deployed Humming v0.1.10 wheel predates the
-upstream v0.1.12 sampler, so a benchmark-local compatibility copy is kept in
-`humming_tuning_candidates.py`.  It uses v0.1.10's own shared-memory estimator
-and filters candidate fields to the installed `TuningConfig`.  Do not treat the
-piecewise production dispatch table as a cross-shape candidate pool: entries
-outside their M interval are not guaranteed to be safe.  The screen precompiles
-resource-filtered candidates,
+Candidate count zero tests the complete shape-specific set; a positive value
+is only a smoke-test cap.  Do not treat the piecewise production dispatch table
+as a cross-shape candidate pool: entries outside their M interval are not
+guaranteed to be safe.  The deployed mixed Humming wheel identifies itself as
+v0.1.10 but includes later H20 logic and does not ship a matching legal tuning
+sampler.  A benchmark-local v0.1.12 sampler compatibility copy remains for
+source comparison, but it is not a formal candidate source because it can
+generate geometries that compile and then fault in this runtime.  The screen
+precompiles candidates,
 requires every output element to pass Humming's MoE numerical gate
 (`rtol=0.01`, `atol=0.2`), records scale-aware aggregate errors, times candidate
 order in randomized rounds over multiple real layer routes, and invalidates the
@@ -86,6 +87,13 @@ and a 1/16-step refinement around half of the direct-shape grid.  This isolates
 the production-table tail issue: Humming's table is generated only through
 roughly 65K routed rows, whereas a 32K-token, top-k 6 prefill chunk has routed M
 196608.
+
+For W13, the tool preserves the installed H20 heuristic's block/warp and
+transfer geometry at the exact routed shape.  It sweeps a bounded scheduling
+surface: three or the heuristic stage count, one or the heuristic CTA count per
+SM, persistent-grid ratios from one half through twice the heuristic `num_sms`,
+plus non-stream-K controls at the heuristic grid.  This is a version-safe
+schedule screen, not an exhaustive block/warp geometry search.
 
 ## Cold-prefill service leg
 

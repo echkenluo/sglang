@@ -52,6 +52,7 @@ from tune_humming_moe import (  # noqa: E402
     load_capture,
     percentile,
     persistent_grid_values,
+    w13_schedule_grid,
 )
 
 
@@ -78,6 +79,51 @@ class TuneHummingCommonTest(unittest.TestCase):
                 16384,
             ],
         )
+
+    def test_w13_schedule_grid_preserves_exact_shape_geometry(self):
+        heuristic = {
+            "block_shape": [64, 128, 128],
+            "warp_shape": [64, 16, 128],
+            "num_stages": 4,
+            "num_ctas_per_sm": 2,
+            "num_sms": 78,
+            "use_stream_k": True,
+            "use_f16_accum": False,
+        }
+
+        candidates = w13_schedule_grid(heuristic)
+
+        self.assertEqual(len(candidates), 24)
+        self.assertEqual(
+            sorted({config["num_sms"] for config in candidates}),
+            [39, 52, 78, 104, 156],
+        )
+        self.assertEqual(
+            {config["num_stages"] for config in candidates}, {3, 4}
+        )
+        self.assertEqual(
+            {config["num_ctas_per_sm"] for config in candidates}, {1, 2}
+        )
+        self.assertTrue(
+            all(config["block_shape"] == heuristic["block_shape"] for config in candidates)
+        )
+        self.assertTrue(
+            all(config["warp_shape"] == heuristic["warp_shape"] for config in candidates)
+        )
+        self.assertEqual(
+            {
+                config["num_sms"]
+                for config in candidates
+                if not config["use_stream_k"]
+            },
+            {78},
+        )
+
+    def test_w13_schedule_grid_rejects_unusable_heuristic(self):
+        with self.assertRaisesRegex(ValueError, "positive num_sms"):
+            w13_schedule_grid({"num_sms": 0, "num_stages": 4})
+        with self.assertRaisesRegex(ValueError, "at least three stages"):
+            w13_schedule_grid({"num_sms": 78, "num_stages": 2})
 
     def test_candidate_cap_supports_full_ladder_and_smoke(self):
         configs = [{"id": index} for index in range(10)]
