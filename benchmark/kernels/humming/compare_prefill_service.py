@@ -89,9 +89,7 @@ def compare_candidate(
     }
 
 
-def candidate_decision(
-    comparison: dict[str, Any], prompt_tokens: list[str]
-) -> str:
+def candidate_decision(comparison: dict[str, Any], prompt_tokens: list[str]) -> str:
     improvements = comparison["improvement_pct_versus_baseline_reference"]
     median_gains = [improvements[key]["median_seconds"] for key in prompt_tokens]
     p95_gains = [improvements[key]["p95_seconds"] for key in prompt_tokens]
@@ -134,8 +132,7 @@ def compare_group(
     hashes_by_leg = {leg["variant"]: response_hashes(leg) for leg in legs}
     response_valid = all(
         len(hashes_by_leg[leg["variant"]][key]) == 1
-        and hashes_by_leg[leg["variant"]][key]
-        == hashes_by_leg[a1["variant"]][key]
+        and hashes_by_leg[leg["variant"]][key] == hashes_by_leg[a1["variant"]][key]
         for leg in legs
         for key in prompt_tokens
     )
@@ -152,10 +149,7 @@ def compare_group(
             for metric in SUMMARY_METRICS
         }
         baseline_reference[key] = {
-            metric: (
-                a1["summaries"][key][metric] + a2["summaries"][key][metric]
-            )
-            / 2.0
+            metric: (a1["summaries"][key][metric] + a2["summaries"][key][metric]) / 2.0
             for metric in SUMMARY_METRICS
         }
 
@@ -171,9 +165,7 @@ def compare_group(
         state = "VALID"
 
     candidate_comparisons = [
-        compare_candidate(
-            candidate, a1=a1, baseline_reference=baseline_reference
-        )
+        compare_candidate(candidate, a1=a1, baseline_reference=baseline_reference)
         for candidate in candidates
     ]
     for comparison in candidate_comparisons:
