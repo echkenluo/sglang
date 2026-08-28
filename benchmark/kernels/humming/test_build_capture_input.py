@@ -7,10 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_capture_input import build_token_stream, normalize_conversation
 
 
-class FakeTokenizer:
-    def apply_chat_template(self, messages, **kwargs):
-        del kwargs
-        return [len(message["content"]) for message in messages] + [99]
+def fake_encode(messages):
+    return [len(message["content"]) for message in messages] + [99]
 
 
 class BuildCaptureInputTest(unittest.TestCase):
@@ -43,10 +41,10 @@ class BuildCaptureInputTest(unittest.TestCase):
             for index in range(4)
         ]
         first_ids, first_selections = build_token_stream(
-            records, FakeTokenizer(), target_tokens=5, seed=7
+            records, fake_encode, target_tokens=5, seed=7
         )
         second_ids, second_selections = build_token_stream(
-            records, FakeTokenizer(), target_tokens=5, seed=7
+            records, fake_encode, target_tokens=5, seed=7
         )
         self.assertEqual(first_ids, second_ids)
         self.assertEqual(first_selections, second_selections)
@@ -63,7 +61,7 @@ class BuildCaptureInputTest(unittest.TestCase):
             }
         ]
         with self.assertRaisesRegex(ValueError, "yielded only"):
-            build_token_stream(records, FakeTokenizer(), target_tokens=10, seed=1)
+            build_token_stream(records, fake_encode, target_tokens=10, seed=1)
 
 
 if __name__ == "__main__":

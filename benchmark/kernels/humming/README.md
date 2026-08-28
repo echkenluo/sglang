@@ -12,13 +12,16 @@ target tokenizer:
 python benchmark/kernels/humming/build_capture_input.py \
   --dataset /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
   --tokenizer /path/to/model \
+  --encoding-spec dsv4 \
   --prompt-tokens 32768 \
   --seed 20260828 \
   --out /path/to/fixed-input-ids.json
 ```
 
-The builder uses the model chat template and records the dataset hash, selected
-conversation hashes, exact token count and final truncation receipt.
+The builder uses an explicitly selected production chat encoder (`dsv4` uses
+SGLang's DeepSeek-V4 encoder; `hf` uses the tokenizer template) and records the
+dataset hash, selected conversation hashes, exact token count and final
+truncation receipt.
 
 Start the server with `--enable-return-routed-experts`, then run:
 

@@ -16,7 +16,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 FORMAT_VERSION = 1
@@ -59,7 +59,10 @@ def normalize_conversation(record: dict) -> list[dict[str, str]]:
 
 
 def build_token_stream(
-    records: list[dict], tokenizer: Any, target_tokens: int, seed: int
+    records: list[dict],
+    encode_conversation: Callable[[list[dict[str, str]]], list[int]],
+    target_tokens: int,
+    seed: int,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     if target_tokens <= 0:
         raise ValueError("target token count must be positive")
@@ -72,12 +75,7 @@ def build_token_stream(
         messages = normalize_conversation(records[index])
         if len(messages) < 2:
             continue
-        encoded = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=False,
-            tokenize=True,
-            return_dict=False,
-        )
+        encoded = encode_conversation(messages)
         if hasattr(encoded, "tolist"):
             encoded = encoded.tolist()
         if not isinstance(encoded, list) or not encoded:
@@ -122,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--encoding-spec", choices=("dsv4", "hf"), required=True)
     parser.add_argument("--prompt-tokens", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--out", type=Path, required=True)
@@ -142,8 +141,31 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=True, local_files_only=True
     )
+    if args.encoding_spec == "dsv4":
+        from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
+
+        def encode_conversation(messages):
+            return encode_simple_chat(
+                tokenizer=tokenizer,
+                spec="dsv4",
+                messages=messages,
+                thinking_mode="chat",
+            )
+
+    else:
+        if tokenizer.chat_template is None:
+            raise ValueError("--encoding-spec hf requires tokenizer.chat_template")
+
+        def encode_conversation(messages):
+            return tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=False,
+            )
+
     input_ids, selections = build_token_stream(
-        records, tokenizer, args.prompt_tokens, args.seed
+        records, encode_conversation, args.prompt_tokens, args.seed
     )
     output = {
         "format_version": FORMAT_VERSION,
@@ -156,6 +178,7 @@ def main() -> None:
             "tokenizer_path": args.tokenizer,
             "tokenizer_class": type(tokenizer).__name__,
             "tokenizer_vocab_size": len(tokenizer),
+            "encoding_spec": args.encoding_spec,
             "prompt_tokens": len(input_ids),
             "seed": args.seed,
             "input_ids_sha256": canonical_json_sha256(input_ids),
