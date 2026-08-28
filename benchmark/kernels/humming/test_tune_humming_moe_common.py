@@ -35,14 +35,13 @@ sys.modules["humming.layer"].HummingMethod = object
 sys.modules["humming.schema"].BaseInputSchema = object
 sys.modules["humming.schema"].BaseWeightSchema = object
 sys.modules["humming.schema"].HummingInputSchema = object
-sys.modules["humming.testing.tuning"].sample_test_tuning_configs = object
 sys.modules[
     "sglang.srt.layers.moe.fused_moe_triton"
 ].moe_align_block_size = object
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tune_humming_moe import (  # noqa: E402
-    cap_sampled_configs,
+    cap_ladder_configs,
     choose_representative_points,
     deduplicate_configs,
     load_capture,
@@ -51,12 +50,13 @@ from tune_humming_moe import (  # noqa: E402
 
 
 class TuneHummingCommonTest(unittest.TestCase):
-    def test_candidate_cap_reserves_heuristic_slot(self):
-        sampled = [{"id": index} for index in range(10)]
-        self.assertEqual(cap_sampled_configs(sampled, 4), sampled[:3])
-        self.assertEqual(cap_sampled_configs(sampled, 1), [])
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            cap_sampled_configs(sampled, 0)
+    def test_candidate_cap_supports_full_ladder_and_smoke(self):
+        configs = [{"id": index} for index in range(10)]
+        self.assertEqual(cap_ladder_configs(configs, 4), configs[:4])
+        self.assertEqual(cap_ladder_configs(configs, 1), configs[:1])
+        self.assertEqual(cap_ladder_configs(configs, 0), configs)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            cap_ladder_configs(configs, -1)
 
     def test_deduplicate_configs_normalizes_tuples(self):
         configs = [

@@ -28,8 +28,6 @@ from humming.config import ComputeConfig, GemmType
 from humming.kernel.humming import HummingKernel
 from humming.layer import HummingMethod
 from humming.schema import BaseInputSchema, BaseWeightSchema, HummingInputSchema
-from humming.testing.tuning import sample_test_tuning_configs
-
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 
@@ -74,11 +72,11 @@ def deduplicate_configs(configs: list[dict]) -> list[dict]:
     return result
 
 
-def cap_sampled_configs(sampled: list[dict], candidate_count: int) -> list[dict]:
-    """Reserve one candidate slot for the production heuristic."""
-    if candidate_count <= 0:
-        raise ValueError("candidate count must be positive")
-    return sampled[: max(candidate_count - 1, 0)]
+def cap_ladder_configs(configs: list[dict], candidate_count: int) -> list[dict]:
+    """Use zero for the complete production ladder; positive values are smoke caps."""
+    if candidate_count < 0:
+        raise ValueError("candidate count must be non-negative")
+    return configs if candidate_count == 0 else configs[:candidate_count]
 
 
 def choose_representative_points(points: list[dict], count: int) -> list[dict]:
@@ -277,12 +275,15 @@ def build_candidates(
     layer, sublayer: str, shape_m: int, candidate_count: int
 ) -> tuple[dict, list[dict]]:
     heuristic = exact_heuristic_config(layer, sublayer, shape_m)
-    compute_config = ComputeConfig(use_f16_accum=False, gemm_type=GemmType.INDEXED)
-    sampled = sample_test_tuning_configs(
-        layer.humming_metas[sublayer], compute_config, sample_size=candidate_count
+    ladder = HummingMethod.get_default_tuning_configs(
+        layer=layer,
+        use_f16_accum=False,
+        gemm_type=GemmType.INDEXED,
+        sublayer_name=sublayer,
     )
-    candidates = deduplicate_configs(
-        [heuristic, *cap_sampled_configs(sampled, candidate_count)]
+    candidates = cap_ladder_configs(
+        deduplicate_configs([heuristic, *(config for _, _, config in ladder)]),
+        candidate_count,
     )
     return heuristic, candidates
 
@@ -399,6 +400,8 @@ def tune_sublayer(
         "heuristic_config": heuristic,
         "heuristic_id": config_id(heuristic),
         "candidate_count": len(candidates),
+        "candidate_source": "humming_default_tuning_ladder",
+        "candidate_cap": candidate_count,
         "route_points": route_points,
         "rejected": [],
     }
@@ -601,7 +604,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--shape-m", type=int)
     parser.add_argument("--sublayer", choices=("w13", "w2", "both"), default="both")
-    parser.add_argument("--candidate-count", type=int, default=64)
+    parser.add_argument(
+        "--candidate-count",
+        type=int,
+        default=0,
+        help="0 tests the complete deduplicated Humming production ladder",
+    )
     parser.add_argument("--route-samples", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
