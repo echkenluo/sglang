@@ -41,6 +41,8 @@ sys.modules[
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tune_humming_moe import (  # noqa: E402
+    DEFAULT_ATOL,
+    DEFAULT_RTOL,
     cap_ladder_configs,
     choose_representative_points,
     deduplicate_configs,
@@ -50,6 +52,10 @@ from tune_humming_moe import (  # noqa: E402
 
 
 class TuneHummingCommonTest(unittest.TestCase):
+    def test_default_gate_matches_humming_moe_tests(self):
+        self.assertEqual(DEFAULT_RTOL, 0.01)
+        self.assertEqual(DEFAULT_ATOL, 0.2)
+
     def test_candidate_cap_supports_full_ladder_and_smoke(self):
         configs = [{"id": index} for index in range(10)]
         self.assertEqual(cap_ladder_configs(configs, 4), configs[:4])

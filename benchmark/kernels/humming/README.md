@@ -56,13 +56,18 @@ CUDA_VISIBLE_DEVICES=0 python benchmark/kernels/humming/tune_humming_moe.py \
   --model-config /path/to/model/config.json \
   --capture-manifest /path/to/capture/manifest.json \
   --tp-size 4 \
-  --candidate-count 64 \
+  --candidate-count 0 \
   --route-samples 5 \
   --out /path/to/tuning-result.json
 ```
 
-The screen precompiles candidates, rejects numerically invalid outputs, times
-candidate order in randomized rounds over multiple real layer routes, and
-invalidates the point when the heuristic A1/A2 drift is at least 2%.  A kernel
+Candidate count zero tests the complete deduplicated production ladder; a
+positive value is only a smoke-test cap.  The screen precompiles candidates,
+requires every output element to pass Humming's MoE numerical gate
+(`rtol=0.01`, `atol=0.2`), records scale-aware aggregate errors, times candidate
+order in randomized rounds over multiple real layer routes, and invalidates the
+point when the heuristic A1/A2 drift is at least 2%.  The numerical reference is
+the current heuristic kernel, so this gate establishes candidate equivalence,
+not agreement with an independent high-precision implementation.  A kernel
 winner is not a deployment result; it must still pass the full MoE-stage and
 matched service A/B/A gates.

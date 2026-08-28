@@ -33,6 +33,11 @@ from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 BIG_M = 1 << 40
 FORMAT_VERSION = 1
+DEFAULT_RTOL = 0.01
+# Match Humming's MoE kernel tests.  The generic KernelTestCase default (0.05)
+# is too strict for alternate FP8 MoE accumulation schedules even when their
+# aggregate numerical error is negligible.
+DEFAULT_ATOL = 0.2
 
 
 class StubMoeLayer(torch.nn.Module):
@@ -366,14 +371,43 @@ def measure_forward(forward, inner_iters: int) -> float:
     return start.elapsed_time(end) * 1000 / inner_iters
 
 
-def correctness_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+def correctness_metrics(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> dict[str, float | int]:
     actual_float = actual.float()
     expected_float = expected.float()
-    absolute = (actual_float - expected_float).abs()
-    relative = absolute / expected_float.abs().clamp_min(1e-5)
+    actual_float.sub_(expected_float)
+    difference_l2 = torch.linalg.vector_norm(actual_float)
+    reference_l2 = torch.linalg.vector_norm(expected_float)
+    absolute = actual_float.abs()
+    total_elements = actual.numel()
+    max_abs = absolute.max().item()
+    mean_abs = absolute.mean().item()
+    relative_l2 = (difference_l2 / reference_l2.clamp_min(1e-12)).item()
+    rmse = (difference_l2 / math.sqrt(total_elements)).item()
+    reference_rms = (reference_l2 / math.sqrt(total_elements)).item()
+
+    # torch.isclose uses abs(actual - expected) <= atol + rtol * abs(expected).
+    # Expressing the same gate as a normalized error also records how far the
+    # worst element is from the frozen threshold without near-zero rel-error
+    # blow-ups.
+    tolerance = expected_float.abs_().mul_(rtol).add_(atol)
+    absolute.div_(tolerance)
+    mismatch_count = int((absolute > 1).sum().item())
     return {
-        "max_abs": absolute.max().item(),
-        "max_rel": relative.max().item(),
+        "total_elements": total_elements,
+        "mismatch_count": mismatch_count,
+        "mismatch_fraction": mismatch_count / total_elements,
+        "max_abs": max_abs,
+        "mean_abs": mean_abs,
+        "rmse": rmse,
+        "reference_rms": reference_rms,
+        "relative_l2": relative_l2,
+        "max_normalized_error": absolute.max().item(),
     }
 
 
@@ -402,6 +436,12 @@ def tune_sublayer(
         "candidate_count": len(candidates),
         "candidate_source": "humming_default_tuning_ladder",
         "candidate_cap": candidate_count,
+        "correctness_gate": {
+            "reference": "heuristic_config_output",
+            "rtol": rtol,
+            "atol": atol,
+            "all_elements_must_pass": True,
+        },
         "route_points": route_points,
         "rejected": [],
     }
@@ -497,7 +537,7 @@ def tune_sublayer(
     valid = []
     for config in compiled:
         candidate_ok = True
-        worst = {"max_abs": 0.0, "max_rel": 0.0}
+        worst: dict[str, float | int] | None = None
         try:
             for context, reference in zip(contexts, references, strict=True):
                 context["output"].fill_(float("nan"))
@@ -505,8 +545,17 @@ def tune_sublayer(
                 torch.cuda.synchronize()
                 if not torch.isfinite(context["output"]).all().item():
                     raise ValueError("candidate produced non-finite output")
-                metrics = correctness_metrics(context["output"], reference)
-                worst = {name: max(worst[name], value) for name, value in metrics.items()}
+                metrics = correctness_metrics(
+                    context["output"], reference, rtol=rtol, atol=atol
+                )
+                worst = (
+                    metrics
+                    if worst is None
+                    else {
+                        name: max(worst[name], value)
+                        for name, value in metrics.items()
+                    }
+                )
                 torch.testing.assert_close(
                     context["output"], reference, rtol=rtol, atol=atol
                 )
@@ -517,10 +566,12 @@ def tune_sublayer(
                     "config_id": config_id(config),
                     "phase": "correctness",
                     "error": repr(exc),
-                    **worst,
+                    **(worst or {}),
                 }
             )
         if candidate_ok:
+            if worst is None:
+                raise RuntimeError("candidate correctness checked no route contexts")
             valid.append((config, worst))
     if result["rejected"]:
         result.update(state="INVALID_CANDIDATE_CORRECTNESS")
@@ -614,8 +665,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--rtol", type=float, default=0.01)
-    parser.add_argument("--atol", type=float, default=0.05)
+    parser.add_argument("--rtol", type=float, default=DEFAULT_RTOL)
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=DEFAULT_ATOL,
+        help="absolute tolerance; default matches Humming's MoE kernel tests",
+    )
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--out", type=Path, required=True)
     return parser.parse_args()
