@@ -74,6 +74,13 @@ def deduplicate_configs(configs: list[dict]) -> list[dict]:
     return result
 
 
+def cap_sampled_configs(sampled: list[dict], candidate_count: int) -> list[dict]:
+    """Reserve one candidate slot for the production heuristic."""
+    if candidate_count <= 0:
+        raise ValueError("candidate count must be positive")
+    return sampled[: max(candidate_count - 1, 0)]
+
+
 def choose_representative_points(points: list[dict], count: int) -> list[dict]:
     if count <= 0:
         raise ValueError("route sample count must be positive")
@@ -271,7 +278,9 @@ def build_candidates(
     sampled = sample_test_tuning_configs(
         layer.humming_metas[sublayer], compute_config, sample_size=candidate_count
     )
-    candidates = deduplicate_configs([heuristic, *sampled])
+    candidates = deduplicate_configs(
+        [heuristic, *cap_sampled_configs(sampled, candidate_count)]
+    )
     return heuristic, candidates
 
 
@@ -378,6 +387,7 @@ def tune_sublayer(
     rtol: float,
     atol: float,
     seed: int,
+    w13_alignment_config: dict | None = None,
 ) -> dict:
     heuristic, candidates = build_candidates(layer, sublayer, shape_m, candidate_count)
     result: dict[str, Any] = {
@@ -404,7 +414,12 @@ def tune_sublayer(
         return result
 
     contexts = []
-    heuristic_w13 = exact_heuristic_config(layer, "w13", shape_m)
+    alignment_w13 = w13_alignment_config or exact_heuristic_config(
+        layer, "w13", shape_m
+    )
+    if sublayer == "w2":
+        result["alignment_w13_config"] = alignment_w13
+        result["alignment_w13_config_id"] = config_id(alignment_w13)
     for route_index, (topk_ids_cpu, point) in enumerate(
         zip(route_tensors, route_points, strict=True)
     ):
@@ -423,7 +438,7 @@ def tune_sublayer(
             # Runtime builds indexed alignment once from the selected W13 block M
             # and reuses it for W2.  Kernel screening must reproduce that contract.
             alignments["runtime"] = alignment_for_route(
-                topk_ids, heuristic_w13["block_shape"][0], layer.num_experts
+                topk_ids, alignment_w13["block_shape"][0], layer.num_experts
             )
         contexts.append(
             {
@@ -631,6 +646,7 @@ def main() -> None:
         },
         "sublayers": {},
     }
+    selected_w13_config = None
     for sublayer in sublayers:
         result["sublayers"][sublayer] = tune_sublayer(
             layer=layer,
@@ -645,7 +661,13 @@ def main() -> None:
             rtol=args.rtol,
             atol=args.atol,
             seed=args.seed + (0 if sublayer == "w13" else 1000),
+            w13_alignment_config=selected_w13_config,
         )
+        if (
+            sublayer == "w13"
+            and result["sublayers"][sublayer]["state"] == "MEASURED"
+        ):
+            selected_w13_config = result["sublayers"][sublayer]["best_config"]
         atomic_write_json(args.out, result)
     states = [value["state"] for value in result["sublayers"].values()]
     result["state"] = "MEASURED" if all(state == "MEASURED" for state in states) else "INVALID"

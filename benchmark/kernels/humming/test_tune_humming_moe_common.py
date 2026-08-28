@@ -42,6 +42,7 @@ sys.modules[
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tune_humming_moe import (  # noqa: E402
+    cap_sampled_configs,
     choose_representative_points,
     deduplicate_configs,
     load_capture,
@@ -50,6 +51,13 @@ from tune_humming_moe import (  # noqa: E402
 
 
 class TuneHummingCommonTest(unittest.TestCase):
+    def test_candidate_cap_reserves_heuristic_slot(self):
+        sampled = [{"id": index} for index in range(10)]
+        self.assertEqual(cap_sampled_configs(sampled, 4), sampled[:3])
+        self.assertEqual(cap_sampled_configs(sampled, 1), [])
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            cap_sampled_configs(sampled, 0)
+
     def test_deduplicate_configs_normalizes_tuples(self):
         configs = [
             {"block_shape": (64, 128, 128)},
