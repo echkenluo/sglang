@@ -108,6 +108,15 @@ class TuneHummingCommonTest(unittest.TestCase):
         self.assertEqual(len(points), 1)
         self.assertEqual(shape_m, 4)
 
+    def test_load_capture_rejects_invalid_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "INVALID.json").write_text('{"state":"INVALID"}\n')
+            manifest = root / "manifest.json"
+            manifest.write_text('{"state":"CAPTURED"}\n')
+            with self.assertRaisesRegex(ValueError, "INVALID marker"):
+                load_capture(manifest, None, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

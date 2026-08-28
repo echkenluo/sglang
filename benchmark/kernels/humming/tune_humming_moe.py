@@ -102,6 +102,9 @@ def choose_representative_points(points: list[dict], count: int) -> list[dict]:
 
 
 def load_capture(manifest_path: Path, shape_m: int | None, route_samples: int):
+    invalid_marker = manifest_path.parent / "INVALID.json"
+    if invalid_marker.exists():
+        raise ValueError(f"capture has an INVALID marker: {invalid_marker}")
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("state") != "CAPTURED":
         raise ValueError("capture manifest is not in CAPTURED state")
@@ -409,6 +412,9 @@ def tune_sublayer(
             result["rejected"].append(
                 {"config_id": config_id(config), "phase": "compile", "error": repr(exc)}
             )
+    if result["rejected"]:
+        result.update(state="INVALID_CANDIDATE_COMPILE")
+        return result
     if config_id(heuristic) not in {config_id(config) for config in compiled}:
         result.update(state="INVALID_HEURISTIC_COMPILE")
         return result
@@ -513,6 +519,9 @@ def tune_sublayer(
             )
         if candidate_ok:
             valid.append((config, worst))
+    if result["rejected"]:
+        result.update(state="INVALID_CANDIDATE_CORRECTNESS")
+        return result
     if config_id(heuristic) not in {config_id(config) for config, _ in valid}:
         result.update(state="INVALID_HEURISTIC_CORRECTNESS")
         return result
