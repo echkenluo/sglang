@@ -63,7 +63,20 @@ class TuneHummingCommonTest(unittest.TestCase):
     def test_persistent_grid_sweep_bounds_shape_specific_value(self):
         self.assertEqual(
             persistent_grid_values(2048, 8192),
-            [2048, 4096, 6144, 8192, 10240, 12288, 16384],
+            [
+                2048,
+                3072,
+                3584,
+                4096,
+                4608,
+                5120,
+                5632,
+                6144,
+                8192,
+                10240,
+                12288,
+                16384,
+            ],
         )
 
     def test_candidate_cap_supports_full_ladder_and_smoke(self):

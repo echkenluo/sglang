@@ -81,6 +81,8 @@ matched service A/B/A gates.
 For W2, the tool does not use the cross-version sampler.  It compares the
 piecewise production-table config with the heuristic recomputed at the real
 routed M, then sweeps only `num_sms` around that shape-specific persistent-grid
-value while holding kernel geometry fixed.  This isolates the production-table
-tail issue: Humming's table is generated only through roughly 65K routed rows,
-whereas a 32K-token, top-k 6 prefill chunk has routed M 196608.
+value while holding kernel geometry fixed.  The sweep includes coarse bounds
+and a 1/16-step refinement around half of the direct-shape grid.  This isolates
+the production-table tail issue: Humming's table is generated only through
+roughly 65K routed rows, whereas a 32K-token, top-k 6 prefill chunk has routed M
+196608.

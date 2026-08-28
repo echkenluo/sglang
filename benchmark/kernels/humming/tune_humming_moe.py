@@ -289,11 +289,11 @@ def direct_shape_config(layer, sublayer: str, shape_m: int) -> dict:
 
 
 def persistent_grid_values(baseline: int, direct: int) -> list[int]:
-    """Sweep a bounded neighborhood around the shape-specific grid."""
+    """Sweep coarse bounds plus 1/16-step refinement around direct / 2."""
     values = {baseline}
     values.update(
-        max(1, direct * numerator // 4)
-        for numerator in (1, 2, 3, 4, 5, 6, 8)
+        max(1, direct * numerator // 16)
+        for numerator in (4, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24, 32)
     )
     return sorted(values)
 
