@@ -29,6 +29,7 @@ from humming.config import ComputeConfig, GemmType, TuningConfig
 from humming.kernel.humming import HummingKernel
 from humming.layer import HummingMethod
 from humming.schema import BaseInputSchema, BaseWeightSchema, HummingInputSchema
+from humming.tune import get_heuristics_config
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 
@@ -277,10 +278,62 @@ def exact_heuristic_config(layer, sublayer: str, shape_m: int) -> dict:
     raise ValueError(f"heuristic has no {sublayer} config for shape_m={shape_m}")
 
 
+def direct_shape_config(layer, sublayer: str, shape_m: int) -> dict:
+    config = get_heuristics_config(
+        layer.humming_metas[sublayer],
+        shape_m=shape_m,
+        use_f16_accum=False,
+        gemm_type=GemmType.INDEXED,
+    )
+    return json.loads(canonical_json(config))
+
+
+def persistent_grid_values(baseline: int, direct: int) -> list[int]:
+    """Sweep a bounded neighborhood around the shape-specific grid."""
+    values = {baseline}
+    values.update(
+        max(1, direct * numerator // 4)
+        for numerator in (1, 2, 3, 4, 5, 6, 8)
+    )
+    return sorted(values)
+
+
+def normalize_sampled_config(config: dict) -> dict:
+    tuning_fields = {field.name for field in dataclasses.fields(TuningConfig)}
+    normalized = {
+        name: value
+        for name, value in config.items()
+        if name in tuning_fields or name in {"num_sms", "use_f16_accum"}
+    }
+    supported_tma_fields = [
+        name for name in tuning_fields if name.startswith("use_tma_")
+    ]
+    if normalized.get("use_tma") and not any(
+        normalized.get(name) for name in supported_tma_fields
+    ):
+        normalized["use_tma"] = False
+    return normalized
+
+
 def build_candidates(
     layer, sublayer: str, shape_m: int, candidate_count: int
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], str]:
     heuristic = exact_heuristic_config(layer, sublayer, shape_m)
+    direct = direct_shape_config(layer, sublayer, shape_m)
+    if sublayer == "w2":
+        baseline_num_sms = int(heuristic["num_sms"])
+        direct_num_sms = int(direct["num_sms"])
+        grid_candidates = []
+        for num_sms in persistent_grid_values(baseline_num_sms, direct_num_sms):
+            config = dict(direct)
+            config["num_sms"] = num_sms
+            grid_candidates.append(config)
+        candidates = cap_candidate_configs(
+            deduplicate_configs([heuristic, direct, *grid_candidates]),
+            candidate_count,
+        )
+        return heuristic, candidates, "shape_specific_w2_persistent_grid"
+
     # The production ladder is a piecewise dispatch table.  Configs from a
     # different M interval are not guaranteed to be safe at this shape (a
     # small-M W2 config can issue an illegal access at production prefill M).
@@ -293,20 +346,12 @@ def build_candidates(
         layer.humming_metas[sublayer],
         compute,
     )
-    tuning_fields = {field.name for field in dataclasses.fields(TuningConfig)}
-    sampled = [
-        {
-            name: value
-            for name, value in config.items()
-            if name in tuning_fields or name in {"num_sms", "use_f16_accum"}
-        }
-        for config in sampled
-    ]
+    sampled = [normalize_sampled_config(config) for config in sampled]
     candidates = cap_candidate_configs(
-        deduplicate_configs([heuristic, *sampled]),
+        deduplicate_configs([heuristic, direct, *sampled]),
         candidate_count,
     )
-    return heuristic, candidates
+    return heuristic, candidates, "humming_v0.1.12_sampler_compat_humming_v0.1.10"
 
 
 def precompile_candidate(layer, sublayer: str, config: dict) -> None:
@@ -443,14 +488,16 @@ def tune_sublayer(
     seed: int,
     w13_alignment_config: dict | None = None,
 ) -> dict:
-    heuristic, candidates = build_candidates(layer, sublayer, shape_m, candidate_count)
+    heuristic, candidates, candidate_source = build_candidates(
+        layer, sublayer, shape_m, candidate_count
+    )
     result: dict[str, Any] = {
         "sublayer": sublayer,
         "shape_m": shape_m,
         "heuristic_config": heuristic,
         "heuristic_id": config_id(heuristic),
         "candidate_count": len(candidates),
-        "candidate_source": "humming_v0.1.12_sampler_compat_humming_v0.1.10",
+        "candidate_source": candidate_source,
         "candidate_cap": candidate_count,
         "correctness_gate": {
             "reference": "heuristic_config_output",

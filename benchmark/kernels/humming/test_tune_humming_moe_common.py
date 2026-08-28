@@ -19,6 +19,7 @@ for name in (
     "humming.kernel.humming",
     "humming.layer",
     "humming.schema",
+    "humming.tune",
     "humming.testing",
     "humming.testing.tuning",
     "sglang",
@@ -36,6 +37,7 @@ sys.modules["humming.layer"].HummingMethod = object
 sys.modules["humming.schema"].BaseInputSchema = object
 sys.modules["humming.schema"].BaseWeightSchema = object
 sys.modules["humming.schema"].HummingInputSchema = object
+sys.modules["humming.tune"].get_heuristics_config = object
 sys.modules[
     "sglang.srt.layers.moe.fused_moe_triton"
 ].moe_align_block_size = object
@@ -49,6 +51,7 @@ from tune_humming_moe import (  # noqa: E402
     deduplicate_configs,
     load_capture,
     percentile,
+    persistent_grid_values,
 )
 
 
@@ -56,6 +59,12 @@ class TuneHummingCommonTest(unittest.TestCase):
     def test_default_gate_matches_humming_moe_tests(self):
         self.assertEqual(DEFAULT_RTOL, 0.01)
         self.assertEqual(DEFAULT_ATOL, 0.2)
+
+    def test_persistent_grid_sweep_bounds_shape_specific_value(self):
+        self.assertEqual(
+            persistent_grid_values(2048, 8192),
+            [2048, 4096, 6144, 8192, 10240, 12288, 16384],
+        )
 
     def test_candidate_cap_supports_full_ladder_and_smoke(self):
         configs = [{"id": index} for index in range(10)]
