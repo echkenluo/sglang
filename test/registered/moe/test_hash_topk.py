@@ -100,6 +100,38 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.router_logits.shape == (0, 6)
 
 
+def test_hash_topk_captures_logical_routes(monkeypatch):
+    captured = {}
+
+    class FakeCapturer:
+        def capture(self, *, layer_id, topk_indices):
+            captured["layer_id"] = layer_id
+            captured["topk_ids"] = topk_indices.clone()
+
+    monkeypatch.setattr(
+        hash_topk_module, "get_global_experts_capturer", lambda: FakeCapturer()
+    )
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        layer_id=3,
+    )
+    with torch.no_grad():
+        topk.tid2eid.copy_(torch.tensor([[1, 4], [2, 7]], dtype=torch.int32))
+
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 8),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+        )
+
+    assert captured["layer_id"] == 3
+    assert captured["topk_ids"].tolist() == [[1, 4], [2, 7]]
+
+
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():
     captured = {}
 

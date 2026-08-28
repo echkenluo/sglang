@@ -40,6 +40,7 @@ class CaptureRoutingTest(unittest.TestCase):
             num_layers=3,
             top_k=2,
             first_moe_layer=1,
+            num_hash_layers=0,
             num_experts=4,
             chunk_size=2,
         )
@@ -65,6 +66,7 @@ class CaptureRoutingTest(unittest.TestCase):
                 num_layers=2,
                 top_k=1,
                 first_moe_layer=1,
+                num_hash_layers=0,
                 num_experts=4,
                 chunk_size=1,
             )
@@ -87,6 +89,7 @@ class CaptureRoutingTest(unittest.TestCase):
                             "num_experts_per_tok": 3,
                             "n_routed_experts": 8,
                             "first_k_dense_replace": 2,
+                            "n_hash_layers": 3,
                         }
                     }
                 )
@@ -95,6 +98,7 @@ class CaptureRoutingTest(unittest.TestCase):
         self.assertEqual(shape["num_layers"], 7)
         self.assertEqual(shape["first_moe_layer"], 2)
         self.assertEqual(shape["top_k"], 3)
+        self.assertEqual(shape["num_hash_layers"], 3)
 
     def test_model_shape_treats_null_dense_prefix_as_v4_default(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +115,20 @@ class CaptureRoutingTest(unittest.TestCase):
             )
             shape = load_model_shape(path)
         self.assertEqual(shape["first_moe_layer"], 0)
+
+    def test_summarize_rejects_uncaptured_hash_layer_sentinel(self):
+        routed = array.array("i", [0, 1, 0, 2])
+        with self.assertRaisesRegex(ValueError, "uncaptured device-cache sentinel"):
+            summarize_capture(
+                routed,
+                num_tokens=2,
+                num_layers=2,
+                top_k=1,
+                first_moe_layer=0,
+                num_hash_layers=1,
+                num_experts=4,
+                chunk_size=2,
+            )
 
 
 if __name__ == "__main__":

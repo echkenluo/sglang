@@ -53,16 +53,27 @@ def load_model_shape(path: Path) -> dict[str, int]:
     first_moe_layer = (
         0 if first_moe_layer_raw is None else int(first_moe_layer_raw)
     )
+    num_hash_layers_raw = text_config.get(
+        "num_hash_layers", text_config.get("n_hash_layers", 0)
+    )
+    num_hash_layers = (
+        0 if num_hash_layers_raw is None else int(num_hash_layers_raw)
+    )
     num_layers = int(text_config["num_hidden_layers"])
     if not 0 <= first_moe_layer < num_layers:
         raise ValueError(
             f"invalid first MoE layer {first_moe_layer} for {num_layers} layers"
+        )
+    if not 0 <= num_hash_layers <= num_layers:
+        raise ValueError(
+            f"invalid hash-layer count {num_hash_layers} for {num_layers} layers"
         )
     return {
         "num_layers": num_layers,
         "top_k": int(text_config["num_experts_per_tok"]),
         "num_experts": int(text_config["n_routed_experts"]),
         "first_moe_layer": first_moe_layer,
+        "num_hash_layers": num_hash_layers,
         "model_config_sha256": _sha256_bytes(raw),
     }
 
@@ -141,6 +152,7 @@ def summarize_capture(
     num_layers: int,
     top_k: int,
     first_moe_layer: int,
+    num_hash_layers: int,
     num_experts: int,
     chunk_size: int,
 ) -> list[dict[str, Any]]:
@@ -168,6 +180,15 @@ def summarize_capture(
                         )
                     counts[expert_id] += 1
             nonzero = [count for count in counts if count > 0]
+            if (
+                layer_id < num_hash_layers
+                and len(nonzero) == 1
+                and counts[0] == valid_shape_m
+            ):
+                raise ValueError(
+                    f"hash layer {layer_id} contains only expert 0; this is the "
+                    "uncaptured device-cache sentinel, not a valid formal route sample"
+                )
             points.append(
                 {
                     "chunk_index": chunk_index,
@@ -175,6 +196,9 @@ def summarize_capture(
                     "token_end": end,
                     "token_count": token_count,
                     "layer_id": layer_id,
+                    "routing_kind": (
+                        "hash" if layer_id < num_hash_layers else "learned"
+                    ),
                     "top_k": top_k,
                     "valid_shape_m": valid_shape_m,
                     "active_experts": len(nonzero),
@@ -246,6 +270,7 @@ def main() -> None:
         num_layers=model_shape["num_layers"],
         top_k=model_shape["top_k"],
         first_moe_layer=model_shape["first_moe_layer"],
+        num_hash_layers=model_shape["num_hash_layers"],
         num_experts=model_shape["num_experts"],
         chunk_size=args.chunk_size,
     )

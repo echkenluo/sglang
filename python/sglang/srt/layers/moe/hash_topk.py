@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class HashTopK(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.allow_routed_experts_capture = True
 
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
@@ -204,6 +206,13 @@ class HashTopK(nn.Module):
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
+
+        if (
+            self.allow_routed_experts_capture
+            and self.layer_id is not None
+            and (capturer := get_global_experts_capturer()) is not None
+        ):
+            capturer.capture(layer_id=self.layer_id, topk_indices=topk_ids)
 
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
