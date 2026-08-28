@@ -86,3 +86,25 @@ and a 1/16-step refinement around half of the direct-shape grid.  This isolates
 the production-table tail issue: Humming's table is generated only through
 roughly 65K routed rows, whereas a 32K-token, top-k 6 prefill chunk has routed M
 196608.
+
+## Cold-prefill service leg
+
+Restart the server for every tuning variant, disable radix caching, and run a
+fixed-input service leg with:
+
+```bash
+python benchmark/kernels/humming/bench_prefill_service.py \
+  --base-url http://127.0.0.1:31260 \
+  --input-ids-json /path/to/input-32768.json /path/to/input-65536.json \
+  --variant default-a1 \
+  --warmups 2 \
+  --repeats 8 \
+  --out /path/to/default-a1.json
+```
+
+The tool also flushes the server radix cache before every request, uses one
+greedy output token, randomizes the two shape orders within each repeat, and
+records response hashes.  It measures one isolated server leg only.  A valid
+deployment comparison still requires full server restarts and an A/B/A-style
+leg order with the same launch arguments, input artifacts, warmup count, repeat
+count, and seed.
