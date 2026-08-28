@@ -1,5 +1,6 @@
 """SM90 component CI for Humming FP8 DeepEP dispatch and fused SiLU quant."""
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,80 @@ def _silu_reference(gate_up: torch.Tensor, swiglu_limit: float | None) -> torch.
     gate = gate.float()
     up = up.float()
     return gate * torch.sigmoid(gate) * up
+
+
+class TestHummingTuningOverride(unittest.TestCase):
+    def test_override_splits_only_the_large_shape_tail(self):
+        original = [
+            [0, 64, {"num_sms": 128, "block_shape": [64, 128, 128]}],
+            [64, 1024, {"num_sms": 2048, "block_shape": [64, 128, 128]}],
+        ]
+
+        actual = humming_runner.apply_humming_indexed_w2_tuning_override(
+            original,
+            {"min_shape_m_exclusive": 256, "num_sms": 5120},
+        )
+
+        self.assertEqual(
+            actual,
+            [
+                [0, 64, {"num_sms": 128, "block_shape": [64, 128, 128]}],
+                [64, 256, {"num_sms": 2048, "block_shape": [64, 128, 128]}],
+                [256, 1024, {"num_sms": 5120, "block_shape": [64, 128, 128]}],
+            ],
+        )
+        self.assertEqual(original[1][2]["num_sms"], 2048)
+
+    def test_override_rejects_ambiguous_or_unusable_values(self):
+        tuning_config = [[0, 1024, {"num_sms": 2048}]]
+        invalid_overrides = [
+            [],
+            {"num_sms": 5120},
+            {"min_shape_m_exclusive": 256, "num_sms": True},
+            {"min_shape_m_exclusive": -1, "num_sms": 5120},
+            {"min_shape_m_exclusive": 1024, "num_sms": 5120},
+        ]
+        for override in invalid_overrides:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                humming_runner.apply_humming_indexed_w2_tuning_override(
+                    tuning_config, override
+                )
+
+    def test_runner_applies_override_only_to_indexed_w2(self):
+        runner = object.__new__(humming_runner.HummingRunnerCore)
+        runner.layer = object()
+        runner.humming_gemm_configs = {}
+        w13 = [[0, 1024, {"num_sms": 1024}]]
+        w2 = [[0, 1024, {"num_sms": 2048}]]
+
+        with (
+            patch.object(
+                humming_runner.HummingMethod,
+                "get_default_tuning_configs",
+                side_effect=[w13, w2],
+            ),
+            patch.object(
+                humming_runner.envs.SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE,
+                "get",
+                return_value={"min_shape_m_exclusive": 256, "num_sms": 5120},
+            ),
+        ):
+            configs = runner.get_humming_gemm_configs(
+                humming_runner.HummingGemmType.INDEXED
+            )
+
+        self.assertEqual(configs["w13_tuning_config"], w13)
+        self.assertEqual(
+            configs["w2_tuning_config"],
+            [
+                [0, 256, {"num_sms": 2048}],
+                [256, 1024, {"num_sms": 5120}],
+            ],
+        )
+        self.assertEqual(
+            json.loads(configs["w2_tuning_config_str"]),
+            configs["w2_tuning_config"],
+        )
 
 
 class TestHummingFp8Dispatch(CustomTestCase):

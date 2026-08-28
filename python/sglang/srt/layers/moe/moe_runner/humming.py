@@ -55,6 +55,67 @@ except ModuleNotFoundError:
     _humming_available = False
 
 
+def apply_humming_indexed_w2_tuning_override(
+    tuning_config: list,
+    override: dict | None,
+) -> list:
+    """Override W2 ``num_sms`` above a routed-M threshold.
+
+    Humming tuning intervals use ``min_shape_m < shape_m <= max_shape_m``.
+    Splitting an interval at the requested threshold keeps every smaller shape
+    on its packaged default while allowing large indexed-prefill shapes to use
+    a separately measured persistent grid.
+    """
+    if override is None:
+        return tuning_config
+    if not isinstance(override, dict):
+        raise ValueError(
+            "SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE must be a JSON object"
+        )
+
+    expected_keys = {"min_shape_m_exclusive", "num_sms"}
+    if set(override) != expected_keys:
+        raise ValueError(
+            "SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE must contain exactly "
+            f"{sorted(expected_keys)}"
+        )
+
+    min_shape_m = override["min_shape_m_exclusive"]
+    num_sms = override["num_sms"]
+    if type(min_shape_m) is not int or min_shape_m < 0:
+        raise ValueError("min_shape_m_exclusive must be a non-negative integer")
+    if type(num_sms) is not int or num_sms <= 0:
+        raise ValueError("num_sms must be a positive integer")
+
+    updated_config = []
+    num_overridden_intervals = 0
+    for entry in tuning_config:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise ValueError(f"invalid Humming tuning interval: {entry!r}")
+        interval_min, interval_max, config = entry
+        if interval_min >= interval_max or not isinstance(config, dict):
+            raise ValueError(f"invalid Humming tuning interval: {entry!r}")
+
+        if interval_max <= min_shape_m:
+            updated_config.append([interval_min, interval_max, dict(config)])
+            continue
+
+        if interval_min < min_shape_m:
+            updated_config.append([interval_min, min_shape_m, dict(config)])
+            interval_min = min_shape_m
+
+        overridden = dict(config)
+        overridden["num_sms"] = num_sms
+        updated_config.append([interval_min, interval_max, overridden])
+        num_overridden_intervals += 1
+
+    if num_overridden_intervals == 0:
+        raise ValueError(
+            "min_shape_m_exclusive does not overlap any Humming tuning interval"
+        )
+    return updated_config
+
+
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
     env_gemm_type_str = envs.SGLANG_HUMMING_MOE_GEMM_TYPE.get().lower()
     if env_gemm_type_str == "grouped":
@@ -181,6 +242,17 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=humming_gemm_type,
             sublayer_name="w2",
         )
+        w2_override = envs.SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE.get()
+        if w2_override is not None and humming_gemm_type == HummingGemmType.INDEXED:
+            w2_tuning_config = apply_humming_indexed_w2_tuning_override(
+                w2_tuning_config, w2_override
+            )
+            logger.info_once(
+                "Applied indexed Humming W2 tuning override: "
+                "shape_m > %d uses num_sms=%d",
+                w2_override["min_shape_m_exclusive"],
+                w2_override["num_sms"],
+            )
         self.humming_gemm_configs[humming_gemm_type.value] = {
             "compute_config": compute_config,
             "w13_tuning_config": w13_tuning_config,
