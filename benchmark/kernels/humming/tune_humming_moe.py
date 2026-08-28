@@ -331,35 +331,23 @@ def w13_schedule_grid(heuristic: dict) -> list[dict]:
     if baseline_ctas <= 0:
         raise ValueError("W13 heuristic must provide positive num_ctas_per_sm")
 
-    num_sms_values = sorted(
-        {
-            max(1, round(baseline_num_sms * numerator / denominator))
-            for numerator, denominator in ((1, 2), (2, 3), (1, 1), (4, 3), (2, 1))
-        }
-    )
     stage_values = sorted({3, baseline_stages})
     cta_values = sorted({1, baseline_ctas})
     candidates = []
     for num_stages in stage_values:
         for num_ctas_per_sm in cta_values:
-            for num_sms in num_sms_values:
+            for use_stream_k in (True, False):
                 config = dict(heuristic)
                 config.update(
                     num_stages=num_stages,
                     num_ctas_per_sm=num_ctas_per_sm,
-                    num_sms=num_sms,
-                    use_stream_k=True,
+                    # W13 stream-K uses this grid in its reduction partitioning.
+                    # Unlike the W2 small-K path, changing it is not numerically
+                    # graph-equivalent under the frozen elementwise gate.
+                    num_sms=baseline_num_sms,
+                    use_stream_k=use_stream_k,
                 )
                 candidates.append(config)
-            # A non-stream-K control does not need a persistent-grid sweep.
-            config = dict(heuristic)
-            config.update(
-                num_stages=num_stages,
-                num_ctas_per_sm=num_ctas_per_sm,
-                num_sms=baseline_num_sms,
-                use_stream_k=False,
-            )
-            candidates.append(config)
     return deduplicate_configs(candidates)
 
 

@@ -91,11 +91,8 @@ class TuneHummingCommonTest(unittest.TestCase):
 
         candidates = w13_schedule_grid(heuristic)
 
-        self.assertEqual(len(candidates), 24)
-        self.assertEqual(
-            sorted({config["num_sms"] for config in candidates}),
-            [39, 52, 78, 104, 156],
-        )
+        self.assertEqual(len(candidates), 8)
+        self.assertEqual({config["num_sms"] for config in candidates}, {78})
         self.assertEqual({config["num_stages"] for config in candidates}, {3, 4})
         self.assertEqual({config["num_ctas_per_sm"] for config in candidates}, {1, 2})
         self.assertTrue(
@@ -110,8 +107,7 @@ class TuneHummingCommonTest(unittest.TestCase):
             )
         )
         self.assertEqual(
-            {config["num_sms"] for config in candidates if not config["use_stream_k"]},
-            {78},
+            {config["use_stream_k"] for config in candidates}, {True, False}
         )
 
     def test_w13_schedule_grid_rejects_unusable_heuristic(self):

@@ -91,9 +91,10 @@ roughly 65K routed rows, whereas a 32K-token, top-k 6 prefill chunk has routed M
 For W13, the tool preserves the installed H20 heuristic's block/warp and
 transfer geometry at the exact routed shape.  It sweeps a bounded scheduling
 surface: three or the heuristic stage count, one or the heuristic CTA count per
-SM, persistent-grid ratios from one half through twice the heuristic `num_sms`,
-plus non-stream-K controls at the heuristic grid.  This is a version-safe
-schedule screen, not an exhaustive block/warp geometry search.
+SM, and stream-K on/off at the heuristic `num_sms`.  W13 stream-K uses the grid
+in its reduction partitioning, so changing `num_sms` is not treated as the
+bit-equivalent launch-only axis observed in the W2 small-K path.  This is a
+version-safe schedule screen, not an exhaustive block/warp geometry search.
 
 ## Cold-prefill service leg
 
