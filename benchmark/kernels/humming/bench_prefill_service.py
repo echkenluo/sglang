@@ -102,6 +102,7 @@ def request_json(
     encoded_payload: bytes | None = None,
     method: str | None = None,
     timeout: int,
+    expect_json: bool = True,
 ) -> Any:
     if payload is not None and encoded_payload is not None:
         raise ValueError("payload and encoded_payload are mutually exclusive")
@@ -118,7 +119,9 @@ def request_json(
         if response.status != 200:
             raise RuntimeError(f"{url} returned HTTP {response.status}")
         raw = response.read()
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    return json.loads(raw) if expect_json else raw.decode()
 
 
 def run_request(
@@ -133,6 +136,7 @@ def run_request(
         payload={},
         method="POST",
         timeout=timeout,
+        expect_json=False,
     )
     body = {
         "input_ids": item["input_ids"],
