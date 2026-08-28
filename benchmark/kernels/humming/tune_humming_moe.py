@@ -32,7 +32,7 @@ from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 
 BIG_M = 1 << 40
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 DEFAULT_RTOL = 0.01
 # Match Humming's MoE kernel tests.  The generic KernelTestCase default (0.05)
 # is too strict for alternate FP8 MoE accumulation schedules even when their
@@ -280,14 +280,20 @@ def build_candidates(
     layer, sublayer: str, shape_m: int, candidate_count: int
 ) -> tuple[dict, list[dict]]:
     heuristic = exact_heuristic_config(layer, sublayer, shape_m)
-    ladder = HummingMethod.get_default_tuning_configs(
-        layer=layer,
-        use_f16_accum=False,
-        gemm_type=GemmType.INDEXED,
-        sublayer_name=sublayer,
+    # The production ladder is a piecewise dispatch table.  Configs from a
+    # different M interval are not guaranteed to be safe at this shape (a
+    # small-M W2 config can issue an illegal access at production prefill M).
+    # Humming v0.1.12 ships a resource-filtered deterministic sampler in its
+    # source tree, but omits it from the wheel; use the benchmark-local copy.
+    from humming_tuning_candidates import sample_test_tuning_configs
+
+    compute = ComputeConfig(use_f16_accum=False, gemm_type=GemmType.INDEXED)
+    sampled = sample_test_tuning_configs(
+        layer.humming_metas[sublayer],
+        compute,
     )
     candidates = cap_ladder_configs(
-        deduplicate_configs([heuristic, *(config for _, _, config in ladder)]),
+        deduplicate_configs([heuristic, *sampled]),
         candidate_count,
     )
     return heuristic, candidates
@@ -434,7 +440,7 @@ def tune_sublayer(
         "heuristic_config": heuristic,
         "heuristic_id": config_id(heuristic),
         "candidate_count": len(candidates),
-        "candidate_source": "humming_default_tuning_ladder",
+        "candidate_source": "humming_v0.1.12_resource_filtered_sampler",
         "candidate_cap": candidate_count,
         "correctness_gate": {
             "reference": "heuristic_config_output",
@@ -453,7 +459,12 @@ def tune_sublayer(
             compiled.append(config)
         except Exception as exc:
             result["rejected"].append(
-                {"config_id": config_id(config), "phase": "compile", "error": repr(exc)}
+                {
+                    "config_id": config_id(config),
+                    "config": config,
+                    "phase": "compile",
+                    "error": repr(exc),
+                }
             )
     if result["rejected"]:
         result.update(state="INVALID_CANDIDATE_COMPILE")
@@ -564,6 +575,7 @@ def tune_sublayer(
             result["rejected"].append(
                 {
                     "config_id": config_id(config),
+                    "config": config,
                     "phase": "correctness",
                     "error": repr(exc),
                     **(worst or {}),
