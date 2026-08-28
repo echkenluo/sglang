@@ -119,7 +119,8 @@ def _is_legal_geometry(
         return False
     if layer_config.mma_type == MmaType.MMA and warp_shape[0] % 16:
         return False
-    if layer_config.mma_type == MmaType.MXMMA and warp_shape[0] % 16:
+    mxmma = getattr(MmaType, "MXMMA", None)
+    if mxmma is not None and layer_config.mma_type == mxmma and warp_shape[0] % 16:
         return False
     if layer_config.mma_type == MmaType.WGMMA and layer_config.a_dtype.is_integer_type and warp_shape[0] % 16:
         return False
