@@ -108,3 +108,20 @@ records response hashes.  It measures one isolated server leg only.  A valid
 deployment comparison still requires full server restarts and an A/B/A-style
 leg order with the same launch arguments, input artifacts, warmup count, repeat
 count, and seed.
+
+After all legs finish, validate the controls and derive a fail-closed decision:
+
+```bash
+python benchmark/kernels/humming/compare_prefill_service.py \
+  --a1 /path/to/a1.json \
+  --candidate /path/to/4096.json \
+  --candidate /path/to/5120.json \
+  --a2 /path/to/a2.json \
+  --drift-threshold-pct 2 \
+  --out /path/to/comparison.json
+```
+
+The comparison requires identical contracts, input hashes and response hashes.
+If either baseline median drifts by at least the threshold, the group is
+`INVALID_DRIFT`; candidate deltas remain diagnostic and their deployment
+decisions are `UNANSWERABLE_INVALID_GROUP`.
