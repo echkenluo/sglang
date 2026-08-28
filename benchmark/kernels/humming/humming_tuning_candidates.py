@@ -1,10 +1,11 @@
 """Humming v0.1.12 offline tuning candidate generator.
 
-Copied from ``humming/testing/tuning.py`` at tag v0.1.12 because the
-published ``humming-kernels`` wheel omits the ``humming.testing`` package.
+Based on ``humming/testing/tuning.py`` at tag v0.1.12 because the deployed
+Humming v0.1.10 wheel predates the ``humming.testing`` package.
 The original file SHA256 is
 ``d3d9d97c00c1b846f31789197d998b67de91e398e6bc8ed03b37dc37b36832c8``.
-Keep this benchmark-only copy byte-for-byte aligned below this header.
+Compatibility changes are limited to the v0.1.10 shared-memory estimator and
+feature-field lookups described inline.
 """
 import dataclasses
 import functools
@@ -19,7 +20,34 @@ import torch
 
 from humming.config import ComputeConfig, LayerConfig, MmaType, TuningConfig
 from humming.tune import get_heuristics_config
-from humming.utils.device import fits_device_smem, get_device_num_sms
+from humming.utils.device import get_device_num_sms
+
+try:
+    from humming.utils.device import fits_device_smem
+except ImportError:
+    # Humming v0.1.10 has the estimator used by its production heuristics but
+    # not the small device-limit wrapper added with the upstream test sampler.
+    from humming.utils.smem import estimate_smem_size_layer
+
+    def fits_device_smem(layer_config, compute_config, tuning_config, device=None):
+        estimated = estimate_smem_size_layer(
+            layer_config,
+            tuning_config.block_shape,
+            compute_config.gemm_type,
+            tuning_config.num_stages,
+        )
+        device_index = torch.cuda.current_device() if device is None else device
+        properties = torch.cuda.get_device_properties(device_index)
+        per_block = getattr(
+            properties,
+            "shared_memory_per_block_optin",
+            properties.shared_memory_per_block,
+        )
+        per_sm = properties.shared_memory_per_multiprocessor
+        return (
+            estimated <= per_block
+            and estimated * tuning_config.num_ctas_per_sm <= per_sm
+        )
 
 NUM_SAMPLED_TUNING_CONFIGS = 100
 TEST_TUNING_SEED_ENV = "HUMMING_TEST_TUNING_SEED"
@@ -95,7 +123,8 @@ def _is_legal_geometry(
         return False
     if layer_config.mma_type == MmaType.WGMMA and layer_config.a_dtype.is_integer_type and warp_shape[0] % 16:
         return False
-    min_warp_n = 32 if layer_config.a_dtype.num_bits == 16 or layer_config.use_packed_k_layout else 16
+    use_packed_k_layout = getattr(layer_config, "use_packed_k_layout", False)
+    min_warp_n = 32 if layer_config.a_dtype.num_bits == 16 or use_packed_k_layout else 16
     min_warp_k = {16: 32, 8: 64, 4: 128}[layer_config.a_dtype.num_bits]
     if warp_shape[1] < min_warp_n or warp_shape[2] < min_warp_k:
         return False
@@ -109,7 +138,7 @@ def _is_legal_geometry(
         group_size and group_size < warp_shape[2]
         for group_size in (layer_config.input_scale_group_size, layer_config.weight_scale_group_size)
     )
-    if layer_config.use_packed_k_layout and is_warp_k_gt_groupsize:
+    if use_packed_k_layout and is_warp_k_gt_groupsize:
         return False
     ratios = tuple(block // warp for block, warp in zip(block_shape, warp_shape, strict=True))
     return all(ratio > 0 and ratio & (ratio - 1) == 0 for ratio in ratios)
@@ -315,7 +344,7 @@ def _try_combine_candidate(
         return None
     actual_warp_iters = (
         config["warp_shape"][1] // 16
-        if layer_config.use_packed_k_layout
+        if getattr(layer_config, "use_packed_k_layout", False)
         else geometry_signature["warp_iters"]
     )
     if config["use_warp_spec"] and actual_warp_iters < 2:

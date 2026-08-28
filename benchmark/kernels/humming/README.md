@@ -61,12 +61,14 @@ CUDA_VISIBLE_DEVICES=0 python benchmark/kernels/humming/tune_humming_moe.py \
   --out /path/to/tuning-result.json
 ```
 
-Candidate count zero tests Humming v0.1.12's complete deterministic sampled
-set; a positive value is only a smoke-test cap.  The source distribution omits
-the sampler from the published wheel, so a benchmark-local copy is kept in
-`humming_tuning_candidates.py`.  Do not treat the piecewise production dispatch
-table as a cross-shape candidate pool: entries outside their M interval are not
-guaranteed to be safe.  The screen precompiles resource-filtered candidates,
+Candidate count zero tests a complete deterministic sampled set; a positive
+value is only a smoke-test cap.  The deployed Humming v0.1.10 wheel predates the
+upstream v0.1.12 sampler, so a benchmark-local compatibility copy is kept in
+`humming_tuning_candidates.py`.  It uses v0.1.10's own shared-memory estimator
+and filters candidate fields to the installed `TuningConfig`.  Do not treat the
+piecewise production dispatch table as a cross-shape candidate pool: entries
+outside their M interval are not guaranteed to be safe.  The screen precompiles
+resource-filtered candidates,
 requires every output element to pass Humming's MoE numerical gate
 (`rtol=0.01`, `atol=0.2`), records scale-aware aggregate errors, times candidate
 order in randomized rounds over multiple real layer routes, and invalidates the

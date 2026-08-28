@@ -30,6 +30,7 @@ for name in (
     sys.modules.setdefault(name, types.ModuleType(name))
 sys.modules["humming.config"].ComputeConfig = object
 sys.modules["humming.config"].GemmType = object
+sys.modules["humming.config"].TuningConfig = object
 sys.modules["humming.kernel.humming"].HummingKernel = object
 sys.modules["humming.layer"].HummingMethod = object
 sys.modules["humming.schema"].BaseInputSchema = object

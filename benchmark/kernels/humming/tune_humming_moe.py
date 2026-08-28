@@ -24,7 +24,8 @@ from typing import Any
 
 import torch
 
-from humming.config import ComputeConfig, GemmType
+import humming
+from humming.config import ComputeConfig, GemmType, TuningConfig
 from humming.kernel.humming import HummingKernel
 from humming.layer import HummingMethod
 from humming.schema import BaseInputSchema, BaseWeightSchema, HummingInputSchema
@@ -292,6 +293,15 @@ def build_candidates(
         layer.humming_metas[sublayer],
         compute,
     )
+    tuning_fields = {field.name for field in dataclasses.fields(TuningConfig)}
+    sampled = [
+        {
+            name: value
+            for name, value in config.items()
+            if name in tuning_fields or name in {"num_sms", "use_f16_accum"}
+        }
+        for config in sampled
+    ]
     candidates = cap_candidate_configs(
         deduplicate_configs([heuristic, *sampled]),
         candidate_count,
@@ -440,7 +450,7 @@ def tune_sublayer(
         "heuristic_config": heuristic,
         "heuristic_id": config_id(heuristic),
         "candidate_count": len(candidates),
-        "candidate_source": "humming_v0.1.12_resource_filtered_sampler",
+        "candidate_source": "humming_v0.1.12_sampler_compat_humming_v0.1.10",
         "candidate_cap": candidate_count,
         "correctness_gate": {
             "reference": "heuristic_config_output",
@@ -712,6 +722,7 @@ def main() -> None:
         "model_config_sha256": hashlib.sha256(model_config_bytes).hexdigest(),
         "tp_size": args.tp_size,
         "shape_m": shape_m,
+        "humming_version": humming.__version__,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "device_name": torch.cuda.get_device_name(),
