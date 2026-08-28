@@ -46,7 +46,13 @@ def load_model_shape(path: Path) -> dict[str, int]:
     if missing:
         raise ValueError(f"model config is missing: {', '.join(missing)}")
 
-    first_moe_layer = int(text_config.get("first_k_dense_replace", 0))
+    # DeepSeek-V4-Flash checkpoints may serialize the optional field as null.
+    # SGLang's V4 config defaults that value to zero, so mirror the production
+    # interpretation instead of calling int(None).
+    first_moe_layer_raw = text_config.get("first_k_dense_replace")
+    first_moe_layer = (
+        0 if first_moe_layer_raw is None else int(first_moe_layer_raw)
+    )
     num_layers = int(text_config["num_hidden_layers"])
     if not 0 <= first_moe_layer < num_layers:
         raise ValueError(

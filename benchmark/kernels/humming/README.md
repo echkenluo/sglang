@@ -5,6 +5,21 @@ SGLang Humming MoE runner.
 
 ## Capture routing shapes
 
+Build an exact-length, reproducible natural-token input from ShareGPT with the
+target tokenizer:
+
+```bash
+python benchmark/kernels/humming/build_capture_input.py \
+  --dataset /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --tokenizer /path/to/model \
+  --prompt-tokens 32768 \
+  --seed 20260828 \
+  --out /path/to/fixed-input-ids.json
+```
+
+The builder uses the model chat template and records the dataset hash, selected
+conversation hashes, exact token count and final truncation receipt.
+
 Start the server with `--enable-return-routed-experts`, then run:
 
 ```bash
@@ -24,7 +39,9 @@ synthetic IDs are allowed only for plumbing checks.
 Run the CPU-only contract tests with:
 
 ```bash
-python -m unittest benchmark/kernels/humming/test_capture_routing.py
+python -m unittest \
+  benchmark/kernels/humming/test_build_capture_input.py \
+  benchmark/kernels/humming/test_capture_routing.py
 ```
 
 ## Kernel screen

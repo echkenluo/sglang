@@ -96,6 +96,22 @@ class CaptureRoutingTest(unittest.TestCase):
         self.assertEqual(shape["first_moe_layer"], 2)
         self.assertEqual(shape["top_k"], 3)
 
+    def test_model_shape_treats_null_dense_prefix_as_v4_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "num_hidden_layers": 43,
+                        "num_experts_per_tok": 6,
+                        "n_routed_experts": 256,
+                        "first_k_dense_replace": None,
+                    }
+                )
+            )
+            shape = load_model_shape(path)
+        self.assertEqual(shape["first_moe_layer"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
