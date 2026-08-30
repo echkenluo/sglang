@@ -696,14 +696,50 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         )
 
     server_args.enable_mixed_chunk = False
-    server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
+    dsv4_chain_only = getattr(server_args, "_dsv4_ngram_chain_only", False)
+    server_args.speculative_eagle_topk = (
+        1 if dsv4_chain_only else server_args.speculative_ngram_max_bfs_breadth
+    )
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = 12
+        server_args.speculative_num_draft_tokens = 10 if dsv4_chain_only else 12
         logger.warning(
-            "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
-            "You can override this by explicitly setting --speculative-num-draft-tokens."
+            "speculative_num_draft_tokens is set to %s by default for ngram speculative decoding. "
+            "You can override this by explicitly setting --speculative-num-draft-tokens.",
+            server_args.speculative_num_draft_tokens,
         )
-    if server_args.speculative_num_steps is None:
+    if dsv4_chain_only:
+        draft_tokens = int(server_args.speculative_num_draft_tokens)
+        if not 2 <= draft_tokens <= 10:
+            raise ValueError(
+                "DeepSeek-V4 chain-only NGRAM requires "
+                "2 <= speculative_num_draft_tokens <= 10; the upper bound is "
+                "the c4 compress-state ring capacity."
+            )
+        if server_args.disaggregation_mode != "null":
+            raise ValueError(
+                "DeepSeek-V4 chain-only NGRAM does not yet support prefill/decode "
+                "disaggregation."
+            )
+        if (
+            server_args.enable_two_batch_overlap
+            or server_args.enable_single_batch_overlap
+        ):
+            raise ValueError("DeepSeek-V4 chain-only NGRAM does not support TBO/SBO.")
+        if not server_args.disable_overlap_schedule:
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "Disabling overlap schedule for the first DeepSeek-V4 NGRAM "
+                "implementation; overlap will be enabled only after its separate "
+                "state-rollback correctness gate passes."
+            )
+        expected_steps = draft_tokens - 1
+        if server_args.speculative_num_steps not in (None, expected_steps):
+            raise ValueError(
+                "DeepSeek-V4 chain-only NGRAM requires speculative_num_steps == "
+                f"speculative_num_draft_tokens - 1 ({expected_steps})."
+            )
+        server_args.speculative_num_steps = expected_steps
+    elif server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = (
             server_args.speculative_num_draft_tokens
             // server_args.speculative_eagle_topk

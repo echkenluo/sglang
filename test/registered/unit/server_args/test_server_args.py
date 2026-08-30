@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
+from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -1109,6 +1110,72 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestDeepseekV4NgramArgs(CustomTestCase):
+    def _make_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "NGRAM"
+        args.device = "cuda"
+        args.page_size = 1
+        args._dsv4_ngram_chain_only = True
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_dsv4_defaults_to_linear_d10_and_sync_schedule(self):
+        args = self._make_args(
+            speculative_num_draft_tokens=None,
+            speculative_num_steps=None,
+            disable_overlap_schedule=False,
+        )
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertEqual(args.speculative_num_draft_tokens, 10)
+        self.assertEqual(args.speculative_num_steps, 9)
+        self.assertTrue(args.disable_overlap_schedule)
+
+    def test_dsv4_rejects_draft_count_beyond_c4_ring(self):
+        args = self._make_args(
+            speculative_num_draft_tokens=11,
+            speculative_num_steps=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "c4 compress-state ring capacity"):
+            handle_speculative_decoding(args)
+
+    def test_dsv4_capability_hook_marks_chain_only_mode(self):
+        args = SimpleNamespace(
+            max_running_requests=1,
+            speculative_algorithm="NGRAM",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.overrides.run_post_process_pass"
+            ) as run_post_process_pass,
+            patch("sglang.srt.utils.is_hip", return_value=False),
+        ):
+            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+
+        run_post_process_pass.assert_called_once()
+        self.assertTrue(args._dsv4_ngram_chain_only)
+
+    def test_generic_ngram_defaults_are_unchanged(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "NGRAM"
+        args.device = "cuda"
+        args.page_size = 1
+        args.speculative_num_draft_tokens = None
+        args.speculative_num_steps = None
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_num_draft_tokens, 12)
+        self.assertEqual(
+            args.speculative_eagle_topk, args.speculative_ngram_max_bfs_breadth
+        )
 
 
 class TestDecoupledSpecArgs(CustomTestCase):

@@ -64,7 +64,8 @@ class Ngram {
   Result batchMatch(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& tokens,
-      const std::vector<size_t>& total_lens);
+      const std::vector<size_t>& total_lens,
+      std::vector<int32_t>* valid_lens = nullptr);
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 

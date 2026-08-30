@@ -148,11 +148,16 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert server_args.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+            "NGRAM",
+        ), f"Only EAGLE, DSPARK, and chain-only NGRAM are supported for {model_arch}"
         if server_args.speculative_algorithm == "EAGLE":
             assert (
                 server_args.speculative_eagle_topk == 1
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+        elif server_args.speculative_algorithm == "NGRAM":
+            # Consumed by the later algorithm hook and worker. Keep it private so
+            # NGRAM behavior for every other architecture remains byte-for-byte.
+            server_args._dsv4_ngram_chain_only = True
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

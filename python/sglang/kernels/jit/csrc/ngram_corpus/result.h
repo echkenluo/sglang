@@ -9,6 +9,10 @@ namespace ngram {
 struct Result {
   std::vector<int32_t> token;
   std::vector<uint8_t> mask;
+  // Number of real nodes in token before fillResult pads the block. Padding
+  // cannot be inferred later: token 0 is legal and a padded row has the same
+  // mask as a real depth-1 child.
+  int32_t num_valid = 0;
 
   void truncate(size_t n);
 };
