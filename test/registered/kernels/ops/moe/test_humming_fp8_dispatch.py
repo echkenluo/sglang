@@ -10,6 +10,9 @@ import torch
 from sglang.kernels.ops.attention.dsv4.moe import (
     silu_and_mul_masked_post_quant,
 )
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_quant_fp8_per_token,
+)
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -421,6 +424,167 @@ class TestHummingFp8Dispatch(CustomTestCase):
         fused_silu.assert_not_called()
         self.assertIs(down_input, expected_down_input)
         self.assertIs(down_scale, expected_down_scale)
+
+    def test_silu_fused_indexed_per_token_quant(self):
+        num_tokens = 37
+        intermediate = 512
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        gate_up = (
+            torch.randn(
+                num_tokens,
+                2 * intermediate,
+                generator=generator,
+                device="cuda",
+            )
+            * 3.0
+        ).to(torch.bfloat16)
+
+        for swiglu_limit in (None, 10.0):
+            with self.subTest(swiglu_limit=swiglu_limit):
+                output = torch.empty(
+                    num_tokens,
+                    intermediate,
+                    device="cuda",
+                    dtype=torch.float8_e4m3fn,
+                )
+                scale = act_and_mul_quant_fp8_per_token(
+                    gate_up, output, swiglu_limit=swiglu_limit
+                )
+
+                gate, up = gate_up.chunk(2, dim=-1)
+                if swiglu_limit is not None:
+                    gate = gate.clamp_max(swiglu_limit)
+                    up = up.clamp(-swiglu_limit, swiglu_limit)
+                activated_gate = (
+                    gate.float() * torch.sigmoid(gate.float())
+                ).to(torch.bfloat16)
+                reference = (activated_gate * up).to(torch.bfloat16).float()
+                expected_scale = (
+                    reference.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+                    / 448.0
+                )
+
+                self.assertEqual(scale.shape, (num_tokens, 1))
+                torch.testing.assert_close(
+                    scale, expected_scale, rtol=5e-3, atol=1e-7
+                )
+                dequantized = output.float() * scale
+                self.assertTrue(
+                    bool(
+                        (
+                            (dequantized - reference).abs()
+                            <= scale * 17.0 + 1e-4
+                        ).all()
+                    )
+                )
+
+    def test_indexed_fusion_selection_and_fallback(self):
+        num_tokens = 8
+        intermediate = 512
+        gate_up = torch.empty(
+            num_tokens,
+            2 * intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        activation_output = torch.empty(
+            num_tokens,
+            intermediate,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        quanted_down_input = torch.empty(
+            num_tokens,
+            intermediate,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        buffers = {
+            "gate_up_output": gate_up,
+            "activation_output": activation_output,
+            "quanted_down_input": quanted_down_input,
+        }
+        runner = humming_runner.HummingRunnerCore(
+            MoeRunnerConfig(
+                num_experts=8,
+                num_local_experts=8,
+                intermediate_size_per_partition=intermediate,
+                top_k=8,
+                activation="silu",
+                is_gated=True,
+                swiglu_limit=10.0,
+                gate_up_interleaved=False,
+            )
+        )
+        runner.layer = SimpleNamespace(
+            humming_metas={
+                "w2": SimpleNamespace(
+                    a_dtype=humming_runner.dtypes.float8e4m3,
+                    as_dtype=humming_runner.dtypes.float32,
+                    input_scale_group_size=0,
+                )
+            }
+        )
+        expected_scale = torch.empty(
+            num_tokens, 1, device="cuda", dtype=torch.float32
+        )
+
+        with (
+            patch.object(
+                humming_runner.envs.SGLANG_HUMMING_FUSED_INDEXED_ACT_QUANT,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                runner,
+                "apply_activation",
+                side_effect=AssertionError("indexed fused path was not selected"),
+            ) as fallback_activation,
+            patch(
+                "sglang.kernels.ops.moe.fused_moe_triton_kernels."
+                "act_and_mul_quant_fp8_per_token",
+                return_value=expected_scale,
+            ) as fused_silu,
+        ):
+            down_input, down_scale = runner._indexed_act_quant(buffers)
+
+        fallback_activation.assert_not_called()
+        fused_silu.assert_called_once_with(
+            gateup_output=gate_up,
+            down_input=quanted_down_input,
+            swiglu_limit=10.0,
+        )
+        self.assertIs(down_input, quanted_down_input)
+        self.assertIs(down_scale, expected_scale)
+
+        expected_fallback_input = torch.empty_like(quanted_down_input)
+        expected_fallback_scale = torch.empty_like(expected_scale)
+        with (
+            patch.object(
+                humming_runner.envs.SGLANG_HUMMING_FUSED_INDEXED_ACT_QUANT,
+                "get",
+                return_value=False,
+            ),
+            patch.object(runner, "apply_activation") as fallback_activation,
+            patch.object(
+                humming_runner.HummingMethod,
+                "may_quant_input",
+                return_value=(expected_fallback_input, expected_fallback_scale),
+            ) as fallback_quant,
+        ):
+            down_input, down_scale = runner._indexed_act_quant(buffers)
+
+        fallback_activation.assert_called_once_with(
+            inputs=gate_up, outputs=activation_output
+        )
+        fallback_quant.assert_called_once_with(
+            layer=runner.layer,
+            inputs=activation_output,
+            quanted_input=quanted_down_input,
+            sublayer_name="w2",
+        )
+        self.assertIs(down_input, expected_fallback_input)
+        self.assertIs(down_scale, expected_fallback_scale)
 
 
 if __name__ == "__main__":

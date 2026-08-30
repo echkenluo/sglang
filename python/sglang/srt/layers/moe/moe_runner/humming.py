@@ -539,6 +539,51 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w2",
         )
 
+    def _indexed_act_quant(
+        self, buffers: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        gate_up = buffers["gate_up_output"]
+        intermediate = gate_up.shape[-1] // 2
+        w2_meta = self.layer.humming_metas["w2"]
+        use_fused_indexed_act_quant = (
+            envs.SGLANG_HUMMING_FUSED_INDEXED_ACT_QUANT.get()
+            and w2_meta.a_dtype == dtypes.float8e4m3
+            and w2_meta.as_dtype == dtypes.float32
+            and w2_meta.input_scale_group_size == 0
+            and self.activation == "silu"
+            and gate_up.ndim == 2
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and intermediate > 0
+            and intermediate <= 65536
+        )
+        if use_fused_indexed_act_quant:
+            logger.info_once(
+                "Using Humming fused indexed activation and per-token FP8 quantization"
+            )
+            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+                act_and_mul_quant_fp8_per_token,
+            )
+
+            down_input = buffers["quanted_down_input"]
+            down_scale = act_and_mul_quant_fp8_per_token(
+                gateup_output=gate_up,
+                down_input=down_input,
+                swiglu_limit=self.swiglu_limit,
+            )
+            return down_input, down_scale
+
+        self.apply_activation(
+            inputs=gate_up,
+            outputs=buffers["activation_output"],
+        )
+        return HummingMethod.may_quant_input(
+            layer=self.layer,
+            inputs=buffers["activation_output"],
+            quanted_input=buffers.get("quanted_down_input"),
+            sublayer_name="w2",
+        )
+
     def run(
         self,
         runner_input: HummingRunnerInput,
@@ -650,17 +695,7 @@ class HummingRunnerCore(MoeRunnerCore):
             **moe_kwargs1,
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
-            sublayer_name="w2",
-        )
+        inputs, input_scale = self._indexed_act_quant(buffers)
 
         HummingMethod.forward_layer(
             layer=self.layer,

@@ -1089,6 +1089,87 @@ def act_and_mul_triton(
     )
 
 
+@triton.jit
+def act_and_mul_quant_fp8_per_token_kernel(
+    gateup_output,
+    down_input,
+    down_input_scale,
+    half_hidden_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
+):
+    """Fuse BF16 SwiGLU with dynamic per-token FP8 quantization."""
+    input_dtype = gateup_output.dtype.element_ty
+    token_id = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < half_hidden_size
+
+    input_start = token_id * half_hidden_size * 2
+    gate = tl.load(gateup_output + input_start + offsets, mask=mask, other=0.0)
+    up = tl.load(
+        gateup_output + input_start + half_hidden_size + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    if HAS_SWIGLU_LIMIT:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+
+    # Match the unfused Humming path: round the SiLU result and the final
+    # product to the BF16 input dtype before deriving the dynamic scale.
+    gate = _apply_activation(gate, "silu").to(input_dtype)
+    activated = (gate * up).to(input_dtype).to(tl.float32)
+
+    absmax = tl.maximum(tl.max(tl.abs(activated), axis=0), 1e-30)
+    scale = absmax / 448.0
+    quantized = (activated / scale).to(tl.float8e4nv)
+
+    output_start = token_id * half_hidden_size
+    tl.store(down_input + output_start + offsets, quantized, mask=mask)
+    tl.store(down_input_scale + token_id, scale)
+
+
+def act_and_mul_quant_fp8_per_token(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
+) -> torch.Tensor:
+    """Write fused SwiGLU+FP8 output and return one FP32 scale per token."""
+    assert gateup_output.ndim == 2
+    assert gateup_output.dtype == torch.bfloat16
+    assert gateup_output.is_contiguous()
+    assert gateup_output.shape[1] % 2 == 0
+    assert down_input.shape == (
+        gateup_output.shape[0],
+        gateup_output.shape[1] // 2,
+    )
+    assert down_input.dtype == torch.float8_e4m3fn
+    assert down_input.is_contiguous()
+
+    num_tokens = gateup_output.shape[0]
+    half_hidden_size = gateup_output.shape[1] // 2
+    block_size = triton.next_power_of_2(half_hidden_size)
+    assert block_size <= 65536
+    down_input_scale = torch.empty(
+        (num_tokens, 1), dtype=torch.float32, device=gateup_output.device
+    )
+    has_swiglu_limit = swiglu_limit is not None
+    act_and_mul_quant_fp8_per_token_kernel[(num_tokens,)](
+        gateup_output,
+        down_input,
+        down_input_scale,
+        half_hidden_size=half_hidden_size,
+        BLOCK_SIZE=block_size,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        num_warps=min(max(block_size // 256, 1), 8),
+        num_stages=1,
+    )
+    return down_input_scale
+
+
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
