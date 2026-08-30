@@ -50,6 +50,7 @@ from tune_humming_moe import (  # noqa: E402
     load_capture,
     percentile,
     persistent_grid_values,
+    require_exact_humming_version,
     require_formal_w13_humming_version,
     w13_schedule_grid,
 )
@@ -64,6 +65,13 @@ class TuneHummingCommonTest(unittest.TestCase):
         self.assertEqual(require_formal_w13_humming_version("0.1.12"), "0.1.12")
         with self.assertRaisesRegex(RuntimeError, "requires official Humming 0.1.12"):
             require_formal_w13_humming_version("0.1.10")
+
+    def test_runtime_screen_requires_explicit_exact_version(self):
+        self.assertEqual(
+            require_exact_humming_version("0.1.13", "0.1.13"), "0.1.13"
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires exact version 0.1.13"):
+            require_exact_humming_version("0.1.13", "0.1.12")
 
     def test_persistent_grid_sweep_bounds_shape_specific_value(self):
         self.assertEqual(

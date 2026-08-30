@@ -33,13 +33,14 @@ from humming.tune import get_heuristics_config
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 BIG_M = 1 << 40
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 DEFAULT_RTOL = 0.01
 # Match Humming's MoE kernel tests.  The generic KernelTestCase default (0.05)
 # is too strict for alternate FP8 MoE accumulation schedules even when their
 # aggregate numerical error is negligible.
 DEFAULT_ATOL = 0.2
 FORMAL_W13_HUMMING_VERSION = "0.1.12"
+W13_CANDIDATE_SOURCES = ("official-sampler", "heuristic-only")
 
 
 class StubMoeLayer(torch.nn.Module):
@@ -93,6 +94,19 @@ def require_formal_w13_humming_version(version: str | None = None) -> str:
         raise RuntimeError(
             "formal W13 tuning requires official Humming "
             f"{FORMAL_W13_HUMMING_VERSION}; found {actual}"
+        )
+    return actual
+
+
+def require_exact_humming_version(
+    expected_version: str, version: str | None = None
+) -> str:
+    """Fail closed when a whole-runtime comparison loads the wrong wheel."""
+    actual = humming.__version__ if version is None else version
+    if actual != expected_version:
+        raise RuntimeError(
+            "Humming runtime comparison requires exact version "
+            f"{expected_version}; found {actual}"
         )
     return actual
 
@@ -395,7 +409,12 @@ def normalize_sampled_config(config: dict) -> dict:
 
 
 def build_candidates(
-    layer, sublayer: str, shape_m: int, candidate_count: int
+    layer,
+    sublayer: str,
+    shape_m: int,
+    candidate_count: int,
+    w13_candidate_source: str = "official-sampler",
+    expected_humming_version: str = FORMAL_W13_HUMMING_VERSION,
 ) -> tuple[dict, list[dict], str]:
     heuristic = exact_heuristic_config(layer, sublayer, shape_m)
     if sublayer == "w2":
@@ -412,6 +431,12 @@ def build_candidates(
             candidate_count,
         )
         return heuristic, candidates, "shape_specific_w2_persistent_grid"
+
+    if w13_candidate_source == "heuristic-only":
+        require_exact_humming_version(expected_humming_version)
+        return heuristic, [heuristic], "exact_heuristic_only"
+    if w13_candidate_source != "official-sampler":
+        raise ValueError(f"unsupported W13 candidate source: {w13_candidate_source}")
 
     # W13 geometry tuning is legal only when the candidate enumerator and
     # kernel constructor come from the same official Humming release.  Keep the
@@ -566,10 +591,17 @@ def tune_sublayer(
     rtol: float,
     atol: float,
     seed: int,
+    w13_candidate_source: str = "official-sampler",
+    expected_humming_version: str = FORMAL_W13_HUMMING_VERSION,
     w13_alignment_config: dict | None = None,
 ) -> dict:
     heuristic, candidates, candidate_source = build_candidates(
-        layer, sublayer, shape_m, candidate_count
+        layer,
+        sublayer,
+        shape_m,
+        candidate_count,
+        w13_candidate_source=w13_candidate_source,
+        expected_humming_version=expected_humming_version,
     )
     result: dict[str, Any] = {
         "sublayer": sublayer,
@@ -811,6 +843,20 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="0 tests the full W2 grid or full official W13 sample",
     )
+    parser.add_argument(
+        "--w13-candidate-source",
+        choices=W13_CANDIDATE_SOURCES,
+        default="official-sampler",
+        help=(
+            "official-sampler explores Humming 0.1.12 test configs; "
+            "heuristic-only isolates an exact whole-runtime A/B"
+        ),
+    )
+    parser.add_argument(
+        "--expected-humming-version",
+        default=FORMAL_W13_HUMMING_VERSION,
+        help="exact wheel version required for W13 execution",
+    )
     parser.add_argument("--route-samples", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
@@ -833,7 +879,14 @@ def main() -> None:
         raise RuntimeError("Humming tuning requires a CUDA GPU")
     torch.cuda.set_device(0)
     sublayers = ("w13", "w2") if args.sublayer == "both" else (args.sublayer,)
-    w13_sampler = formal_w13_sampler_receipt() if "w13" in sublayers else None
+    if "w13" in sublayers:
+        require_exact_humming_version(args.expected_humming_version)
+    use_official_sampler = args.w13_candidate_source == "official-sampler"
+    w13_sampler = (
+        formal_w13_sampler_receipt()
+        if "w13" in sublayers and use_official_sampler
+        else None
+    )
     capture, routed, points, shape_m = load_capture(
         args.capture_manifest, args.shape_m, args.route_samples
     )
@@ -869,6 +922,8 @@ def main() -> None:
                 "rtol",
                 "atol",
                 "seed",
+                "w13_candidate_source",
+                "expected_humming_version",
             )
         },
         "sublayers": {},
@@ -890,6 +945,8 @@ def main() -> None:
             rtol=args.rtol,
             atol=args.atol,
             seed=args.seed + (0 if sublayer == "w13" else 1000),
+            w13_candidate_source=args.w13_candidate_source,
+            expected_humming_version=args.expected_humming_version,
             w13_alignment_config=selected_w13_config,
         )
         if sublayer == "w13" and result["sublayers"][sublayer]["state"] == "MEASURED":

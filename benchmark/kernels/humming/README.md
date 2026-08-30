@@ -96,6 +96,15 @@ only the old eight-config schedule surface.  Every sampled candidate remains
 subject to precompile, full-output correctness and fail-closed route gates; a
 sampler-issued config is not assumed correct merely because it compiled.
 
+To isolate a whole-Humming runtime upgrade without changing the selected W13
+schedule, use `--w13-candidate-source heuristic-only` together with an explicit
+`--expected-humming-version`.  This mode tests exactly one candidate: the
+installed runtime's production-table heuristic for the captured M.  It is for
+matched runtime A/B/A screening, not shape search; compare the reported
+`heuristic_median_us` across runs only after asserting the heuristic config IDs
+match and the A1/A2 drift gate passes in every run.  A runtime screen still
+needs a separate cross-version correctness and service gate before deployment.
+
 ## Cold-prefill service leg
 
 Restart the server for every tuning variant, disable radix caching, and run a
