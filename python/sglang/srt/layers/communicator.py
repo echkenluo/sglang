@@ -272,7 +272,13 @@ class AttnTpContext:
             get_parallel().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_dsa
+            and (
+                not is_dsa
+                or (
+                    envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
+                    and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                )
+            )
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -294,6 +300,10 @@ class AttnTpContext:
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.input_ids is not None
+            and (
+                not self.is_dsa
+                or forward_batch.input_ids.shape[0] % get_parallel().tp_size == 0
+            )
             and not forward_batch.can_run_tbo
         )
 

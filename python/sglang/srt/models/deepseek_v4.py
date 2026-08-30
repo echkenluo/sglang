@@ -199,6 +199,48 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+_DSV4_TP_SCATTER_LOGGED: Set[str] = set()
+
+
+def _dsv4_tp_scatter_log_once(site: str, message: str) -> None:
+    if site in _DSV4_TP_SCATTER_LOGGED:
+        return
+    _DSV4_TP_SCATTER_LOGGED.add(site)
+    logger.info("[DSV4-TP-SCATTER] %s", message)
+
+
+def _dsv4_tp_all_gather_rows(x: torch.Tensor) -> torch.Tensor:
+    """Gather equal first-dimension token shards over the model TP group."""
+    tp_group = get_tp_group()
+    output = x.new_empty((x.shape[0] * tp_group.world_size, *x.shape[1:]))
+    tp_group.all_gather_into_tensor(output, x.contiguous())
+    return output
+
+
+def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
+    """Sum TP partials and retain the rank-owned first-dimension token shard."""
+    tp_group = get_tp_group()
+    if x.shape[0] % tp_group.world_size != 0:
+        raise RuntimeError(
+            "DSV4 TP-scattered output requires token rows divisible by TP: "
+            f"rows={x.shape[0]} tp={tp_group.world_size}"
+        )
+    output = x.new_empty((x.shape[0] // tp_group.world_size, *x.shape[1:]))
+    tp_group.reduce_scatter_tensor(output, x.contiguous())
+    return output
+
+
+def _dsv4_tp_scatter_replicated_rows(x: torch.Tensor) -> torch.Tensor:
+    """Select this TP rank's rows from an already replicated tensor."""
+    tp_group = get_tp_group()
+    if x.shape[0] % tp_group.world_size != 0:
+        raise RuntimeError(
+            "DSV4 TP-scattered input requires token rows divisible by TP: "
+            f"rows={x.shape[0]} tp={tp_group.world_size}"
+        )
+    rows = x.shape[0] // tp_group.world_size
+    return x.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
+
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -225,13 +267,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
-_BCG_EAGER_TARGET_SELF_ATTN = get_bool_env_var(
-    "SGLANG_BCG_EAGER_TARGET_SELF_ATTN"
-)
+_BCG_EAGER_TARGET_SELF_ATTN = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_SELF_ATTN")
 _BCG_EAGER_TARGET_MHC = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC")
-_BCG_EAGER_TARGET_MHC_PRE = get_bool_env_var(
-    "SGLANG_BCG_EAGER_TARGET_MHC_PRE"
-)
+_BCG_EAGER_TARGET_MHC_PRE = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC_PRE")
 _BCG_EAGER_TARGET_MHC_POST = get_bool_env_var("SGLANG_BCG_EAGER_TARGET_MHC_POST")
 _BCG_EAGER_TARGET_MHC_POST_ATTN = get_bool_env_var(
     "SGLANG_BCG_EAGER_TARGET_MHC_POST_ATTN"
@@ -1378,7 +1416,14 @@ class MQALayer(MqaAttentionBase):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
-        o, _ = self.wo_b(o.flatten(1))
+        use_tp_scattered = get_attn_tp_context().input_scattered
+        o, _ = self.wo_b(o.flatten(1), skip_all_reduce=use_tp_scattered)
+        if use_tp_scattered:
+            o = _dsv4_tp_reduce_scatter_rows(o)
+            _dsv4_tp_scatter_log_once(
+                "wo_b_rs",
+                "wo_b local FP8 GEMM -> TP reduce-scatter engaged",
+            )
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -1507,16 +1552,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _BCG_BRIDGE_TARGET_MHC_POST_FFN_OUTPUT and not is_nextn:
             # Allocate a strong bridge buffer after the captured FFN hc_post;
             # replay copies the fresh tensor into this fixed-address buffer.
-            self.hc_post_ffn_output_bridge = eager_on_graph(True)(
-                lambda x: x.clone()
-            )
+            self.hc_post_ffn_output_bridge = eager_on_graph(True)(lambda x: x.clone())
         # Diagnostic-only: keep the target router, expert call, and TP combine
         # outside Breakable CUDA Graph while leaving the DSpark draft unchanged.
         # ``is_nextn`` is true for DSparkV4Stage and false for target layers.
         if _BCG_EAGER_TARGET_FFN and not is_nextn:
-            self._run_moe_ffn_dp_sync = eager_on_graph(True)(
-                self._run_moe_ffn_dp_sync
-            )
+            self._run_moe_ffn_dp_sync = eager_on_graph(True)(self._run_moe_ffn_dp_sync)
 
     def _build_self_attn(
         self,
@@ -1771,6 +1812,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        if get_attn_tp_context().input_scattered:
+            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+            # The pre-gather quantized activation covers only the local token
+            # shard. Let the attention path quantize the gathered full tensor.
+            x_quant = None
+            _dsv4_tp_scatter_log_once(
+                "attn_ag",
+                "gathered TP token shards before DSA attention",
+            )
+
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -1871,6 +1922,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
+        _use_tp_input_scattered = get_attn_tp_context().input_scattered
+        if _use_tp_input_scattered and (
+            _use_cp or _use_tp_moe_gather or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "DSV4 TP input-scattered is only valid for TP MoE without "
+                "CP, DP-attention, or A2A"
+            )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
@@ -1900,24 +1959,32 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
-        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
-        # on LOCAL hidden before the gather and add it back after the combine
-        # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
-        # Applies to BOTH prefill and decode: the shared expert is a per-token MLP,
-        # so computing it on this rank's local tokens (M_local rows) is identical to
-        # computing it on the gathered global buffer (M_global rows) and keeping the
-        # local slice -- but costs 1/dp_size the rows. With a replicated (TP1) shared
-        # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
-        # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
+        mlp_reduce_scatter = (
+            _use_cp
+            or _use_reduce_scatterv
+            or _use_reduce_scatter
+            or _use_tp_input_scattered
+        )
+        # A replicated TP1 shared expert must run on local token rows before a
+        # TP-scattered gather. Adding a replicated full-token result before the
+        # reduce-scatter would sum the same shared output once per TP rank.
+        # The existing DP-local optimization is still env-gated; correctness of
+        # the new TP-scattered path requires its local form unconditionally.
         _shared_local = None
         _do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and _use_tp_moe_gather
+            (_use_tp_input_scattered or (_SHARED_EXPERT_LOCAL and _use_tp_moe_gather))
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
-        if _use_cp:
+        if _use_tp_input_scattered:
+            if _do_shared_local and hidden_states.shape[0] > 0:
+                _shared_local = self.mlp._forward_shared_experts(hidden_states)
+            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+            _dsv4_tp_scatter_log_once(
+                "moe_ag",
+                "gathered TP token shards before TP MoE",
+            )
+        elif _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -1953,7 +2020,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
-        if _use_cp and get_moe_a2a_backend().is_none():
+        if _use_tp_input_scattered:
+            hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
+            if _shared_local is not None:
+                hidden_states = hidden_states + _shared_local
+            _dsv4_tp_scatter_log_once(
+                "moe_rs",
+                "TP MoE partial output -> TP reduce-scatter engaged",
+            )
+        elif _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
@@ -2464,6 +2539,19 @@ class DeepseekV4Model(nn.Module):
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
+        if get_attn_tp_context().input_scattered:
+            if self.pp_group.world_size != 1:
+                raise RuntimeError("DSV4 TP input-scattered requires pp_size=1")
+            if self.dspark_layers_to_capture is not None:
+                raise RuntimeError(
+                    "DSV4 TP input-scattered does not support DSpark aux capture"
+                )
+            hidden_states = _dsv4_tp_scatter_replicated_rows(hidden_states)
+            _dsv4_tp_scatter_log_once(
+                "model_input",
+                "sliced replicated model input into TP-owned token rows",
+            )
+
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
@@ -2522,6 +2610,13 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
+
+        if get_attn_tp_context().input_scattered:
+            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+            _dsv4_tp_scatter_log_once(
+                "model_output",
+                "restored full token rows before the DSV4 head",
+            )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
