@@ -1262,6 +1262,8 @@ class Envs:
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
+    # Fused CP AllGather/GEMM and MoE ReduceScatter via torch symmetric memory.
+    SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph

@@ -322,6 +322,90 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+def _get_cp_fused_symm_mem_comm(mlp, hidden_states: torch.Tensor, forward_batch):
+    """Return a communicator only when the whole fused AG/RS contract is valid."""
+    if (
+        not envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get()
+        or get_is_capture_mode()
+    ):
+        return None
+
+    tp_group = get_tp_group()
+    comm = tp_group.torch_symm_mem_comm
+    parallel = get_parallel()
+    experts = getattr(mlp, "experts", None)
+    runner_config = getattr(experts, "moe_runner_config", None)
+    shared = getattr(mlp, "shared_experts", None)
+    gate_up = getattr(shared, "gate_up_proj", None)
+    top_k = int(getattr(mlp, "top_k", -1))
+    n_shared_experts = int(getattr(mlp, "n_shared_experts", -1))
+    local_eligible = (
+        comm is not None
+        and not comm.disabled
+        and comm.world_size == parallel.tp_size == parallel.attn_cp_size
+        and hidden_states.ndim == 2
+        and hidden_states.shape[0] > 0
+        and hidden_states.shape[1] % 512 == 0
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and runner_config is not None
+        and runner_config.inplace
+        and top_k > 0
+        and n_shared_experts > 0
+        and shared is not None
+        and getattr(mlp, "shared_experts_is_fp8", False)
+        and not getattr(mlp, "_shared_expert_tp1", False)
+        and getattr(mlp, "num_fused_shared_experts", 0) == 0
+        and not getattr(mlp, "_fuse_shared_experts_inside_sbo", False)
+        and getattr(gate_up, "weight", None) is not None
+        and getattr(gate_up, "weight_scale_inv", None) is not None
+    )
+
+    policy_key = (
+        type(mlp).__name__,
+        int(hidden_states.shape[0]) if hidden_states.ndim > 0 else -1,
+        int(hidden_states.shape[1]) if hidden_states.ndim == 2 else -1,
+        str(hidden_states.dtype),
+        bool(hidden_states.is_contiguous()),
+        top_k,
+        n_shared_experts,
+    )
+    cache_name = "_dsv4_symm_mem_fused_admission_cache"
+    cache = getattr(forward_batch, cache_name, None)
+    if cache is None:
+        cache = {}
+        setattr(forward_batch, cache_name, cache)
+    if policy_key not in cache:
+        signature = torch.tensor(
+            [
+                int(local_eligible),
+                policy_key[1],
+                policy_key[2],
+                int(hidden_states.dtype == torch.bfloat16),
+                int(hidden_states.is_contiguous()),
+                int(parallel.tp_size),
+                int(parallel.attn_cp_size),
+                top_k,
+                n_shared_experts,
+            ],
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        gathered = torch.empty(
+            (tp_group.world_size, signature.numel()),
+            dtype=signature.dtype,
+            device=signature.device,
+        )
+        tp_group.all_gather_into_tensor(gathered, signature)
+        cache[policy_key] = bool(
+            (
+                torch.all(gathered[:, 0] == 1)
+                & torch.all(gathered == gathered[0])
+            ).item()
+        )
+    return comm if cache[policy_key] else None
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -1837,10 +1921,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        moe_a2a_backend = get_moe_a2a_backend() if _use_cp else None
+        fused_cp_comm = (
+            _get_cp_fused_symm_mem_comm(self.mlp, hidden_states, forward_batch)
+            if _use_cp and moe_a2a_backend.is_none()
+            else None
+        )
         if _use_cp:
-            moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                if fused_cp_comm is None:
+                    hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
                     "CP requires DeepEP or megaMoE "
@@ -1865,7 +1955,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        fused_cp_scope = (
+            fused_cp_comm.cp_fused_scope()
+            if fused_cp_comm is not None
+            else nullcontext()
+        )
+        with (
+            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            fused_cp_scope,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -1873,8 +1971,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
-        if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+        if _use_cp and moe_a2a_backend.is_none():
+            if fused_cp_comm is None:
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -2385,7 +2484,11 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
-        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+        for _attr in (
+            "freqs_cis_c4",
+            "freqs_cis_c128",
+            "_dsv4_symm_mem_fused_admission_cache",
+        ):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
