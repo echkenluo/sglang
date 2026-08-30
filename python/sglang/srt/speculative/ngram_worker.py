@@ -20,7 +20,9 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_chain import (
+    derive_chain_links,
     derive_tree_links,
+    resolve_dsv4_chain_only,
     select_longest_ngram_chains,
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -67,7 +69,9 @@ class NGRAMWorker(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         architectures = self.model_runner.model_config.hf_config.architectures or []
-        self.dsv4_chain_only = "DeepseekV4ForCausalLM" in architectures
+        self.dsv4_chain_only = resolve_dsv4_chain_only(
+            getattr(server_args, "_dsv4_ngram_chain_only", False), architectures
+        )
         self.tp_rank = ps.tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
@@ -183,9 +187,6 @@ class NGRAMWorker(BaseSpecWorker):
         )
         self.tree_mask = torch.empty(
             (max_total_mask_size,), dtype=torch.bool, device=self.device
-        )
-        self.valid_lens = torch.empty(
-            (self.max_batch_size,), dtype=torch.int32, device=self.device
         )
         self.retrieve_indexes.copy_(
             torch.arange(max_total_drafts, dtype=torch.int64, device=self.device).view(
@@ -315,8 +316,8 @@ class NGRAMWorker(BaseSpecWorker):
 
         if self.dsv4_chain_only:
             assert chain_lens is not None
-            next_token_cpu, next_sibling_cpu = derive_tree_links(
-                mask, bs, self.draft_token_num
+            next_token_cpu, next_sibling_cpu = derive_chain_links(
+                chain_lens, self.draft_token_num
             )
             retrieve_next_token.copy_(
                 torch.from_numpy(next_token_cpu), non_blocking=True
@@ -333,8 +334,6 @@ class NGRAMWorker(BaseSpecWorker):
                 batch.seq_lens.repeat_interleave(self.draft_token_num)
                 + position_offsets
             )
-            valid_lens = self.valid_lens[:bs]
-            valid_lens.copy_(torch.from_numpy(chain_lens), non_blocking=True)
         else:
             # Generate positions and tree traversal indices for generic NGRAM.
             reconstruct_indices_from_tree_mask(
@@ -347,7 +346,6 @@ class NGRAMWorker(BaseSpecWorker):
                 bs,
                 self.draft_token_num,
             )
-            valid_lens = None
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
@@ -394,7 +392,6 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
-            valid_lens=valid_lens,
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
@@ -482,13 +479,8 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
             new_seq_lens = batch.seq_lens + accept_lens
-            clear_unaccepted_c128 = getattr(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                "clear_unaccepted_c128_draft_states",
-                None,
-            )
-            if clear_unaccepted_c128 is not None:
-                clear_unaccepted_c128(
+            if self.dsv4_chain_only:
+                self.token_to_kv_pool_allocator.get_kvcache().clear_unaccepted_c128_draft_states(
                     batch.req_pool_indices,
                     batch.seq_lens,
                     accept_lens,

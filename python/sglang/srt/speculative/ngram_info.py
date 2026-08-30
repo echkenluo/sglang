@@ -22,7 +22,6 @@ class NgramVerifyInput(SpecInput):
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
-        valid_lens: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -40,7 +39,6 @@ class NgramVerifyInput(SpecInput):
         self.new_seq_lens = new_seq_lens
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
-        self.valid_lens = valid_lens
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device

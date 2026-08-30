@@ -1,6 +1,42 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
+
+
+def resolve_dsv4_chain_only(
+    enabled_by_capability_hook: bool, architectures: Sequence[str]
+) -> bool:
+    """Fail closed if model discovery and the DSV4 capability hook disagree."""
+    is_dsv4 = "DeepseekV4ForCausalLM" in architectures
+    if bool(enabled_by_capability_hook) != is_dsv4:
+        raise ValueError(
+            "DeepSeek-V4 NGRAM capability state disagrees with the loaded model "
+            "architecture. Connector INSTANCE and other hook-bypassing model "
+            "paths are not supported until they run the same validation."
+        )
+    return is_dsv4
+
+
+def derive_chain_links(
+    chain_lens: np.ndarray, draft_token_num: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build traversal links directly from producer-known chain lengths."""
+    lens = np.asarray(chain_lens, dtype=np.int64).reshape(-1)
+    d = int(draft_token_num)
+    if d <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {d}")
+    if np.any(lens < 1) or np.any(lens > d):
+        raise ValueError(f"chain lengths must be within [1, {d}], got {lens.tolist()}")
+
+    next_token = np.full((lens.size, d), -1, dtype=np.int64)
+    next_sibling = np.full((lens.size, d), -1, dtype=np.int64)
+    for batch_idx, chain_len_value in enumerate(lens):
+        chain_len = int(chain_len_value)
+        if chain_len > 1:
+            next_token[batch_idx, : chain_len - 1] = np.arange(1, chain_len)
+    return next_token, next_sibling
 
 
 def derive_tree_links(
