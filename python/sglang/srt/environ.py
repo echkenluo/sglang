@@ -1178,8 +1178,9 @@ class Envs:
     # Experimental TP-scattered prefill for DeepSeek-V4. This is a second,
     # model-specific gate on top of --enable-attn-tp-input-scattered because
     # DSV4/DSA needs explicit full-state gather points around attention and
-    # MoE. Decode, speculative verification, PP, and non-divisible token
-    # batches remain on the stock full-token path.
+    # MoE. The vocab-parallel embedding is reduced and token-scattered at the
+    # model entrance. Decode, speculative verification, PP, and non-divisible
+    # token batches remain on the stock full-token path.
     SGLANG_DSV4_TP_INPUT_SCATTERED = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)

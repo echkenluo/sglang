@@ -230,18 +230,6 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def _dsv4_tp_scatter_replicated_rows(x: torch.Tensor) -> torch.Tensor:
-    """Select this TP rank's rows from an already replicated tensor."""
-    tp_group = get_tp_group()
-    if x.shape[0] % tp_group.world_size != 0:
-        raise RuntimeError(
-            "DSV4 TP-scattered input requires token rows divisible by TP: "
-            f"rows={x.shape[0]} tp={tp_group.world_size}"
-        )
-    rows = x.shape[0] // tp_group.world_size
-    return x.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
-
-
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -2546,10 +2534,14 @@ class DeepseekV4Model(nn.Module):
                 raise RuntimeError(
                     "DSV4 TP input-scattered does not support DSpark aux capture"
                 )
-            hidden_states = _dsv4_tp_scatter_replicated_rows(hidden_states)
+            # VocabParallelEmbedding intentionally skips its all-reduce while
+            # input_scattered is active. Its output is therefore still a TP
+            # partial, not a replicated tensor. Reduce-scatter both sums the
+            # vocab shards and assigns the resulting token rows to TP ranks.
+            hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
             _dsv4_tp_scatter_log_once(
                 "model_input",
-                "sliced replicated model input into TP-owned token rows",
+                "reduced vocab-parallel embedding into TP-owned token rows",
             )
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
