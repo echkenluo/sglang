@@ -548,7 +548,6 @@ class HummingRunnerCore(MoeRunnerCore):
         use_fused_indexed_act_quant = (
             envs.SGLANG_HUMMING_FUSED_INDEXED_ACT_QUANT.get()
             and w2_meta.a_dtype == dtypes.float8e4m3
-            and w2_meta.as_dtype == dtypes.float32
             and w2_meta.input_scale_group_size == 0
             and self.activation == "silu"
             and gate_up.ndim == 2

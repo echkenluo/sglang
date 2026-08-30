@@ -520,7 +520,6 @@ class TestHummingFp8Dispatch(CustomTestCase):
             humming_metas={
                 "w2": SimpleNamespace(
                     a_dtype=humming_runner.dtypes.float8e4m3,
-                    as_dtype=humming_runner.dtypes.float32,
                     input_scale_group_size=0,
                 )
             }
