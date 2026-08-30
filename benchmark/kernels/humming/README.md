@@ -134,3 +134,21 @@ The comparison requires identical contracts, input hashes and response hashes.
 If either baseline median drifts by at least the threshold, the group is
 `INVALID_DRIFT`; candidate deltas remain diagnostic and their deployment
 decisions are `UNANSWERABLE_INVALID_GROUP`.
+
+## Indexed activation-quantization fusion
+
+Screen the opt-in indexed Humming fusion against the exact unfused runtime
+sequence before running a service A/B:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmark/kernels/humming/bench_indexed_act_quant.py \
+  --m-values 6 12 24 48 96 192 384 768 1536 196608 \
+  --intermediate 512 \
+  --swiglu-limit 10 \
+  --out /path/to/indexed-act-quant.json
+```
+
+The baseline is `act_and_mul_triton` followed by Humming dynamic per-token FP8
+quantization.  The tool checks data/scale numerical compatibility first, then
+times the two-kernel baseline and one-kernel candidate in alternating order.
+These are component results only; they do not establish service performance.
