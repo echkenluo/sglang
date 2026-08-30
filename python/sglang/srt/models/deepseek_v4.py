@@ -218,16 +218,33 @@ def _dsv4_tp_all_gather_rows(x: torch.Tensor) -> torch.Tensor:
 
 
 def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
-    """Sum TP partials and retain the rank-owned first-dimension token shard."""
+    """Sum TP partials and retain the rank-owned first-dimension token shard.
+
+    The default uses ReduceScatter. The diagnostic preserve-AR mode uses the
+    stock AllReduce reduction order before slicing rows, which separates model
+    topology correctness from BF16 collective-order drift.
+    """
     tp_group = get_tp_group()
     if x.shape[0] % tp_group.world_size != 0:
         raise RuntimeError(
             "DSV4 TP-scattered output requires token rows divisible by TP: "
             f"rows={x.shape[0]} tp={tp_group.world_size}"
         )
+    if envs.SGLANG_DSV4_TP_SCATTER_PRESERVE_AR.get():
+        full = tp_group.all_reduce(x.contiguous())
+        rows = full.shape[0] // tp_group.world_size
+        return full.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
     output = x.new_empty((x.shape[0] // tp_group.world_size, *x.shape[1:]))
     tp_group.reduce_scatter_tensor(output, x.contiguous())
     return output
+
+
+def _dsv4_tp_scatter_collective_name() -> str:
+    return (
+        "AllReduce+row-slice"
+        if envs.SGLANG_DSV4_TP_SCATTER_PRESERVE_AR.get()
+        else "ReduceScatter"
+    )
 
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -1410,7 +1427,7 @@ class MQALayer(MqaAttentionBase):
             o = _dsv4_tp_reduce_scatter_rows(o)
             _dsv4_tp_scatter_log_once(
                 "wo_b_rs",
-                "wo_b local FP8 GEMM -> TP reduce-scatter engaged",
+                f"wo_b local FP8 GEMM -> {_dsv4_tp_scatter_collective_name()} engaged",
             )
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
@@ -2014,7 +2031,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + _shared_local
             _dsv4_tp_scatter_log_once(
                 "moe_rs",
-                "TP MoE partial output -> TP reduce-scatter engaged",
+                "TP MoE partial output -> "
+                f"{_dsv4_tp_scatter_collective_name()} engaged",
             )
         elif _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -2541,7 +2559,8 @@ class DeepseekV4Model(nn.Module):
             hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
             _dsv4_tp_scatter_log_once(
                 "model_input",
-                "reduced vocab-parallel embedding into TP-owned token rows",
+                "reduced vocab-parallel embedding into TP-owned token rows via "
+                f"{_dsv4_tp_scatter_collective_name()}",
             )
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.

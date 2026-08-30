@@ -1182,6 +1182,10 @@ class Envs:
     # model entrance. Decode, speculative verification, PP, and non-divisible
     # token batches remain on the stock full-token path.
     SGLANG_DSV4_TP_INPUT_SCATTERED = EnvBool(False)
+    # Diagnostic/numeric-preserving variant: retain the stock TP AllReduce
+    # reduction order, then keep only this rank's token rows. This adds an
+    # AllGather before each full-token consumer and is not assumed faster.
+    SGLANG_DSV4_TP_SCATTER_PRESERVE_AR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
