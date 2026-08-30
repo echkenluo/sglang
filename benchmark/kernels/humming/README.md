@@ -61,15 +61,16 @@ CUDA_VISIBLE_DEVICES=0 python benchmark/kernels/humming/tune_humming_moe.py \
   --out /path/to/tuning-result.json
 ```
 
-Candidate count zero tests the complete shape-specific set; a positive value
-is only a smoke-test cap.  Do not treat the piecewise production dispatch table
-as a cross-shape candidate pool: entries outside their M interval are not
-guaranteed to be safe.  The deployed mixed Humming wheel identifies itself as
-v0.1.10 but includes later H20 logic and does not ship a matching legal tuning
-sampler.  A benchmark-local v0.1.12 sampler compatibility copy remains for
-source comparison, but it is not a formal candidate source because it can
-generate geometries that compile and then fault in this runtime.  The screen
-precompiles candidates,
+For W13, candidate count zero tests the complete deterministic set returned by
+the official Humming 0.1.12 test sampler (target 100, possibly larger when its
+pairwise-coverage seed requires it) plus the exact-shape heuristic; a positive
+value is only a smoke-test cap.  The tool fails closed if
+the installed Humming version is not exactly 0.1.12, so candidate enumeration
+and kernel construction cannot silently cross releases.  Do not treat the
+piecewise production dispatch table as a cross-shape candidate pool: entries
+outside their M interval are not guaranteed to be safe.  The benchmark-local
+sampler compatibility copy remains only as historical source comparison and is
+not used by formal W13 runs.  The screen precompiles candidates,
 requires every output element to pass Humming's MoE numerical gate
 (`rtol=0.01`, `atol=0.2`), records scale-aware aggregate errors, times candidate
 order in randomized rounds over multiple real layer routes, and invalidates the
@@ -88,13 +89,12 @@ the production-table tail issue: Humming's table is generated only through
 roughly 65K routed rows, whereas a 32K-token, top-k 6 prefill chunk has routed M
 196608.
 
-For W13, the tool preserves the installed H20 heuristic's block/warp and
-transfer geometry at the exact routed shape.  It sweeps a bounded scheduling
-surface: three or the heuristic stage count, one or the heuristic CTA count per
-SM, and stream-K on/off at the heuristic `num_sms`.  W13 stream-K uses the grid
-in its reduction partitioning, so changing `num_sms` is not treated as the
-bit-equivalent launch-only axis observed in the W2 small-K path.  This is a
-version-safe schedule screen, not an exhaustive block/warp geometry search.
+For W13, the formal path uses Humming 0.1.12's own resource-filtered,
+pairwise-covering sampler against the 0.1.12 kernel constructor.  It therefore
+explores legal block/warp, transfer and scheduling combinations rather than
+only the old eight-config schedule surface.  Every sampled candidate remains
+subject to precompile, full-output correctness and fail-closed route gates; a
+sampler-issued config is not assumed correct merely because it compiled.
 
 ## Cold-prefill service leg
 

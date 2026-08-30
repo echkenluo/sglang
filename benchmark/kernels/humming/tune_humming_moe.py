@@ -33,12 +33,13 @@ from humming.tune import get_heuristics_config
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 BIG_M = 1 << 40
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 DEFAULT_RTOL = 0.01
 # Match Humming's MoE kernel tests.  The generic KernelTestCase default (0.05)
 # is too strict for alternate FP8 MoE accumulation schedules even when their
 # aggregate numerical error is negligible.
 DEFAULT_ATOL = 0.2
+FORMAL_W13_HUMMING_VERSION = "0.1.12"
 
 
 class StubMoeLayer(torch.nn.Module):
@@ -83,6 +84,31 @@ def cap_candidate_configs(configs: list[dict], candidate_count: int) -> list[dic
     if candidate_count < 0:
         raise ValueError("candidate count must be non-negative")
     return configs if candidate_count == 0 else configs[:candidate_count]
+
+
+def require_formal_w13_humming_version(version: str | None = None) -> str:
+    """Fail closed unless W13 enumeration and kernel construction match."""
+    actual = humming.__version__ if version is None else version
+    if actual != FORMAL_W13_HUMMING_VERSION:
+        raise RuntimeError(
+            "formal W13 tuning requires official Humming "
+            f"{FORMAL_W13_HUMMING_VERSION}; found {actual}"
+        )
+    return actual
+
+
+def formal_w13_sampler_receipt() -> dict[str, str]:
+    """Record the exact official sampler source used by a formal W13 run."""
+    version = require_formal_w13_humming_version()
+    from humming.testing import tuning
+
+    source_path = Path(tuning.__file__).resolve()
+    return {
+        "humming_version": version,
+        "module": tuning.__name__,
+        "source_path": str(source_path),
+        "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+    }
 
 
 def choose_representative_points(points: list[dict], count: int) -> list[dict]:
@@ -387,18 +413,25 @@ def build_candidates(
         )
         return heuristic, candidates, "shape_specific_w2_persistent_grid"
 
-    # The production ladder is a piecewise dispatch table.  Configs from a
-    # different M interval are not guaranteed to be safe at this shape.  The
-    # deployed mixed wheel also lacks its own legal sampler; the v0.1.12 test
-    # sampler can emit geometries that compile but fault in this runtime.
-    # Preserve the installed exact-shape heuristic geometry and sweep only the
-    # bounded scheduling surface described in ``w13_schedule_grid``.
-    schedule_grid = w13_schedule_grid(heuristic)
+    # W13 geometry tuning is legal only when the candidate enumerator and
+    # kernel constructor come from the same official Humming release.  Keep the
+    # old exact-shape schedule grid for historical comparison, but do not use it
+    # as the formal source after upgrading the runtime to 0.1.12.
+    require_formal_w13_humming_version()
+    from humming.testing.tuning import sample_test_tuning_configs
+
+    compute = ComputeConfig(use_f16_accum=False, gemm_type=GemmType.INDEXED)
+    sampled = sample_test_tuning_configs(
+        layer.humming_metas[sublayer],
+        compute,
+    )
     candidates = cap_candidate_configs(
-        deduplicate_configs([heuristic, *schedule_grid]),
+        deduplicate_configs(
+            [heuristic, *(normalize_sampled_config(config) for config in sampled)]
+        ),
         candidate_count,
     )
-    return heuristic, candidates, "exact_shape_w13_schedule_grid"
+    return heuristic, candidates, "official_humming_0.1.12_sampler"
 
 
 def precompile_candidate(layer, sublayer: str, config: dict) -> None:
@@ -776,7 +809,7 @@ def parse_args() -> argparse.Namespace:
         "--candidate-count",
         type=int,
         default=0,
-        help="0 tests the complete shape-specific candidate set",
+        help="0 tests the full W2 grid or full official W13 sample",
     )
     parser.add_argument("--route-samples", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=5)
@@ -799,6 +832,8 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("Humming tuning requires a CUDA GPU")
     torch.cuda.set_device(0)
+    sublayers = ("w13", "w2") if args.sublayer == "both" else (args.sublayer,)
+    w13_sampler = formal_w13_sampler_receipt() if "w13" in sublayers else None
     capture, routed, points, shape_m = load_capture(
         args.capture_manifest, args.shape_m, args.route_samples
     )
@@ -808,7 +843,6 @@ def main() -> None:
     route_tensors = [
         extract_topk_ids(routed, capture["raw_shape"], point) for point in points
     ]
-    sublayers = ("w13", "w2") if args.sublayer == "both" else (args.sublayer,)
     result = {
         "format_version": FORMAT_VERSION,
         "state": "RUNNING",
@@ -839,6 +873,8 @@ def main() -> None:
         },
         "sublayers": {},
     }
+    if w13_sampler is not None:
+        result["w13_sampler"] = w13_sampler
     selected_w13_config = None
     for sublayer in sublayers:
         result["sublayers"][sublayer] = tune_sublayer(
