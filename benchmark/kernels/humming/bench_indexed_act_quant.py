@@ -97,7 +97,6 @@ def benchmark_shape(
             dtype="float8e4m3",
             outputs=baseline_q,
             group_size=None,
-            scale_dtype="float32",
         )
 
     def baseline_fn():
