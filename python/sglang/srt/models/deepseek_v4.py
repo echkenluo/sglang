@@ -382,6 +382,9 @@ def _dsv4_tp_fp8_a2a_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     packed[:, :hidden] = x_q.view(torch.uint8)
     packed[:, hidden:] = x_s.view(torch.uint8).view(rows, scale_bytes)
     received = torch.empty_like(packed)
+    # raw eager collective on the coordinator's device group: the
+    # GroupCoordinator has no all_to_all_single wrapper, and this path is
+    # prefill-only/eager by the scattered admission (CR-5 note)
     torch.distributed.all_to_all_single(received, packed, group=tp_group.device_group)
     shard = rows // world
     q_full = received.view(torch.float8_e4m3fn)[:, :hidden]
@@ -414,6 +417,12 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     """
     tp_group = get_tp_group()
     if envs.SGLANG_DSV4_TP_SCATTER_PRESERVE_AR.get():
+        if envs.SGLANG_DSV4_TP_SCATTER_FP8_RS.get():
+            _dsv4_tp_scatter_log_once(
+                "fp8_rs_conflict",
+                "SGLANG_DSV4_TP_SCATTER_PRESERVE_AR overrides FP8-RS; the "
+                "fp8 wire is INACTIVE in preserve-AR mode",
+            )
         # Numeric-preserving control: AllReduce the ORIGINAL rows first so the
         # stock message size (and thus NCCL protocol/chunking) is unchanged,
         # then zero-pad the reduced result and slice the rank-owned rows.
@@ -421,6 +430,9 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
         rows = full.shape[0] // tp_group.world_size
         return full.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
     x = _dsv4_tp_pad_rows(x)
+    # dim()==2 intentionally leaves the model-entry embedding RS on BF16:
+    # that tensor is 3D (mHC streams) and runs once per forward, vs 2x43
+    # per-layer 2D sites which carry ~all of the RS cost (CR-5).
     if (
         envs.SGLANG_DSV4_TP_SCATTER_FP8_RS.get()
         and x.dim() == 2
