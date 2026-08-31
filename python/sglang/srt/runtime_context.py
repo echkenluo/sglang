@@ -376,6 +376,10 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # Benchmark-only live selector for the indexed Humming W2 persistent grid.
+    # Zero preserves the startup tuning table exactly; nonzero values are
+    # validated by Scheduler.set_internal_state before publication.
+    humming_indexed_w2_runtime_num_sms: int = 0
 
 
 @dataclasses.dataclass

@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_flags,
     get_lora,
     get_memory,
     get_mm,
@@ -4166,6 +4167,9 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
+        ret["humming_indexed_w2_runtime_num_sms"] = (
+            get_flags().moe.humming_indexed_w2_runtime_num_sms
+        )
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
@@ -4224,6 +4228,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "humming_indexed_w2_runtime_num_sms",
             ]
         )
 
@@ -4265,6 +4270,21 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "humming_indexed_w2_runtime_num_sms":
+                if type(v) is not int or v not in (0, 4096, 5120):
+                    logging.warning(
+                        "humming_indexed_w2_runtime_num_sms must be one of "
+                        f"0, 4096, or 5120; got {v!r}."
+                    )
+                    if_success = False
+                    break
+                if not self.is_fully_idle():
+                    logging.warning(
+                        "humming_indexed_w2_runtime_num_sms can only be "
+                        "updated while the scheduler is fully idle."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -4289,6 +4309,17 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            runtime_w2_num_sms = remaining.pop(
+                "humming_indexed_w2_runtime_num_sms", None
+            )
+            if "humming_indexed_w2_runtime_num_sms" in server_args_dict:
+                get_flags().moe.humming_indexed_w2_runtime_num_sms = int(
+                    runtime_w2_num_sms
+                )
+                logger.info(
+                    "Runtime indexed Humming W2 num_sms set to %d",
+                    runtime_w2_num_sms,
+                )
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
             logger.info(f"Config updated via context override: {remaining}")

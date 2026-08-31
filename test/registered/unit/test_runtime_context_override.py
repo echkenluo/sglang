@@ -90,6 +90,12 @@ class TestContextOverride(CustomTestCase):
         self.assertEqual(rc.get_spec().speculative_accept_threshold_single, 0.5)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_acc, 0.9)
 
+    def test_humming_runtime_w2_selector_is_process_local_flag(self):
+        self._publish()
+        self.assertEqual(rc.get_flags().moe.humming_indexed_w2_runtime_num_sms, 0)
+        rc.get_flags().moe.humming_indexed_w2_runtime_num_sms = 5120
+        self.assertEqual(rc.get_flags().moe.humming_indexed_w2_runtime_num_sms, 5120)
+
     def test_kv_cache_dtype_override_reaches_get_model_not_server_args(self):
         # Load-time resolution: the resolved kv-cache dtype is written
         # to the model bag; server_args stays the RAW resolver input.

@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -43,6 +44,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_RUNTIME_W2_MIN_SHAPE_M_EXCLUSIVE = 65536
+_RUNTIME_W2_ALLOWED_NUM_SMS = frozenset((4096, 5120))
+_RUNTIME_W2_LOGGED_NUM_SMS: set[int] = set()
 
 
 try:
@@ -114,6 +119,32 @@ def apply_humming_indexed_w2_tuning_override(
             "min_shape_m_exclusive does not overlap any Humming tuning interval"
         )
     return updated_config
+
+
+def resolve_humming_indexed_w2_runtime_tuning_config(
+    base_tuning_config: list,
+    startup_override: dict | None,
+    runtime_num_sms: int,
+) -> list:
+    """Resolve the live W2 table without changing the startup baseline."""
+    if runtime_num_sms == 0:
+        return apply_humming_indexed_w2_tuning_override(
+            base_tuning_config, startup_override
+        )
+    if startup_override is not None:
+        raise ValueError(
+            "runtime Humming W2 tuning cannot be combined with "
+            "SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE"
+        )
+    if runtime_num_sms not in _RUNTIME_W2_ALLOWED_NUM_SMS:
+        raise ValueError(f"unsupported runtime Humming W2 num_sms: {runtime_num_sms}")
+    return apply_humming_indexed_w2_tuning_override(
+        base_tuning_config,
+        {
+            "min_shape_m_exclusive": _RUNTIME_W2_MIN_SHAPE_M_EXCLUSIVE,
+            "num_sms": runtime_num_sms,
+        },
+    )
 
 
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
@@ -236,13 +267,14 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=humming_gemm_type,
             sublayer_name="w13",
         )
-        w2_tuning_config = HummingMethod.get_default_tuning_configs(
+        w2_base_tuning_config = HummingMethod.get_default_tuning_configs(
             layer=self.layer,
             use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
             gemm_type=humming_gemm_type,
             sublayer_name="w2",
         )
         w2_override = envs.SGLANG_HUMMING_INDEXED_W2_TUNING_OVERRIDE.get()
+        w2_tuning_config = w2_base_tuning_config
         if w2_override is not None and humming_gemm_type == HummingGemmType.INDEXED:
             w2_tuning_config = apply_humming_indexed_w2_tuning_override(
                 w2_tuning_config, w2_override
@@ -256,7 +288,9 @@ class HummingRunnerCore(MoeRunnerCore):
         self.humming_gemm_configs[humming_gemm_type.value] = {
             "compute_config": compute_config,
             "w13_tuning_config": w13_tuning_config,
+            "w2_base_tuning_config": w2_base_tuning_config,
             "w2_tuning_config": w2_tuning_config,
+            "w2_startup_override": w2_override,
             "compute_config_str": json.dumps(compute_config),
             "w13_tuning_config_str": json.dumps(w13_tuning_config),
             "w2_tuning_config_str": json.dumps(w2_tuning_config),
@@ -623,6 +657,27 @@ class HummingRunnerCore(MoeRunnerCore):
         configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
 
+        runtime_num_sms = get_flags().moe.humming_indexed_w2_runtime_num_sms
+        if runtime_num_sms:
+            cache = configs.setdefault("runtime_w2_tuning_config_str", {})
+            if runtime_num_sms not in cache:
+                runtime_config = resolve_humming_indexed_w2_runtime_tuning_config(
+                    configs["w2_base_tuning_config"],
+                    configs["w2_startup_override"],
+                    runtime_num_sms,
+                )
+                cache[runtime_num_sms] = json.dumps(runtime_config)
+            if runtime_num_sms not in _RUNTIME_W2_LOGGED_NUM_SMS:
+                logger.info(
+                    "Using runtime indexed Humming W2 num_sms=%d for shape_m > %d",
+                    runtime_num_sms,
+                    _RUNTIME_W2_MIN_SHAPE_M_EXCLUSIVE,
+                )
+                _RUNTIME_W2_LOGGED_NUM_SMS.add(runtime_num_sms)
+            w2_tuning_config_str = cache[runtime_num_sms]
+        else:
+            w2_tuning_config_str = configs["w2_tuning_config_str"]
+
         for min_shape_m, max_shape_m, config in configs["w13_tuning_config"]:
             if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
                 moe_block_size = config["block_shape"][0]
@@ -650,7 +705,7 @@ class HummingRunnerCore(MoeRunnerCore):
             "top_k": top_k,
             "tuning_config": configs["w13_tuning_config_str"],
         }
-        moe_kwargs2 = {"top_k": 1, "tuning_config": configs["w2_tuning_config_str"]}
+        moe_kwargs2 = {"top_k": 1, "tuning_config": w2_tuning_config_str}
         moe_kwargs1.update(moe_common_kwargs)
         moe_kwargs2.update(moe_common_kwargs)
 

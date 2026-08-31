@@ -10,10 +10,10 @@ import torch
 from sglang.kernels.ops.attention.dsv4.moe import (
     silu_and_mul_masked_post_quant,
 )
+from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_quant_fp8_per_token,
 )
-from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization import humming_utils
@@ -106,6 +106,42 @@ class TestHummingTuningOverride(unittest.TestCase):
             json.loads(configs["w2_tuning_config_str"]),
             configs["w2_tuning_config"],
         )
+
+    def test_runtime_selector_preserves_baseline_and_switches_only_large_shapes(self):
+        original = [
+            [0, 65536, {"num_sms": 256}],
+            [65536, 1 << 30, {"num_sms": 2048}],
+        ]
+
+        baseline = humming_runner.resolve_humming_indexed_w2_runtime_tuning_config(
+            original, None, 0
+        )
+        candidate = humming_runner.resolve_humming_indexed_w2_runtime_tuning_config(
+            original, None, 5120
+        )
+
+        self.assertIs(baseline, original)
+        self.assertEqual(
+            candidate,
+            [
+                [0, 65536, {"num_sms": 256}],
+                [65536, 1 << 30, {"num_sms": 5120}],
+            ],
+        )
+        self.assertEqual(original[-1][-1]["num_sms"], 2048)
+
+    def test_runtime_selector_rejects_unfrozen_or_mixed_controls(self):
+        original = [[0, 1 << 30, {"num_sms": 2048}]]
+        with self.assertRaises(ValueError):
+            humming_runner.resolve_humming_indexed_w2_runtime_tuning_config(
+                original, None, 3072
+            )
+        with self.assertRaises(ValueError):
+            humming_runner.resolve_humming_indexed_w2_runtime_tuning_config(
+                original,
+                {"min_shape_m_exclusive": 65536, "num_sms": 4096},
+                5120,
+            )
 
 
 class TestHummingFp8Dispatch(CustomTestCase):
