@@ -200,6 +200,13 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 _DSV4_TP_SCATTER_LOGGED: Set[str] = set()
+# Real (unpadded) token rows of the current scattered forward. Zero-value
+# padding rows are appended before every ReduceScatter so arbitrary extend
+# batch sizes stay on the scattered path; padding rows never cross into real
+# rows because every op between collectives is row-local and every AllGather
+# narrows back to the real row count before DSA/MoE consume the tensor.
+_DSV4_TP_SCATTER_REAL_ROWS: int = 0
+_DSV4_TP_SCATTER_STATS = {"engaged": 0, "padded": 0, "fallback": 0}
 
 
 def _dsv4_tp_scatter_log_once(site: str, message: str) -> None:
@@ -209,11 +216,47 @@ def _dsv4_tp_scatter_log_once(site: str, message: str) -> None:
     logger.info("[DSV4-TP-SCATTER] %s", message)
 
 
+def _dsv4_tp_scatter_begin_forward(total_rows: int) -> None:
+    global _DSV4_TP_SCATTER_REAL_ROWS
+    _DSV4_TP_SCATTER_REAL_ROWS = total_rows
+    _DSV4_TP_SCATTER_STATS["engaged"] += 1
+    if total_rows % get_tp_group().world_size != 0:
+        _DSV4_TP_SCATTER_STATS["padded"] += 1
+    _dsv4_tp_scatter_maybe_log_stats()
+
+
+def _dsv4_tp_scatter_count_fallback() -> None:
+    _DSV4_TP_SCATTER_STATS["fallback"] += 1
+    _dsv4_tp_scatter_maybe_log_stats()
+
+
+def _dsv4_tp_scatter_maybe_log_stats() -> None:
+    # One line per extend forward: prefill forwards are sparse enough that
+    # this stays cheap, and per-phase log diffs give exact path coverage.
+    logger.info(
+        "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d",
+        _DSV4_TP_SCATTER_STATS["engaged"],
+        _DSV4_TP_SCATTER_STATS["padded"],
+        _DSV4_TP_SCATTER_STATS["fallback"],
+    )
+
+
+def _dsv4_tp_pad_rows(x: torch.Tensor) -> torch.Tensor:
+    """Append zero rows so the first dimension divides the TP world size."""
+    pad = -x.shape[0] % get_tp_group().world_size
+    if pad == 0:
+        return x
+    return torch.cat([x, x.new_zeros((pad, *x.shape[1:]))], dim=0)
+
+
 def _dsv4_tp_all_gather_rows(x: torch.Tensor) -> torch.Tensor:
-    """Gather equal first-dimension token shards over the model TP group."""
+    """Gather token shards over the model TP group, dropping padding rows."""
     tp_group = get_tp_group()
     output = x.new_empty((x.shape[0] * tp_group.world_size, *x.shape[1:]))
     tp_group.all_gather_into_tensor(output, x.contiguous())
+    real_rows = _DSV4_TP_SCATTER_REAL_ROWS
+    if 0 < real_rows < output.shape[0]:
+        output = output.narrow(0, 0, real_rows)
     return output
 
 
@@ -222,14 +265,11 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
 
     The default uses ReduceScatter. The diagnostic preserve-AR mode uses the
     stock AllReduce reduction order before slicing rows, which separates model
-    topology correctness from BF16 collective-order drift.
+    topology correctness from BF16 collective-order drift. Inputs whose row
+    count does not divide the TP world size are zero-padded first.
     """
     tp_group = get_tp_group()
-    if x.shape[0] % tp_group.world_size != 0:
-        raise RuntimeError(
-            "DSV4 TP-scattered output requires token rows divisible by TP: "
-            f"rows={x.shape[0]} tp={tp_group.world_size}"
-        )
+    x = _dsv4_tp_pad_rows(x)
     if envs.SGLANG_DSV4_TP_SCATTER_PRESERVE_AR.get():
         full = tp_group.all_reduce(x.contiguous())
         rows = full.shape[0] // tp_group.world_size
@@ -2552,6 +2592,7 @@ class DeepseekV4Model(nn.Module):
                 raise RuntimeError(
                     "DSV4 TP input-scattered does not support DSpark aux capture"
                 )
+            _dsv4_tp_scatter_begin_forward(hidden_states.shape[0])
             # VocabParallelEmbedding intentionally skips its all-reduce while
             # input_scattered is active. Its output is therefore still a TP
             # partial, not a replicated tensor. Reduce-scatter both sums the
@@ -2562,6 +2603,12 @@ class DeepseekV4Model(nn.Module):
                 "reduced vocab-parallel embedding into TP-owned token rows via "
                 f"{_dsv4_tp_scatter_collective_name()}",
             )
+        elif (
+            envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            _dsv4_tp_scatter_count_fallback()
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):

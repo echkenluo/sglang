@@ -295,15 +295,15 @@ class AttnTpContext:
                 logging.info("attn_tp_input_scattered is enabled")
 
     def use_input_scattered(self, forward_batch: ForwardBatch):
+        # DSA no longer requires token rows divisible by TP: the DSV4
+        # scattered path zero-pads rows before each ReduceScatter and drops
+        # them after each AllGather, so arbitrary extend batches stay on the
+        # scattered path instead of silently falling back.
         return (
             self.allow_input_scattered
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.input_ids is not None
-            and (
-                not self.is_dsa
-                or forward_batch.input_ids.shape[0] % get_parallel().tp_size == 0
-            )
             and not forward_batch.can_run_tbo
         )
 
