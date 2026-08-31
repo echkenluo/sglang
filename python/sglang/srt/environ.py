@@ -1179,13 +1179,25 @@ class Envs:
     # model-specific gate on top of --enable-attn-tp-input-scattered because
     # DSV4/DSA needs explicit full-state gather points around attention and
     # MoE. The vocab-parallel embedding is reduced and token-scattered at the
-    # model entrance. Decode, speculative verification, PP, and non-divisible
-    # token batches remain on the stock full-token path.
+    # model entrance. Arbitrary extend row counts are admitted via zero-row
+    # padding; decode, target-verify, TBO, PP>1, and DSpark capture remain on
+    # the stock full-token path.
     SGLANG_DSV4_TP_INPUT_SCATTERED = EnvBool(False)
     # Diagnostic/numeric-preserving variant: retain the stock TP AllReduce
     # reduction order, then keep only this rank's token rows. This adds an
     # AllGather before each full-token consumer and is not assumed faster.
     SGLANG_DSV4_TP_SCATTER_PRESERVE_AR = EnvBool(False)
+    # FP8-quantized AllGather for the DSV4 TP-scattered hidden gathers (port
+    # of the 240b8a8345 FP8-AG v2 packed wire format). AG moves final values,
+    # not partial sums, so quantize-transfer-dequantize is numerically bounded
+    # by one activation-quant round trip; wire bytes are roughly halved.
+    SGLANG_DSV4_TP_SCATTER_FP8_AG = EnvBool(False)
+    # Which scattered gather sites quantize: all | attn | moe. The final
+    # head gather always stays BF16.
+    SGLANG_DSV4_FP8_AG_SITE = EnvStr("all")
+    # Below this gathered-token count the BF16 gather is kept (packing
+    # overhead beats the byte saving at small M; micro gate calibrates this).
+    SGLANG_DSV4_FP8_AG_MIN_TOKENS = EnvInt(1024)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

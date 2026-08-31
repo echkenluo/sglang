@@ -21,6 +21,8 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.kernels.ops.attention.dsv4 import (
@@ -206,7 +208,13 @@ _DSV4_TP_SCATTER_LOGGED: Set[str] = set()
 # rows because every op between collectives is row-local and every AllGather
 # narrows back to the real row count before DSA/MoE consume the tensor.
 _DSV4_TP_SCATTER_REAL_ROWS: int = 0
-_DSV4_TP_SCATTER_STATS = {"engaged": 0, "padded": 0, "fallback": 0}
+_DSV4_TP_SCATTER_STATS = {
+    "engaged": 0,
+    "padded": 0,
+    "fallback": 0,
+    "fp8_ag_attn": 0,
+    "fp8_ag_moe": 0,
+}
 
 
 def _dsv4_tp_scatter_log_once(site: str, message: str) -> None:
@@ -231,13 +239,19 @@ def _dsv4_tp_scatter_count_fallback() -> None:
 
 
 def _dsv4_tp_scatter_maybe_log_stats() -> None:
-    # One line per extend forward: prefill forwards are sparse enough that
-    # this stays cheap, and per-phase log diffs give exact path coverage.
+    # One line per extend forward, from TP rank 0 only so the docker log has a
+    # single monotonic counter stream; per-phase log diffs give exact path
+    # coverage.
+    if get_tp_group().rank_in_group != 0:
+        return
     logger.info(
-        "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d",
+        "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d "
+        "fp8_ag_attn=%d fp8_ag_moe=%d",
         _DSV4_TP_SCATTER_STATS["engaged"],
         _DSV4_TP_SCATTER_STATS["padded"],
         _DSV4_TP_SCATTER_STATS["fallback"],
+        _DSV4_TP_SCATTER_STATS["fp8_ag_attn"],
+        _DSV4_TP_SCATTER_STATS["fp8_ag_moe"],
     )
 
 
@@ -249,13 +263,100 @@ def _dsv4_tp_pad_rows(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([x, x.new_zeros((pad, *x.shape[1:]))], dim=0)
 
 
-def _dsv4_tp_all_gather_rows(x: torch.Tensor) -> torch.Tensor:
+_DSV4_FP8_AG_GROUP_SIZE = 128
+
+
+@triton.jit
+def _dsv4_fp8_ag_dequant_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    q_row_stride,
+    s_row_stride,
+    out_row_stride,
+    GROUP: tl.constexpr,
+):
+    t = tl.program_id(0)
+    g = tl.program_id(1)
+    offs = g * GROUP + tl.arange(0, GROUP)
+    q = tl.load(q_ptr + t * q_row_stride + offs).to(tl.float32)
+    s = tl.load(s_ptr + t * s_row_stride + g)
+    tl.store(out_ptr + t * out_row_stride + offs, q * s)
+
+
+def _dsv4_tp_fp8_packed_all_gather(
+    x: torch.Tensor, total_rows: int, real_rows: int
+) -> torch.Tensor:
+    """FP8-AG v2 wire format: quantize local rows per token-group, pack the
+    fp8 payload and fp32 scales into one byte row per token, gather once as
+    uint8 (NCCL has no fp8 dtype; the gather is broadcast-only so a byte view
+    is safe), then dequantize into the bf16 output. Zero padding rows quantize
+    to (q=0, s=eps) and dequantize back to exact zeros."""
+    hidden = x.shape[-1]
+    group = _DSV4_FP8_AG_GROUP_SIZE
+    scale_bytes = (hidden // group) * 4
+    row_bytes = hidden + scale_bytes
+    x_q, x_s = sglang_per_token_group_quant_fp8(x.contiguous(), group)
+    local_rows = x_q.shape[0]
+    packed = torch.empty((local_rows, row_bytes), dtype=torch.uint8, device=x.device)
+    packed[:, :hidden] = x_q.view(torch.uint8)
+    packed[:, hidden:] = x_s.view(torch.uint8).view(local_rows, scale_bytes)
+    packed_full = torch.empty(
+        (total_rows, row_bytes), dtype=torch.uint8, device=x.device
+    )
+    get_tp_group().all_gather_into_tensor(packed_full, packed)
+    q_full = packed_full.view(torch.float8_e4m3fn)[:, :hidden]
+    s_full = (
+        packed_full[:, hidden:]
+        .contiguous()
+        .view(torch.float32)
+        .view(total_rows, hidden // group)
+    )
+    # The collective must cover the padded rows, but padding rows are dropped
+    # by the caller anyway -- dequantize only the real rows.
+    output = torch.empty((real_rows, hidden), dtype=x.dtype, device=x.device)
+    _dsv4_fp8_ag_dequant_kernel[(real_rows, hidden // group)](
+        q_full,
+        s_full,
+        output,
+        packed_full.stride(0),
+        s_full.stride(0),
+        output.stride(0),
+        GROUP=group,
+    )
+    return output
+
+
+def _dsv4_tp_all_gather_rows(x: torch.Tensor, site: str = "other") -> torch.Tensor:
     """Gather token shards over the model TP group, dropping padding rows."""
     tp_group = get_tp_group()
-    output = x.new_empty((x.shape[0] * tp_group.world_size, *x.shape[1:]))
-    tp_group.all_gather_into_tensor(output, x.contiguous())
+    total_rows = x.shape[0] * tp_group.world_size
     real_rows = _DSV4_TP_SCATTER_REAL_ROWS
-    if 0 < real_rows < output.shape[0]:
+    if not 0 < real_rows <= total_rows or total_rows - real_rows >= tp_group.world_size:
+        raise RuntimeError(
+            "DSV4 TP-scattered gather invariant violated: "
+            f"real={real_rows} padded_total={total_rows} tp={tp_group.world_size}"
+        )
+    ag_site = envs.SGLANG_DSV4_FP8_AG_SITE.get()
+    if (
+        envs.SGLANG_DSV4_TP_SCATTER_FP8_AG.get()
+        and site in ("attn", "moe")
+        and (ag_site == "all" or ag_site == site)
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and x.shape[-1] % _DSV4_FP8_AG_GROUP_SIZE == 0
+        and total_rows >= envs.SGLANG_DSV4_FP8_AG_MIN_TOKENS.get()
+    ):
+        output = _dsv4_tp_fp8_packed_all_gather(x, total_rows, real_rows)
+        _DSV4_TP_SCATTER_STATS[f"fp8_ag_{site}"] += 1
+        _dsv4_tp_scatter_log_once(
+            f"fp8_ag_{site}", f"FP8 packed AllGather engaged at the {site} site"
+        )
+        return output
+    output = x.new_empty((total_rows, *x.shape[1:]))
+    tp_group.all_gather_into_tensor(output, x.contiguous())
+    if real_rows < output.shape[0]:
         output = output.narrow(0, 0, real_rows)
     return output
 
@@ -269,11 +370,14 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     count does not divide the TP world size are zero-padded first.
     """
     tp_group = get_tp_group()
-    x = _dsv4_tp_pad_rows(x)
     if envs.SGLANG_DSV4_TP_SCATTER_PRESERVE_AR.get():
-        full = tp_group.all_reduce(x.contiguous())
+        # Numeric-preserving control: AllReduce the ORIGINAL rows first so the
+        # stock message size (and thus NCCL protocol/chunking) is unchanged,
+        # then zero-pad the reduced result and slice the rank-owned rows.
+        full = _dsv4_tp_pad_rows(tp_group.all_reduce(x.contiguous()))
         rows = full.shape[0] // tp_group.world_size
         return full.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
+    x = _dsv4_tp_pad_rows(x)
     output = x.new_empty((x.shape[0] // tp_group.world_size, *x.shape[1:]))
     tp_group.reduce_scatter_tensor(output, x.contiguous())
     return output
@@ -1858,7 +1962,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant = None
 
         if get_attn_tp_context().input_scattered:
-            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+            hidden_states = _dsv4_tp_all_gather_rows(hidden_states, site="attn")
             # The pre-gather quantized activation covers only the local token
             # shard. Let the attention path quantize the gathered full tensor.
             x_quant = None
@@ -2024,7 +2128,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_tp_input_scattered:
             if _do_shared_local and hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(hidden_states)
-            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+            hidden_states = _dsv4_tp_all_gather_rows(hidden_states, site="moe")
             _dsv4_tp_scatter_log_once(
                 "moe_ag",
                 "gathered TP token shards before TP MoE",
