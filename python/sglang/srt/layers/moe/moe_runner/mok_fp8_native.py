@@ -52,6 +52,38 @@ def _note_path_hit(path: str, *, mode: str, num_tokens: Optional[int]):
     return None
 
 
+def _note_shape_trace(
+    *,
+    layer_id,
+    rank: int,
+    mode: str,
+    num_tokens: int,
+    padded_tokens: int,
+    capacity_factor: int,
+) -> Optional[str]:
+    """Emit exact layer-0 ExpertLane shapes for offline bucket tuning.
+
+    The trace is deliberately opt-in and limited to the first routed layer so
+    one model forward contributes one record instead of one record per layer.
+    Keeping both the real and admitted token counts makes the workspace-reuse
+    benefit and padding tax independently measurable from a service log.
+    """
+    if (
+        not envs.SGLANG_OPT_MOK_SHAPE_TRACE.get()
+        or layer_id != 0
+        or rank != 0
+    ):
+        return None
+    line = (
+        "MOK_SHAPE_TRACE "
+        f"rank={rank} mode={mode} tokens={num_tokens} "
+        f"padded_tokens={padded_tokens} "
+        f"capacity_factor={capacity_factor}"
+    )
+    logger.info(line)
+    return line
+
+
 _TRAP_WATCHDOG_LOCK = threading.Lock()
 _TRAP_WATCHDOG_ENTRIES: list = []
 _TRAP_WATCHDOG_STARTED = False
@@ -858,6 +890,15 @@ def maybe_run_mok_fp8_native(
         mode="extend" if get_is_extend_in_batch() else "decode",
         num_tokens=num_tokens,
     )
+    if envs.SGLANG_OPT_MOK_SHAPE_TRACE.get():
+        _note_shape_trace(
+            layer_id=layer.layer_id,
+            rank=dist.get_rank(group),
+            mode="extend" if get_is_extend_in_batch() else "decode",
+            num_tokens=num_tokens,
+            padded_tokens=padded_tokens,
+            capacity_factor=capacity_factor,
+        )
 
     use_graph = (
         envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()

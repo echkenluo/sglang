@@ -266,6 +266,63 @@ class TestMoKSplitContract(unittest.TestCase):
             mok_fp8_native._HIT_COUNTS[("warp_masked", "decode", "na")], 1
         )
 
+    def test_shape_trace_records_only_layer_zero(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        with envs.SGLANG_OPT_MOK_SHAPE_TRACE.override(True):
+            line = mok_fp8_native._note_shape_trace(
+                layer_id=0,
+                rank=0,
+                mode="extend",
+                num_tokens=1281,
+                padded_tokens=2048,
+                capacity_factor=5,
+            )
+            skipped = mok_fp8_native._note_shape_trace(
+                layer_id=1,
+                rank=0,
+                mode="extend",
+                num_tokens=1281,
+                padded_tokens=2048,
+                capacity_factor=5,
+            )
+        self.assertEqual(
+            line,
+            "MOK_SHAPE_TRACE rank=0 mode=extend tokens=1281 "
+            "padded_tokens=2048 capacity_factor=5",
+        )
+        self.assertIsNone(skipped)
+
+    def test_shape_trace_skips_nonzero_rank(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        with envs.SGLANG_OPT_MOK_SHAPE_TRACE.override(True):
+            self.assertIsNone(
+                mok_fp8_native._note_shape_trace(
+                    layer_id=0,
+                    rank=1,
+                    mode="extend",
+                    num_tokens=1281,
+                    padded_tokens=2048,
+                    capacity_factor=5,
+                )
+            )
+
+    def test_shape_trace_disabled_is_noop(self):
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native
+
+        self.assertIsNone(
+            mok_fp8_native._note_shape_trace(
+                layer_id=0,
+                rank=0,
+                mode="extend",
+                num_tokens=1281,
+                padded_tokens=2048,
+                capacity_factor=5,
+            )
+        )
+        self.assertFalse(envs.SGLANG_OPT_MOK_SHAPE_TRACE.default)
+
     def test_runtime_contract_tolerates_interleave_flag_on_split_checkpoints(self):
         # V4 loads separate w1/w3 shards: _load_w13 places [gate; up] halves
         # unconditionally, and the deepgemm silu stage consumes halves, so a
