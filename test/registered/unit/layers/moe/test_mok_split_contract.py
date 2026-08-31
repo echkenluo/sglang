@@ -77,6 +77,7 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertEqual(envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.default, 16384)
         self.assertEqual(envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.default, 6)
         self.assertEqual(envs.SGLANG_OPT_MOK_PREFILL_BUCKETS.default, ())
+        self.assertFalse(envs.SGLANG_OPT_MOK_SCHEDULE_TRACE.default)
 
     def _gate_call(self, tokens, extend, min_tokens):
         from unittest import mock
@@ -255,6 +256,66 @@ class TestMoKSplitContract(unittest.TestCase):
         for buckets in (("1024", "768"), ("1000",), ("x",)):
             with self.subTest(buckets=buckets), self.assertRaises(ValueError):
                 _parse_prefill_buckets(buckets)
+
+    def test_schedule_trace_record_separates_route_padding_and_capacity(self):
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+            _format_schedule_trace,
+        )
+
+        line = _format_schedule_trace(
+            layer_id=7,
+            rank=2,
+            mode="extend",
+            num_tokens=1044,
+            padded_tokens=2048,
+            topk=8,
+            raw_route_rows=4097,
+            scheduled_rows=6144,
+            schedule_capacity=81920,
+            expert_padding=64,
+        )
+        self.assertIn("layer=7 rank=2 mode=extend", line)
+        self.assertIn("padded_tokens=2048 topk=8", line)
+        self.assertIn("raw_route_rows=4097 scheduled_rows=6144", line)
+        self.assertIn("schedule_capacity=81920 expert_padding=64", line)
+        self.assertIn(
+            "raw_route_rows=0 scheduled_rows=0",
+            _format_schedule_trace(
+                layer_id=7,
+                rank=2,
+                mode="extend",
+                num_tokens=1044,
+                padded_tokens=2048,
+                topk=8,
+                raw_route_rows=0,
+                scheduled_rows=0,
+                schedule_capacity=81920,
+                expert_padding=64,
+            ),
+        )
+
+        invalid = (
+            {"num_tokens": 2049},
+            {"raw_route_rows": 6145},
+            {"scheduled_rows": 81921},
+            {"scheduled_rows": 6145},
+            {"topk": 0},
+        )
+        base = dict(
+            layer_id=7,
+            rank=2,
+            mode="extend",
+            num_tokens=1044,
+            padded_tokens=2048,
+            topk=8,
+            raw_route_rows=4097,
+            scheduled_rows=6144,
+            schedule_capacity=81920,
+            expert_padding=64,
+        )
+        for override in invalid:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                _format_schedule_trace(**(base | override))
 
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
         from unittest import mock

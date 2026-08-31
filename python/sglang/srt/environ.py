@@ -1242,6 +1242,9 @@ class Envs:
     # Opt-in profiling trace for ExpertLane bucket tuning.  Emit one exact
     # shape record per model forward (layer 0 only); disabled in production.
     SGLANG_OPT_MOK_SHAPE_TRACE = EnvBool(False)
+    # Trace-only ExpertLane schedule accounting.  Synchronizes each routed
+    # layer to report raw routes, M64-padded rows, and reserved capacity.
+    SGLANG_OPT_MOK_SCHEDULE_TRACE = EnvBool(False)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
 
     # TopK

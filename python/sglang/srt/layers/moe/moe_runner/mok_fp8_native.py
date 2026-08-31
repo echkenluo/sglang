@@ -85,6 +85,86 @@ def _note_shape_trace(
     return line
 
 
+def _format_schedule_trace(
+    *,
+    layer_id,
+    rank: int,
+    mode: str,
+    num_tokens: int,
+    padded_tokens: int,
+    topk: int,
+    raw_route_rows: int,
+    scheduled_rows: int,
+    schedule_capacity: int,
+    expert_padding: int,
+) -> str:
+    """Format validated schedule accounting for an offline trace."""
+    if min(num_tokens, padded_tokens, topk, schedule_capacity, expert_padding) <= 0:
+        raise ValueError("MoK schedule trace geometry must be positive")
+    if raw_route_rows < 0 or scheduled_rows < 0:
+        raise ValueError("MoK schedule trace row counts must be non-negative")
+    if num_tokens > padded_tokens:
+        raise ValueError("MoK schedule trace tokens exceed padded tokens")
+    if raw_route_rows > scheduled_rows:
+        raise ValueError("MoK raw route rows exceed scheduled rows")
+    if scheduled_rows > schedule_capacity:
+        raise ValueError("MoK scheduled rows exceed reserved capacity")
+    if scheduled_rows % expert_padding:
+        raise ValueError("MoK scheduled rows violate expert padding")
+    return (
+        "MOK_SCHEDULE_TRACE "
+        f"layer={layer_id} rank={rank} mode={mode} "
+        f"tokens={num_tokens} padded_tokens={padded_tokens} topk={topk} "
+        f"raw_route_rows={raw_route_rows} scheduled_rows={scheduled_rows} "
+        f"schedule_capacity={schedule_capacity} "
+        f"expert_padding={expert_padding}"
+    )
+
+
+def _note_schedule_trace(
+    *,
+    layer,
+    group,
+    workspace,
+    mode: str,
+    num_tokens: int,
+    padded_tokens: int,
+) -> Optional[str]:
+    """Synchronously expose real-vs-padded schedule rows for trace runs.
+
+    This deliberately performs GPU reductions and host reads once per routed
+    layer.  It is never enabled in a performance run.  The workspace's
+    all-gather buffer already contains every EP rank's route IDs, including
+    the ``-1`` token-bucket padding, so no extra collective is needed.
+    """
+    if not envs.SGLANG_OPT_MOK_SCHEDULE_TRACE.get():
+        return None
+    rank = dist.get_rank(group)
+    first_expert = rank * layer.num_local_experts
+    last_expert = first_expert + layer.num_local_experts
+    gathered_ids = workspace.all_gather_top_experts_buffer
+    raw_route_rows = int(
+        ((gathered_ids >= first_expert) & (gathered_ids < last_expert))
+        .sum()
+        .item()
+    )
+    scheduled_rows = int(workspace.schedule_num_tokens.item())
+    line = _format_schedule_trace(
+        layer_id=layer.layer_id,
+        rank=rank,
+        mode=mode,
+        num_tokens=num_tokens,
+        padded_tokens=padded_tokens,
+        topk=workspace.topk,
+        raw_route_rows=raw_route_rows,
+        scheduled_rows=scheduled_rows,
+        schedule_capacity=workspace.schedule_capacity,
+        expert_padding=_ROUTE_EXPERT_PADDING,
+    )
+    logger.info(line)
+    return line
+
+
 _TRAP_WATCHDOG_LOCK = threading.Lock()
 _TRAP_WATCHDOG_ENTRIES: list = []
 _TRAP_WATCHDOG_STARTED = False
@@ -965,6 +1045,14 @@ def maybe_run_mok_fp8_native(
                 entry.in_weights[num_tokens:].zero_()
             try:
                 entry.graph.replay()
+                _note_schedule_trace(
+                    layer=layer,
+                    group=group,
+                    workspace=workspace,
+                    mode="extend" if is_extend else "decode",
+                    num_tokens=num_tokens,
+                    padded_tokens=padded_tokens,
+                )
                 # Graphs record the acquire but not the release, and entry.out
                 # aliases workspace.output. Force a new-storage copy before
                 # releasing outside the graph.
@@ -1007,6 +1095,14 @@ def maybe_run_mok_fp8_native(
             padded_hidden,
             padded_topk_ids,
             padded_topk_weights,
+        )
+        _note_schedule_trace(
+            layer=layer,
+            group=group,
+            workspace=workspace,
+            mode="extend" if is_extend else "decode",
+            num_tokens=num_tokens,
+            padded_tokens=padded_tokens,
         )
         # The result lives in workspace.output and .contiguous() on a
         # contiguous slice is a no-op alias. Force a new-storage copy, then
