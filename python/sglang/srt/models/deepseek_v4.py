@@ -230,7 +230,8 @@ def _dsv4_tp_scatter_begin_forward(total_rows: int) -> None:
     _DSV4_TP_SCATTER_STATS["engaged"] += 1
     if total_rows % get_tp_group().world_size != 0:
         _DSV4_TP_SCATTER_STATS["padded"] += 1
-    _dsv4_tp_scatter_maybe_log_stats()
+    # Stats are logged at the model-output gather (forward end) so the line
+    # already includes this forward's FP8 site counters (CR-3 blocker).
 
 
 def _dsv4_tp_scatter_count_fallback() -> None:
@@ -2779,6 +2780,7 @@ class DeepseekV4Model(nn.Module):
                 "model_output",
                 "restored full token rows before the DSV4 head",
             )
+            _dsv4_tp_scatter_maybe_log_stats()
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
