@@ -96,6 +96,47 @@ only the old eight-config schedule surface.  Every sampled candidate remains
 subject to precompile, full-output correctness and fail-closed route gates; a
 sampler-issued config is not assumed correct merely because it compiled.
 
+### Production W13 correctness filter
+
+The production-tuner workflow treats compile or numerical failures as recorded
+candidate rejections instead of invalidating the entire sampler universe.  It
+is opt-in: the historical default remains fail-closed.  Freeze five
+representative routes, use positions 0/2/4 as train routes and positions 1/3
+as heldout routes, then distribute only the train correctness screen:
+
+```bash
+for shard in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES="$shard" python benchmark/kernels/humming/tune_humming_moe.py \
+    --model-config /path/to/model/config.json \
+    --capture-manifest /path/to/capture/manifest.json \
+    --sublayer w13 --expected-humming-version 0.1.13 \
+    --route-samples 5 --route-split train \
+    --candidate-shard-count 4 --candidate-shard-index "$shard" \
+    --candidate-rejection-policy filter --correctness-only \
+    --out "/path/to/screen-$shard.json" &
+done
+wait
+```
+
+Every shard repeats the heuristic reference; non-heuristic candidates are
+assigned exactly once by deterministic sampler order modulo shard count.  The
+merger rejects missing, overlapping or contract-mismatched shards and emits an
+ordered survivor-ID file:
+
+```bash
+python benchmark/kernels/humming/merge_humming_w13_screens.py \
+  --screen /path/to/screen-0.json --screen /path/to/screen-1.json \
+  --screen /path/to/screen-2.json --screen /path/to/screen-3.json \
+  --out /path/to/survivors.json
+```
+
+Time all survivors on one GPU with `--candidate-ids-file` and the train split;
+different GPUs must not time disjoint candidates because device-to-device
+variation would bias selection.  Only a preregistered train winner is then run
+against the heldout split.  Candidate rejection, train selection and heldout
+validation are separate result states; none is a service-level deployment
+result.
+
 To isolate a whole-Humming runtime upgrade without changing the selected W13
 schedule, use `--w13-candidate-source heuristic-only` together with an explicit
 `--expected-humming-version`.  This mode tests exactly one candidate: the

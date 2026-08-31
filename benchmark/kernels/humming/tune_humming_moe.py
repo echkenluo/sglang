@@ -33,7 +33,7 @@ from humming.tune import get_heuristics_config
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
 BIG_M = 1 << 40
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 DEFAULT_RTOL = 0.01
 # Match Humming's MoE kernel tests.  The generic KernelTestCase default (0.05)
 # is too strict for alternate FP8 MoE accumulation schedules even when their
@@ -87,6 +87,86 @@ def cap_candidate_configs(configs: list[dict], candidate_count: int) -> list[dic
     return configs if candidate_count == 0 else configs[:candidate_count]
 
 
+def candidate_universe_sha256(configs: list[dict]) -> str:
+    return hashlib.sha256(canonical_json(configs).encode()).hexdigest()
+
+
+def load_candidate_ids(path: Path | None) -> tuple[list[str] | None, str | None]:
+    if path is None:
+        return None, None
+    payload = path.read_bytes()
+    data = json.loads(payload)
+    ids = data.get("candidate_ids") if isinstance(data, dict) else data
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or not all(isinstance(item, str) for item in ids)
+    ):
+        raise ValueError("candidate IDs file must contain a non-empty string list")
+    if len(ids) != len(set(ids)):
+        raise ValueError("candidate IDs file contains duplicates")
+    return ids, hashlib.sha256(payload).hexdigest()
+
+
+def select_candidate_subset(
+    candidates: list[dict],
+    heuristic: dict,
+    *,
+    shard_count: int,
+    shard_index: int,
+    candidate_ids: list[str] | None,
+) -> tuple[list[dict], dict[str, Any]]:
+    """Select a deterministic correctness shard or an explicit survivor set."""
+    if shard_count <= 0:
+        raise ValueError("candidate shard count must be positive")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("candidate shard index is outside shard count")
+    if candidate_ids is not None and shard_count != 1:
+        raise ValueError("candidate IDs cannot be combined with candidate sharding")
+
+    universe_ids = [config_id(config) for config in candidates]
+    if len(universe_ids) != len(set(universe_ids)):
+        raise ValueError("candidate universe contains duplicate config IDs")
+    heuristic_id = config_id(heuristic)
+    if heuristic_id not in universe_ids:
+        raise ValueError("candidate universe does not contain the heuristic")
+
+    if candidate_ids is not None:
+        unknown = sorted(set(candidate_ids) - set(universe_ids))
+        if unknown:
+            raise ValueError(f"candidate IDs are absent from universe: {unknown}")
+        if heuristic_id not in candidate_ids:
+            raise ValueError("candidate IDs file must include the heuristic")
+        selected_ids = set(candidate_ids)
+        selected = [
+            config for config in candidates if config_id(config) in selected_ids
+        ]
+        selection = "explicit_candidate_ids"
+    else:
+        selected = [heuristic]
+        nonheuristic = [
+            config for config in candidates if config_id(config) != heuristic_id
+        ]
+        selected.extend(
+            config
+            for index, config in enumerate(nonheuristic)
+            if index % shard_count == shard_index
+        )
+        selected = deduplicate_configs(selected)
+        selection = "deterministic_modulo_shard"
+
+    receipt = {
+        "candidate_universe_count": len(candidates),
+        "candidate_universe_ids": universe_ids,
+        "candidate_universe_sha256": candidate_universe_sha256(candidates),
+        "candidate_selection": selection,
+        "candidate_shard_count": shard_count,
+        "candidate_shard_index": shard_index,
+        "selected_candidate_ids": [config_id(config) for config in selected],
+    }
+    return selected, receipt
+
+
 def require_formal_w13_humming_version(version: str | None = None) -> str:
     """Fail closed unless W13 enumeration and kernel construction match."""
     actual = humming.__version__ if version is None else version
@@ -111,9 +191,9 @@ def require_exact_humming_version(
     return actual
 
 
-def formal_w13_sampler_receipt() -> dict[str, str]:
+def formal_w13_sampler_receipt(expected_version: str) -> dict[str, str]:
     """Record the exact official sampler source used by a formal W13 run."""
-    version = require_formal_w13_humming_version()
+    version = require_exact_humming_version(expected_version)
     from humming.testing import tuning
 
     source_path = Path(tuning.__file__).resolve()
@@ -123,6 +203,18 @@ def formal_w13_sampler_receipt() -> dict[str, str]:
         "source_path": str(source_path),
         "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
     }
+
+
+def split_representative_points(points: list[dict], route_split: str) -> list[dict]:
+    """Freeze a 3/2 train/heldout split over five ordered route quantiles."""
+    if route_split == "all":
+        return points
+    if route_split not in {"train", "heldout"}:
+        raise ValueError(f"unsupported route split: {route_split}")
+    if len(points) != 5:
+        raise ValueError("train/heldout route split requires exactly five points")
+    indices = (0, 2, 4) if route_split == "train" else (1, 3)
+    return [points[index] for index in indices]
 
 
 def choose_representative_points(points: list[dict], count: int) -> list[dict]:
@@ -441,8 +533,8 @@ def build_candidates(
     # W13 geometry tuning is legal only when the candidate enumerator and
     # kernel constructor come from the same official Humming release.  Keep the
     # old exact-shape schedule grid for historical comparison, but do not use it
-    # as the formal source after upgrading the runtime to 0.1.12.
-    require_formal_w13_humming_version()
+    # as the formal source after upgrading the runtime.
+    require_exact_humming_version(expected_humming_version)
     from humming.testing.tuning import sample_test_tuning_configs
 
     compute = ComputeConfig(use_f16_accum=False, gemm_type=GemmType.INDEXED)
@@ -456,7 +548,11 @@ def build_candidates(
         ),
         candidate_count,
     )
-    return heuristic, candidates, "official_humming_0.1.12_sampler"
+    return (
+        heuristic,
+        candidates,
+        f"official_humming_{expected_humming_version}_sampler",
+    )
 
 
 def precompile_candidate(layer, sublayer: str, config: dict) -> None:
@@ -594,6 +690,11 @@ def tune_sublayer(
     w13_candidate_source: str = "official-sampler",
     expected_humming_version: str = FORMAL_W13_HUMMING_VERSION,
     w13_alignment_config: dict | None = None,
+    rejection_policy: str = "invalidate",
+    correctness_only: bool = False,
+    candidate_shard_count: int = 1,
+    candidate_shard_index: int = 0,
+    candidate_ids: list[str] | None = None,
 ) -> dict:
     heuristic, candidates, candidate_source = build_candidates(
         layer,
@@ -603,6 +704,15 @@ def tune_sublayer(
         w13_candidate_source=w13_candidate_source,
         expected_humming_version=expected_humming_version,
     )
+    candidates, selection_receipt = select_candidate_subset(
+        candidates,
+        heuristic,
+        shard_count=candidate_shard_count,
+        shard_index=candidate_shard_index,
+        candidate_ids=candidate_ids,
+    )
+    if rejection_policy not in {"invalidate", "filter"}:
+        raise ValueError(f"unsupported rejection policy: {rejection_policy}")
     result: dict[str, Any] = {
         "sublayer": sublayer,
         "shape_m": shape_m,
@@ -611,6 +721,8 @@ def tune_sublayer(
         "candidate_count": len(candidates),
         "candidate_source": candidate_source,
         "candidate_cap": candidate_count,
+        "rejection_policy": rejection_policy,
+        "correctness_only": correctness_only,
         "correctness_gate": {
             "reference": "heuristic_config_output",
             "rtol": rtol,
@@ -619,6 +731,7 @@ def tune_sublayer(
         },
         "route_points": route_points,
         "rejected": [],
+        **selection_receipt,
     }
 
     compiled = []
@@ -635,7 +748,7 @@ def tune_sublayer(
                     "error": repr(exc),
                 }
             )
-    if result["rejected"]:
+    if result["rejected"] and rejection_policy == "invalidate":
         result.update(state="INVALID_CANDIDATE_COMPILE")
         return result
     if config_id(heuristic) not in {config_id(config) for config in compiled}:
@@ -753,11 +866,25 @@ def tune_sublayer(
             if worst is None:
                 raise RuntimeError("candidate correctness checked no route contexts")
             valid.append((config, worst))
-    if result["rejected"]:
+    if result["rejected"] and rejection_policy == "invalidate":
         result.update(state="INVALID_CANDIDATE_CORRECTNESS")
         return result
     if config_id(heuristic) not in {config_id(config) for config, _ in valid}:
         result.update(state="INVALID_HEURISTIC_CORRECTNESS")
+        return result
+
+    result["valid_candidate_count"] = len(valid)
+    result["valid_candidates"] = [
+        {
+            "config_id": config_id(config),
+            "config": config,
+            "correctness": metrics,
+        }
+        for config, metrics in valid
+    ]
+    result["rejected_candidate_count"] = len(result["rejected"])
+    if correctness_only:
+        result.update(state="SCREENED")
         return result
 
     for context in contexts:
@@ -858,6 +985,18 @@ def parse_args() -> argparse.Namespace:
         help="exact wheel version required for W13 execution",
     )
     parser.add_argument("--route-samples", type=int, default=5)
+    parser.add_argument(
+        "--route-split", choices=("all", "train", "heldout"), default="all"
+    )
+    parser.add_argument("--candidate-shard-count", type=int, default=1)
+    parser.add_argument("--candidate-shard-index", type=int, default=0)
+    parser.add_argument("--candidate-ids-file", type=Path)
+    parser.add_argument(
+        "--candidate-rejection-policy",
+        choices=("invalidate", "filter"),
+        default="invalidate",
+    )
+    parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
@@ -883,12 +1022,16 @@ def main() -> None:
         require_exact_humming_version(args.expected_humming_version)
     use_official_sampler = args.w13_candidate_source == "official-sampler"
     w13_sampler = (
-        formal_w13_sampler_receipt()
+        formal_w13_sampler_receipt(args.expected_humming_version)
         if "w13" in sublayers and use_official_sampler
         else None
     )
-    capture, routed, points, shape_m = load_capture(
+    capture, routed, representative_points, shape_m = load_capture(
         args.capture_manifest, args.shape_m, args.route_samples
+    )
+    points = split_representative_points(representative_points, args.route_split)
+    candidate_ids, candidate_ids_sha256 = load_candidate_ids(
+        args.candidate_ids_file
     )
     model_config_bytes = args.model_config.read_bytes()
     model_config = json.loads(model_config_bytes)
@@ -924,12 +1067,20 @@ def main() -> None:
                 "seed",
                 "w13_candidate_source",
                 "expected_humming_version",
+                "route_split",
+                "candidate_shard_count",
+                "candidate_shard_index",
+                "candidate_rejection_policy",
+                "correctness_only",
             )
         },
         "sublayers": {},
     }
     if w13_sampler is not None:
         result["w13_sampler"] = w13_sampler
+    if args.candidate_ids_file is not None:
+        result["candidate_ids_file"] = str(args.candidate_ids_file)
+        result["candidate_ids_file_sha256"] = candidate_ids_sha256
     selected_w13_config = None
     for sublayer in sublayers:
         result["sublayers"][sublayer] = tune_sublayer(
@@ -948,13 +1099,19 @@ def main() -> None:
             w13_candidate_source=args.w13_candidate_source,
             expected_humming_version=args.expected_humming_version,
             w13_alignment_config=selected_w13_config,
+            rejection_policy=args.candidate_rejection_policy,
+            correctness_only=args.correctness_only,
+            candidate_shard_count=args.candidate_shard_count,
+            candidate_shard_index=args.candidate_shard_index,
+            candidate_ids=candidate_ids,
         )
         if sublayer == "w13" and result["sublayers"][sublayer]["state"] == "MEASURED":
             selected_w13_config = result["sublayers"][sublayer]["best_config"]
         atomic_write_json(args.out, result)
     states = [value["state"] for value in result["sublayers"].values()]
+    success_state = "SCREENED" if args.correctness_only else "MEASURED"
     result["state"] = (
-        "MEASURED" if all(state == "MEASURED" for state in states) else "INVALID"
+        success_state if all(state == success_state for state in states) else "INVALID"
     )
     atomic_write_json(args.out, result)
     print(
@@ -978,7 +1135,7 @@ def main() -> None:
             indent=2,
         )
     )
-    raise SystemExit(0 if result["state"] == "MEASURED" else 1)
+    raise SystemExit(0 if result["state"] in {"MEASURED", "SCREENED"} else 1)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ from tune_humming_moe import (  # noqa: E402
     DEFAULT_ATOL,
     DEFAULT_RTOL,
     cap_candidate_configs,
+    config_id,
     choose_representative_points,
     deduplicate_configs,
     load_capture,
@@ -52,6 +53,8 @@ from tune_humming_moe import (  # noqa: E402
     persistent_grid_values,
     require_exact_humming_version,
     require_formal_w13_humming_version,
+    select_candidate_subset,
+    split_representative_points,
     w13_schedule_grid,
 )
 
@@ -159,6 +162,68 @@ class TuneHummingCommonTest(unittest.TestCase):
         ]
         selected = choose_representative_points(points, 3)
         self.assertEqual([point["layer_id"] for point in selected], [0, 4, 8])
+
+    def test_route_split_freezes_train_and_heldout_quantiles(self):
+        points = [{"layer_id": index} for index in range(5)]
+        self.assertEqual(
+            [
+                point["layer_id"]
+                for point in split_representative_points(points, "train")
+            ],
+            [0, 2, 4],
+        )
+        self.assertEqual(
+            [
+                point["layer_id"]
+                for point in split_representative_points(points, "heldout")
+            ],
+            [1, 3],
+        )
+        with self.assertRaisesRegex(ValueError, "exactly five"):
+            split_representative_points(points[:4], "train")
+
+    def test_candidate_shards_cover_nonheuristic_once(self):
+        candidates = [{"value": index} for index in range(9)]
+        heuristic = candidates[0]
+        selected_ids = []
+        heuristic_id = config_id(heuristic)
+        for shard_index in range(4):
+            selected, receipt = select_candidate_subset(
+                candidates,
+                heuristic,
+                shard_count=4,
+                shard_index=shard_index,
+                candidate_ids=None,
+            )
+            ids = [config_id(config) for config in selected]
+            self.assertIn(heuristic_id, ids)
+            self.assertEqual(receipt["candidate_universe_count"], 9)
+            selected_ids.extend(item for item in ids if item != heuristic_id)
+        expected = [config_id(config) for config in candidates[1:]]
+        self.assertCountEqual(selected_ids, expected)
+        self.assertEqual(len(selected_ids), len(set(selected_ids)))
+
+    def test_explicit_candidate_ids_require_known_heuristic(self):
+        candidates = [{"value": index} for index in range(3)]
+        heuristic = candidates[0]
+        wanted = [config_id(heuristic), config_id(candidates[2])]
+        selected, receipt = select_candidate_subset(
+            candidates,
+            heuristic,
+            shard_count=1,
+            shard_index=0,
+            candidate_ids=wanted,
+        )
+        self.assertEqual([config_id(config) for config in selected], wanted)
+        self.assertEqual(receipt["candidate_selection"], "explicit_candidate_ids")
+        with self.assertRaisesRegex(ValueError, "include the heuristic"):
+            select_candidate_subset(
+                candidates,
+                heuristic,
+                shard_count=1,
+                shard_index=0,
+                candidate_ids=[config_id(candidates[1])],
+            )
 
     def test_percentile_uses_nearest_rank(self):
         self.assertEqual(percentile([5, 1, 3, 2, 4], 0.95), 5)
