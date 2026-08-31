@@ -28,9 +28,13 @@ def _require_equal(name: str, values: list[Any]) -> Any:
     return values[0]
 
 
-def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
+def merge_screens(
+    payloads: list[dict], sources: list[str], coverage_mode: str = "disjoint"
+) -> dict:
     if not payloads:
         raise ValueError("at least one screen shard is required")
+    if coverage_mode not in {"disjoint", "replicated"}:
+        raise ValueError(f"unsupported coverage mode: {coverage_mode}")
     layers = []
     for payload in payloads:
         if payload.get("state") != "SCREENED":
@@ -71,9 +75,12 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
         for field in common_top_fields
     }
     normalized_parameters = []
+    screen_seeds = {}
     for payload in payloads:
         parameters = dict(payload.get("parameters", {}))
-        parameters.pop("candidate_shard_index", None)
+        shard_index = parameters.pop("candidate_shard_index", None)
+        if coverage_mode == "replicated":
+            screen_seeds[str(shard_index)] = parameters.pop("seed", None)
         normalized_parameters.append(parameters)
     common["screen_parameters"] = _require_equal(
         "parameters excluding shard index", normalized_parameters
@@ -84,11 +91,17 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
         raise ValueError("screen shards must be correctness-only")
     if common["screen_parameters"].get("candidate_rejection_policy") != "filter":
         raise ValueError("screen shards must use the filter rejection policy")
+    if coverage_mode == "replicated" and len(set(screen_seeds.values())) != len(
+        screen_seeds
+    ):
+        raise ValueError("replicated screen seeds must be unique")
+    common["screen_seeds"] = screen_seeds
     common_layer_fields = (
         "candidate_source",
         "candidate_universe_count",
         "candidate_universe_ids",
         "candidate_universe_sha256",
+        "candidate_selection",
         "heuristic_id",
         "heuristic_config",
         "correctness_gate",
@@ -108,15 +121,19 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
         raise ValueError("heuristic is absent from candidate universe")
 
     covered: list[str] = []
-    valid_ids = {heuristic_id}
+    valid_sets = []
     rejected = []
     shard_receipts = []
     for source, payload, layer in zip(sources, payloads, layers, strict=True):
         selected = layer["selected_candidate_ids"]
         if heuristic_id not in selected:
             raise ValueError("screen shard does not contain the heuristic")
-        nonheuristic = [item for item in selected if item != heuristic_id]
-        covered.extend(nonheuristic)
+        if coverage_mode == "replicated":
+            if selected != universe_ids:
+                raise ValueError("replicated screen does not cover the full universe")
+        else:
+            nonheuristic = [item for item in selected if item != heuristic_id]
+            covered.extend(nonheuristic)
         layer_valid = {item["config_id"] for item in layer["valid_candidates"]}
         layer_rejected = {item["config_id"] for item in layer["rejected"]}
         if heuristic_id not in layer_valid:
@@ -125,8 +142,11 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
             raise ValueError("candidate is both valid and rejected in one shard")
         if layer_valid | layer_rejected != set(selected):
             raise ValueError("screen shard does not account for every candidate")
-        valid_ids.update(layer_valid)
-        rejected.extend(layer["rejected"])
+        valid_sets.append(layer_valid)
+        rejected.extend(
+            {**item, "screen_shard_index": layer["candidate_shard_index"]}
+            for item in layer["rejected"]
+        )
         shard_receipts.append(
             {
                 "source": source,
@@ -138,21 +158,31 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
             }
         )
 
-    expected_covered = [item for item in universe_ids if item != heuristic_id]
-    if (
-        sorted(covered) != sorted(expected_covered)
-        or len(covered) != len(set(covered))
-    ):
-        raise ValueError("non-heuristic candidate shards are incomplete or overlapping")
+    if coverage_mode == "replicated":
+        valid_ids = set.intersection(*valid_sets)
+    else:
+        expected_covered = [item for item in universe_ids if item != heuristic_id]
+        if (
+            sorted(covered) != sorted(expected_covered)
+            or len(covered) != len(set(covered))
+        ):
+            raise ValueError(
+                "non-heuristic candidate shards are incomplete or overlapping"
+            )
+        valid_ids = set.union(*valid_sets)
     survivor_ids = [item for item in universe_ids if item in valid_ids]
+    rejected_ids = sorted({item["config_id"] for item in rejected})
     return {
-        "format_version": 1,
+        "format_version": 2,
         "state": "MERGED",
+        "coverage_mode": coverage_mode,
         **common,
         **common_layer,
         "candidate_ids": survivor_ids,
         "survivor_count": len(survivor_ids),
-        "rejected_count": len(rejected),
+        "rejected_count": len(rejected_ids),
+        "rejected_candidate_ids": rejected_ids,
+        "rejection_observation_count": len(rejected),
         "rejected": rejected,
         "shards": sorted(shard_receipts, key=lambda item: item["shard_index"]),
     }
@@ -161,6 +191,9 @@ def merge_screens(payloads: list[dict], sources: list[str]) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--screen", type=Path, action="append", required=True)
+    parser.add_argument(
+        "--coverage-mode", choices=("disjoint", "replicated"), default="disjoint"
+    )
     parser.add_argument("--out", type=Path, required=True)
     return parser.parse_args()
 
@@ -168,7 +201,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     payloads = [json.loads(path.read_text()) for path in args.screen]
-    result = merge_screens(payloads, [str(path) for path in args.screen])
+    result = merge_screens(
+        payloads, [str(path) for path in args.screen], args.coverage_mode
+    )
     atomic_write_json(args.out, result)
     print(
         json.dumps(

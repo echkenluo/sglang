@@ -115,6 +115,7 @@ def select_candidate_subset(
     shard_count: int,
     shard_index: int,
     candidate_ids: list[str] | None,
+    replicate_universe: bool = False,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Select a deterministic correctness shard or an explicit survivor set."""
     if shard_count <= 0:
@@ -123,6 +124,8 @@ def select_candidate_subset(
         raise ValueError("candidate shard index is outside shard count")
     if candidate_ids is not None and shard_count != 1:
         raise ValueError("candidate IDs cannot be combined with candidate sharding")
+    if candidate_ids is not None and replicate_universe:
+        raise ValueError("candidate IDs cannot be combined with universe replication")
 
     universe_ids = [config_id(config) for config in candidates]
     if len(universe_ids) != len(set(universe_ids)):
@@ -131,7 +134,10 @@ def select_candidate_subset(
     if heuristic_id not in universe_ids:
         raise ValueError("candidate universe does not contain the heuristic")
 
-    if candidate_ids is not None:
+    if replicate_universe:
+        selected = list(candidates)
+        selection = "replicated_full_universe"
+    elif candidate_ids is not None:
         unknown = sorted(set(candidate_ids) - set(universe_ids))
         if unknown:
             raise ValueError(f"candidate IDs are absent from universe: {unknown}")
@@ -695,6 +701,8 @@ def tune_sublayer(
     candidate_shard_count: int = 1,
     candidate_shard_index: int = 0,
     candidate_ids: list[str] | None = None,
+    replicate_candidate_universe: bool = False,
+    correctness_repeats: int = 1,
 ) -> dict:
     heuristic, candidates, candidate_source = build_candidates(
         layer,
@@ -710,9 +718,12 @@ def tune_sublayer(
         shard_count=candidate_shard_count,
         shard_index=candidate_shard_index,
         candidate_ids=candidate_ids,
+        replicate_universe=replicate_candidate_universe,
     )
     if rejection_policy not in {"invalidate", "filter"}:
         raise ValueError(f"unsupported rejection policy: {rejection_policy}")
+    if correctness_repeats <= 0:
+        raise ValueError("correctness repeats must be positive")
     result: dict[str, Any] = {
         "sublayer": sublayer,
         "shape_m": shape_m,
@@ -728,6 +739,7 @@ def tune_sublayer(
             "rtol": rtol,
             "atol": atol,
             "all_elements_must_pass": True,
+            "repeats_per_route": correctness_repeats,
         },
         "route_points": route_points,
         "rejected": [],
@@ -831,26 +843,30 @@ def tune_sublayer(
     for config in compiled:
         candidate_ok = True
         worst: dict[str, float | int] | None = None
+        checked_executions = 0
         try:
             for context, reference in zip(contexts, references, strict=True):
-                context["output"].fill_(float("nan"))
-                get_forward(context, config)()
-                torch.cuda.synchronize()
-                if not torch.isfinite(context["output"]).all().item():
-                    raise ValueError("candidate produced non-finite output")
-                metrics = correctness_metrics(
-                    context["output"], reference, rtol=rtol, atol=atol
-                )
-                worst = (
-                    metrics
-                    if worst is None
-                    else {
-                        name: max(worst[name], value) for name, value in metrics.items()
-                    }
-                )
-                torch.testing.assert_close(
-                    context["output"], reference, rtol=rtol, atol=atol
-                )
+                for _ in range(correctness_repeats):
+                    context["output"].fill_(float("nan"))
+                    get_forward(context, config)()
+                    torch.cuda.synchronize()
+                    checked_executions += 1
+                    if not torch.isfinite(context["output"]).all().item():
+                        raise ValueError("candidate produced non-finite output")
+                    metrics = correctness_metrics(
+                        context["output"], reference, rtol=rtol, atol=atol
+                    )
+                    worst = (
+                        metrics
+                        if worst is None
+                        else {
+                            name: max(worst[name], value)
+                            for name, value in metrics.items()
+                        }
+                    )
+                    torch.testing.assert_close(
+                        context["output"], reference, rtol=rtol, atol=atol
+                    )
         except Exception as exc:
             candidate_ok = False
             result["rejected"].append(
@@ -859,12 +875,14 @@ def tune_sublayer(
                     "config": config,
                     "phase": "correctness",
                     "error": repr(exc),
+                    "checked_executions": checked_executions,
                     **(worst or {}),
                 }
             )
         if candidate_ok:
             if worst is None:
                 raise RuntimeError("candidate correctness checked no route contexts")
+            worst["checked_executions"] = checked_executions
             valid.append((config, worst))
     if result["rejected"] and rejection_policy == "invalidate":
         result.update(state="INVALID_CANDIDATE_CORRECTNESS")
@@ -990,6 +1008,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--candidate-shard-count", type=int, default=1)
     parser.add_argument("--candidate-shard-index", type=int, default=0)
+    parser.add_argument("--replicate-candidate-universe", action="store_true")
     parser.add_argument("--candidate-ids-file", type=Path)
     parser.add_argument(
         "--candidate-rejection-policy",
@@ -997,6 +1016,7 @@ def parse_args() -> argparse.Namespace:
         default="invalidate",
     )
     parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument("--correctness-repeats", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
@@ -1070,8 +1090,10 @@ def main() -> None:
                 "route_split",
                 "candidate_shard_count",
                 "candidate_shard_index",
+                "replicate_candidate_universe",
                 "candidate_rejection_policy",
                 "correctness_only",
+                "correctness_repeats",
             )
         },
         "sublayers": {},
@@ -1104,6 +1126,8 @@ def main() -> None:
             candidate_shard_count=args.candidate_shard_count,
             candidate_shard_index=args.candidate_shard_index,
             candidate_ids=candidate_ids,
+            replicate_candidate_universe=args.replicate_candidate_universe,
+            correctness_repeats=args.correctness_repeats,
         )
         if sublayer == "w13" and result["sublayers"][sublayer]["state"] == "MEASURED":
             selected_w13_config = result["sublayers"][sublayer]["best_config"]

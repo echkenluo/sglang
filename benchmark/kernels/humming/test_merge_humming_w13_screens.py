@@ -92,6 +92,33 @@ class MergeHummingW13ScreensTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incomplete or overlapping"):
                 merge_screens(copy.deepcopy(payloads), sources)
 
+    def test_replicated_merge_intersects_cross_gpu_survivors(self):
+        payloads = [
+            make_payload(
+                0, ["h", "a", "b", "c", "d"], ["h", "a", "c", "d"], ["b"]
+            ),
+            make_payload(
+                1, ["h", "a", "b", "c", "d"], ["h", "a", "b", "d"], ["c"]
+            ),
+        ]
+        for index, payload in enumerate(payloads):
+            payload["parameters"]["seed"] = 20260902 + index
+            payload["parameters"]["replicate_candidate_universe"] = True
+            payload["sublayers"]["w13"][
+                "candidate_selection"
+            ] = "replicated_full_universe"
+        with tempfile.TemporaryDirectory() as directory:
+            sources = []
+            for index, payload in enumerate(payloads):
+                path = Path(directory) / f"screen-{index}.json"
+                path.write_text(json.dumps(payload))
+                sources.append(str(path))
+            result = merge_screens(payloads, sources, "replicated")
+        self.assertEqual(result["candidate_ids"], ["h", "a", "d"])
+        self.assertEqual(result["rejected_count"], 2)
+        self.assertEqual(result["rejection_observation_count"], 2)
+        self.assertEqual(result["screen_seeds"], {"0": 20260902, "1": 20260903})
+
 
 if __name__ == "__main__":
     unittest.main()

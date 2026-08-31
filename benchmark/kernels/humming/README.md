@@ -130,6 +130,33 @@ python benchmark/kernels/humming/merge_humming_w13_screens.py \
   --out /path/to/survivors.json
 ```
 
+If a one-pass shard screen exposes a candidate that passes once but fails the
+same contract in a later process, use the stability protocol instead of
+deleting that candidate after the fact.  Every GPU then screens the complete
+universe with a distinct preregistered input seed and multiple executions per
+route:
+
+```bash
+CUDA_VISIBLE_DEVICES="$gpu" python benchmark/kernels/humming/tune_humming_moe.py \
+  ... \
+  --candidate-shard-count 4 --candidate-shard-index "$gpu" \
+  --replicate-candidate-universe --correctness-repeats 3 \
+  --candidate-rejection-policy filter --correctness-only \
+  --seed "$replica_seed" --out "/path/to/replica-$gpu.json"
+
+python benchmark/kernels/humming/merge_humming_w13_screens.py \
+  --coverage-mode replicated \
+  --screen /path/to/replica-0.json --screen /path/to/replica-1.json \
+  --screen /path/to/replica-2.json --screen /path/to/replica-3.json \
+  --out /path/to/stable-survivors.json
+```
+
+The replicated merger requires unique seeds, identical candidate universes and
+full coverage in every replica.  Its survivor list is the intersection across
+all GPUs; every rejection observation remains in the receipt.  Reuse a
+completed replica's compile cache only after all replicas exit, and still rerun
+the declared correctness repeats before timing.
+
 Time all survivors on one GPU with `--candidate-ids-file` and the train split;
 different GPUs must not time disjoint candidates because device-to-device
 variation would bias selection.  Only a preregistered train winner is then run

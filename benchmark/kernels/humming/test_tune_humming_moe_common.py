@@ -203,6 +203,20 @@ class TuneHummingCommonTest(unittest.TestCase):
         self.assertCountEqual(selected_ids, expected)
         self.assertEqual(len(selected_ids), len(set(selected_ids)))
 
+    def test_candidate_replication_selects_full_universe(self):
+        candidates = [{"value": index} for index in range(5)]
+        selected, receipt = select_candidate_subset(
+            candidates,
+            candidates[0],
+            shard_count=4,
+            shard_index=2,
+            candidate_ids=None,
+            replicate_universe=True,
+        )
+        self.assertEqual(selected, candidates)
+        self.assertEqual(receipt["candidate_selection"], "replicated_full_universe")
+        self.assertEqual(receipt["candidate_shard_index"], 2)
+
     def test_explicit_candidate_ids_require_known_heuristic(self):
         candidates = [{"value": index} for index in range(3)]
         heuristic = candidates[0]
