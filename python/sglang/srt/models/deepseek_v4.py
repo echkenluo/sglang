@@ -214,6 +214,7 @@ _DSV4_TP_SCATTER_STATS = {
     "fallback": 0,
     "fp8_ag_attn": 0,
     "fp8_ag_moe": 0,
+    "fp8_rs": 0,
 }
 
 
@@ -247,12 +248,13 @@ def _dsv4_tp_scatter_maybe_log_stats() -> None:
         return
     logger.info(
         "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d "
-        "fp8_ag_attn=%d fp8_ag_moe=%d",
+        "fp8_ag_attn=%d fp8_ag_moe=%d fp8_rs=%d",
         _DSV4_TP_SCATTER_STATS["engaged"],
         _DSV4_TP_SCATTER_STATS["padded"],
         _DSV4_TP_SCATTER_STATS["fallback"],
         _DSV4_TP_SCATTER_STATS["fp8_ag_attn"],
         _DSV4_TP_SCATTER_STATS["fp8_ag_moe"],
+        _DSV4_TP_SCATTER_STATS["fp8_rs"],
     )
 
 
@@ -362,6 +364,46 @@ def _dsv4_tp_all_gather_rows(x: torch.Tensor, site: str = "other") -> torch.Tens
     return output
 
 
+def _dsv4_tp_fp8_a2a_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+    """FP8-wire reduce-scatter: quantize the local partial rows per
+    token-group, exchange row shards via all-to-all (payload+scales packed as
+    bytes), dequantize the received shards and reduce them locally in fp32.
+    Wire bytes are ~0.52x of the BF16 reduce-scatter; the quantization happens
+    BEFORE the reduction, so this is numerically riskier than FP8-AG and stays
+    behind the task-level quality gates."""
+    tp_group = get_tp_group()
+    world = tp_group.world_size
+    rows, hidden = x.shape
+    group = _DSV4_FP8_AG_GROUP_SIZE
+    scale_bytes = (hidden // group) * 4
+    row_bytes = hidden + scale_bytes
+    x_q, x_s = sglang_per_token_group_quant_fp8(x.contiguous(), group)
+    packed = torch.empty((rows, row_bytes), dtype=torch.uint8, device=x.device)
+    packed[:, :hidden] = x_q.view(torch.uint8)
+    packed[:, hidden:] = x_s.view(torch.uint8).view(rows, scale_bytes)
+    received = torch.empty_like(packed)
+    torch.distributed.all_to_all_single(received, packed, group=tp_group.device_group)
+    shard = rows // world
+    q_full = received.view(torch.float8_e4m3fn)[:, :hidden]
+    s_full = (
+        received[:, hidden:]
+        .contiguous()
+        .view(torch.float32)
+        .view(rows, hidden // group)
+    )
+    dequant = torch.empty((rows, hidden), dtype=torch.float32, device=x.device)
+    _dsv4_fp8_ag_dequant_kernel[(rows, hidden // group)](
+        q_full,
+        s_full,
+        dequant,
+        received.stride(0),
+        s_full.stride(0),
+        dequant.stride(0),
+        GROUP=group,
+    )
+    return dequant.view(world, shard, hidden).sum(dim=0).to(x.dtype)
+
+
 def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     """Sum TP partials and retain the rank-owned first-dimension token shard.
 
@@ -379,6 +421,16 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
         rows = full.shape[0] // tp_group.world_size
         return full.narrow(0, tp_group.rank_in_group * rows, rows).contiguous()
     x = _dsv4_tp_pad_rows(x)
+    if (
+        envs.SGLANG_DSV4_TP_SCATTER_FP8_RS.get()
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.shape[-1] % _DSV4_FP8_AG_GROUP_SIZE == 0
+        and x.shape[0] >= envs.SGLANG_DSV4_FP8_AG_MIN_TOKENS.get()
+    ):
+        _DSV4_TP_SCATTER_STATS["fp8_rs"] += 1
+        _dsv4_tp_scatter_log_once("fp8_rs", "FP8 all-to-all ReduceScatter engaged")
+        return _dsv4_tp_fp8_a2a_reduce_scatter(x)
     output = x.new_empty((x.shape[0] // tp_group.world_size, *x.shape[1:]))
     tp_group.reduce_scatter_tensor(output, x.contiguous())
     return output

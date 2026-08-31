@@ -1198,6 +1198,12 @@ class Envs:
     # Below this gathered-token count the BF16 gather is kept (packing
     # overhead beats the byte saving at small M; micro gate calibrates this).
     SGLANG_DSV4_FP8_AG_MIN_TOKENS = EnvInt(1024)
+    # FP8 wire for the scattered ReduceScatter: decompose RS into an fp8
+    # all-to-all of packed partial shards plus a local fp32 reduction (NCCL
+    # cannot sum fp8 on the wire). Quantizes PARTIAL sums, so the noise is
+    # larger than FP8-AG's final-value quantization; gated behind the same
+    # task-level quality gates. Default off.
+    SGLANG_DSV4_TP_SCATTER_FP8_RS = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
