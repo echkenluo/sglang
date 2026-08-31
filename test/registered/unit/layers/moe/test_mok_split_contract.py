@@ -76,6 +76,7 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertEqual(envs.SGLANG_OPT_MOK_MAX_TOKENS.default, 4096)
         self.assertEqual(envs.SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS.default, 16384)
         self.assertEqual(envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.default, 6)
+        self.assertEqual(envs.SGLANG_OPT_MOK_PREFILL_BUCKETS.default, ())
 
     def _gate_call(self, tokens, extend, min_tokens):
         from unittest import mock
@@ -210,6 +211,50 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertEqual(
             _route_padding_config(3, 8, prefill_pow2_bucket=True), (4, 16)
         )
+
+    def test_measured_prefill_buckets_override_power_of_two_padding(self):
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+            _parse_prefill_buckets,
+            _route_padding_config,
+        )
+
+        buckets = _parse_prefill_buckets(("1280", "2304", "3328", "4096"))
+        self.assertEqual(
+            _route_padding_config(
+                1044,
+                8,
+                prefill_pow2_bucket=True,
+                prefill_buckets=buckets,
+            ),
+            (1280, 1024),
+        )
+        self.assertEqual(
+            _route_padding_config(
+                3149,
+                8,
+                prefill_pow2_bucket=True,
+                prefill_buckets=buckets,
+            ),
+            (3328, 1024),
+        )
+        self.assertEqual(
+            _route_padding_config(
+                3888,
+                8,
+                prefill_pow2_bucket=True,
+                prefill_buckets=buckets,
+            ),
+            (4096, 1024),
+        )
+
+    def test_measured_prefill_buckets_reject_invalid_contracts(self):
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+            _parse_prefill_buckets,
+        )
+
+        for buckets in (("1024", "768"), ("1000",), ("x",)):
+            with self.subTest(buckets=buckets), self.assertRaises(ValueError):
+                _parse_prefill_buckets(buckets)
 
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
         from unittest import mock

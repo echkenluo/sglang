@@ -1236,6 +1236,9 @@ class Envs:
     # retaining one large symmetric-memory allocation for every scheduler
     # token geometry. Decode keeps its existing fine-grained padding.
     SGLANG_OPT_MOK_PREFILL_POW2_BUCKET = EnvBool(False)
+    # Optional comma-separated M256-aligned upper bounds for measured prefill
+    # shapes. When set, these bounds take precedence over power-of-two buckets.
+    SGLANG_OPT_MOK_PREFILL_BUCKETS = EnvTuple(())
     # Opt-in profiling trace for ExpertLane bucket tuning.  Emit one exact
     # shape record per model forward (layer 0 only); disabled in production.
     SGLANG_OPT_MOK_SHAPE_TRACE = EnvBool(False)

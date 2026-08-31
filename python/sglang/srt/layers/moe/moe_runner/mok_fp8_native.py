@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -403,8 +404,27 @@ def _conservative_route_capacity_factor(
     ) * factor_alignment
 
 
+@functools.lru_cache(maxsize=16)
+def _parse_prefill_buckets(raw_buckets: tuple[str, ...]) -> tuple[int, ...]:
+    if not raw_buckets:
+        return ()
+    try:
+        buckets = tuple(int(value) for value in raw_buckets)
+    except ValueError as exc:
+        raise ValueError("MoK prefill buckets must be integers") from exc
+    if any(value < 256 or value % 256 for value in buckets):
+        raise ValueError("MoK prefill buckets must be positive M256 multiples")
+    if tuple(sorted(set(buckets))) != buckets:
+        raise ValueError("MoK prefill buckets must be sorted and unique")
+    return buckets
+
+
 def _route_padding_config(
-    num_tokens: int, topk: int, *, prefill_pow2_bucket: bool = False
+    num_tokens: int,
+    topk: int,
+    *,
+    prefill_pow2_bucket: bool = False,
+    prefill_buckets: tuple[int, ...] = (),
 ) -> tuple[int, int]:
     """Return the padded token count and route-gather chunk size."""
     if num_tokens <= 0 or topk <= 0:
@@ -416,7 +436,12 @@ def _route_padding_config(
         ) * route_token_alignment
         return padded_tokens, 16
     padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
-    if prefill_pow2_bucket:
+    if prefill_buckets:
+        padded_tokens = next(
+            (bucket for bucket in prefill_buckets if bucket >= padded_tokens),
+            padded_tokens,
+        )
+    elif prefill_pow2_bucket:
         padded_tokens = 1 << (padded_tokens - 1).bit_length()
     return padded_tokens, 1024
 
@@ -830,13 +855,20 @@ def maybe_run_mok_fp8_native(
     # Decode only needs enough padding for the even-token reducer and an M16
     # route-buffer chunk.  Retain M256 token padding for larger batches until
     # their route-chunk/capacity tradeoff is measured independently.
+    is_extend = get_is_extend_in_batch()
+    prefill_buckets = (
+        _parse_prefill_buckets(envs.SGLANG_OPT_MOK_PREFILL_BUCKETS.get())
+        if is_extend
+        else ()
+    )
     padded_tokens, route_chunk_bytes = _route_padding_config(
         num_tokens,
         topk,
         prefill_pow2_bucket=(
             envs.SGLANG_OPT_MOK_PREFILL_POW2_BUCKET.get()
-            and get_is_extend_in_batch()
+            and is_extend
         ),
+        prefill_buckets=prefill_buckets,
     )
 
     # SGLang's TP/EP model contract gives every rank the same padded shape,
