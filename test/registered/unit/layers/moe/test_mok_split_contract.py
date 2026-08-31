@@ -185,6 +185,32 @@ class TestMoKSplitContract(unittest.TestCase):
             self.assertEqual(len(mok_fp8_native._WORKSPACE_GEOMETRIES), 2)
             mok_fp8_native._WORKSPACE_GEOMETRIES.clear()
 
+    def test_prefill_power_of_two_bucketing_bounds_workspace_geometries(self):
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+            _route_padding_config,
+        )
+
+        # The default retains the exact M256 geometry.
+        self.assertEqual(_route_padding_config(1280, 8), (1280, 1024))
+        self.assertEqual(_route_padding_config(3072, 8), (3072, 1024))
+        # The opt-in maps scheduler-dependent prefill shapes to a bounded set.
+        self.assertEqual(
+            _route_padding_config(1280, 8, prefill_pow2_bucket=True),
+            (2048, 1024),
+        )
+        self.assertEqual(
+            _route_padding_config(3072, 8, prefill_pow2_bucket=True),
+            (4096, 1024),
+        )
+        self.assertEqual(
+            _route_padding_config(4096, 8, prefill_pow2_bucket=True),
+            (4096, 1024),
+        )
+        # Decode-sized inputs retain the existing even-token contract.
+        self.assertEqual(
+            _route_padding_config(3, 8, prefill_pow2_bucket=True), (4, 16)
+        )
+
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
         from unittest import mock
 

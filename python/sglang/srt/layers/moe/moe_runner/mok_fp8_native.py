@@ -371,7 +371,9 @@ def _conservative_route_capacity_factor(
     ) * factor_alignment
 
 
-def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
+def _route_padding_config(
+    num_tokens: int, topk: int, *, prefill_pow2_bucket: bool = False
+) -> tuple[int, int]:
     """Return the padded token count and route-gather chunk size."""
     if num_tokens <= 0 or topk <= 0:
         raise ValueError("token and top-k counts must be positive")
@@ -381,7 +383,10 @@ def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
             (num_tokens + route_token_alignment - 1) // route_token_alignment
         ) * route_token_alignment
         return padded_tokens, 16
-    return max(256, ((num_tokens + 255) // 256) * 256), 1024
+    padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
+    if prefill_pow2_bucket:
+        padded_tokens = 1 << (padded_tokens - 1).bit_length()
+    return padded_tokens, 1024
 
 
 def _required_route_capacity_factor(
@@ -793,7 +798,14 @@ def maybe_run_mok_fp8_native(
     # Decode only needs enough padding for the even-token reducer and an M16
     # route-buffer chunk.  Retain M256 token padding for larger batches until
     # their route-chunk/capacity tradeoff is measured independently.
-    padded_tokens, route_chunk_bytes = _route_padding_config(num_tokens, topk)
+    padded_tokens, route_chunk_bytes = _route_padding_config(
+        num_tokens,
+        topk,
+        prefill_pow2_bucket=(
+            envs.SGLANG_OPT_MOK_PREFILL_POW2_BUCKET.get()
+            and get_is_extend_in_batch()
+        ),
+    )
 
     # SGLang's TP/EP model contract gives every rank the same padded shape,
     # and the MoK workspace validates that invariant when a shape is first
@@ -824,7 +836,9 @@ def maybe_run_mok_fp8_native(
         schedule_capacity_factor=capacity_factor,
     ):
         _report_fallback(
-            "workspace geometry cap reached; unseen geometry uses stock DeepEP"
+            "workspace geometry cap reached: "
+            f"tokens={padded_tokens} capacity_factor={capacity_factor}; "
+            "unseen geometry uses stock DeepEP"
         )
         return None
     workspace = mok_functional.get_fp8_route_workspace(

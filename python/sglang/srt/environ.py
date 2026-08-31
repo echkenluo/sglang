@@ -1232,6 +1232,10 @@ class Envs:
     SGLANG_OPT_MOK_MAX_TOKENS = EnvInt(4096)
     SGLANG_OPT_MOK_MAX_SEQUENCE_TOKENS = EnvInt(16384)
     SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP = EnvInt(6)
+    # Reuse a bounded set of power-of-two prefill workspaces instead of
+    # retaining one large symmetric-memory allocation for every scheduler
+    # token geometry. Decode keeps its existing fine-grained padding.
+    SGLANG_OPT_MOK_PREFILL_POW2_BUCKET = EnvBool(False)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
 
     # TopK
