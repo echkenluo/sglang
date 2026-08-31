@@ -157,6 +157,13 @@ all GPUs; every rejection observation remains in the receipt.  Reuse a
 completed replica's compile cache only after all replicas exit, and still rerun
 the declared correctness repeats before timing.
 
+If replicated screening shows that instability is confined to stream-K
+challengers, `--challenger-stream-k-policy exclude` retains the deployed
+exact-shape heuristic as the baseline while removing other stream-K configs
+before correctness and timing. The result records the pre/post class counts
+and every excluded config ID; this is a class-level safety policy, not an
+individual failed-ID denylist.
+
 Time all survivors on one GPU with `--candidate-ids-file` and the train split;
 different GPUs must not time disjoint candidates because device-to-device
 variation would bias selection.  Only a preregistered train winner is then run

@@ -48,6 +48,7 @@ from tune_humming_moe import (  # noqa: E402
     config_id,
     choose_representative_points,
     deduplicate_configs,
+    filter_challenger_stream_k,
     load_capture,
     percentile,
     persistent_grid_values,
@@ -216,6 +217,31 @@ class TuneHummingCommonTest(unittest.TestCase):
         self.assertEqual(selected, candidates)
         self.assertEqual(receipt["candidate_selection"], "replicated_full_universe")
         self.assertEqual(receipt["candidate_shard_index"], 2)
+
+    def test_stream_k_filter_retains_heuristic_and_non_stream_k_challengers(self):
+        heuristic = {"name": "heuristic", "use_stream_k": True}
+        stream_k = {"name": "challenger-stream-k", "use_stream_k": True}
+        non_stream_k = {"name": "challenger-non-stream-k", "use_stream_k": False}
+        selected, receipt = filter_challenger_stream_k(
+            [heuristic, stream_k, non_stream_k], heuristic, "exclude"
+        )
+        self.assertEqual(selected, [heuristic, non_stream_k])
+        self.assertEqual(receipt["candidate_class_count_before"], 3)
+        self.assertEqual(receipt["candidate_class_count_after"], 2)
+        self.assertEqual(receipt["excluded_candidate_ids"], [config_id(stream_k)])
+
+    def test_stream_k_filter_allow_preserves_full_universe(self):
+        candidates = [
+            {"name": "heuristic", "use_stream_k": True},
+            {"name": "challenger", "use_stream_k": True},
+        ]
+        selected, receipt = filter_challenger_stream_k(
+            candidates, candidates[0], "allow"
+        )
+        self.assertEqual(selected, candidates)
+        self.assertEqual(receipt["candidate_class_count_before"], 2)
+        self.assertEqual(receipt["candidate_class_count_after"], 2)
+        self.assertEqual(receipt["excluded_candidate_ids"], [])
 
     def test_explicit_candidate_ids_require_known_heuristic(self):
         candidates = [{"value": index} for index in range(3)]

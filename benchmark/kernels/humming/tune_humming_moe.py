@@ -173,6 +173,38 @@ def select_candidate_subset(
     return selected, receipt
 
 
+def filter_challenger_stream_k(
+    candidates: list[dict], heuristic: dict, policy: str
+) -> tuple[list[dict], dict]:
+    """Optionally exclude stream-K challengers but retain the heuristic."""
+    if policy not in {"allow", "exclude"}:
+        raise ValueError(f"unsupported challenger stream-K policy: {policy}")
+    heuristic_id = config_id(heuristic)
+    if policy == "allow":
+        selected = list(candidates)
+    else:
+        selected = [
+            config
+            for config in candidates
+            if config_id(config) == heuristic_id
+            or not config.get("use_stream_k", False)
+        ]
+    selected_ids = {config_id(config) for config in selected}
+    if heuristic_id not in selected_ids:
+        raise ValueError("candidate class filter removed the heuristic")
+    excluded_ids = [
+        config_id(config)
+        for config in candidates
+        if config_id(config) not in selected_ids
+    ]
+    return selected, {
+        "challenger_stream_k_policy": policy,
+        "candidate_class_count_before": len(candidates),
+        "candidate_class_count_after": len(selected),
+        "excluded_candidate_ids": excluded_ids,
+    }
+
+
 def require_formal_w13_humming_version(version: str | None = None) -> str:
     """Fail closed unless W13 enumeration and kernel construction match."""
     actual = humming.__version__ if version is None else version
@@ -703,6 +735,7 @@ def tune_sublayer(
     candidate_ids: list[str] | None = None,
     replicate_candidate_universe: bool = False,
     correctness_repeats: int = 1,
+    challenger_stream_k_policy: str = "allow",
 ) -> dict:
     heuristic, candidates, candidate_source = build_candidates(
         layer,
@@ -711,6 +744,9 @@ def tune_sublayer(
         candidate_count,
         w13_candidate_source=w13_candidate_source,
         expected_humming_version=expected_humming_version,
+    )
+    candidates, class_receipt = filter_challenger_stream_k(
+        candidates, heuristic, challenger_stream_k_policy
     )
     candidates, selection_receipt = select_candidate_subset(
         candidates,
@@ -743,6 +779,7 @@ def tune_sublayer(
         },
         "route_points": route_points,
         "rejected": [],
+        **class_receipt,
         **selection_receipt,
     }
 
@@ -1017,6 +1054,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--correctness-repeats", type=int, default=1)
+    parser.add_argument(
+        "--challenger-stream-k-policy",
+        choices=("allow", "exclude"),
+        default="allow",
+        help=(
+            "exclude retains the exact-shape heuristic baseline but removes "
+            "stream-K challenger configs before correctness and timing"
+        ),
+    )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
@@ -1094,6 +1140,7 @@ def main() -> None:
                 "candidate_rejection_policy",
                 "correctness_only",
                 "correctness_repeats",
+                "challenger_stream_k_policy",
             )
         },
         "sublayers": {},
@@ -1128,6 +1175,7 @@ def main() -> None:
             candidate_ids=candidate_ids,
             replicate_candidate_universe=args.replicate_candidate_universe,
             correctness_repeats=args.correctness_repeats,
+            challenger_stream_k_policy=args.challenger_stream_k_policy,
         )
         if sublayer == "w13" and result["sublayers"][sublayer]["state"] == "MEASURED":
             selected_w13_config = result["sublayers"][sublayer]["best_config"]
