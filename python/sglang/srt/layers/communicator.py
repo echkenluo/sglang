@@ -304,6 +304,10 @@ class AttnTpContext:
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.input_ids is not None
+            # Small forwards pay the decomposition's fixed per-layer cost
+            # without enough rows to amortize it; keep them on the stock path.
+            and forward_batch.input_ids.shape[0]
+            >= envs.SGLANG_DSV4_TP_INPUT_SCATTERED_MIN_TOKENS.get()
             # The DSV4 chunk pipeline runs TBO ON the scattered path; only
             # the (DP) TBO paths that bypass scattering exclude it here.
             and (

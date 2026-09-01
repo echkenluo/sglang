@@ -1210,6 +1210,14 @@ class Envs:
     # other child's compute. Requires --enable-two-batch-overlap and the
     # scattered path; prefill-only, decode untouched. Default off.
     SGLANG_DSV4_TP_SCATTER_TBO = EnvBool(False)
+    # Minimum extend rows in a forward before the scattered path engages.
+    # Below this the fixed per-layer cost of the RS+AG decomposition (2x the
+    # collective launches, ~+10ms/forward on 8xL20-PCIe) exceeds the
+    # row-proportional compute savings; the GPU18 size/concurrency sweeps put
+    # the crossover at ~512 rows regardless of how the rows are composed
+    # (single long extend or batched small ones). Sub-threshold forwards
+    # keep the stock AllReduce path (counted as scattered fallbacks).
+    SGLANG_DSV4_TP_INPUT_SCATTERED_MIN_TOKENS = EnvInt(512)
     # Minimum extend tokens in a forward before the chunk pipeline engages.
     # Small ragged forwards (agent-traffic increments) pay the doubled
     # collective launches without enough compute to hide them (~8% slower on
