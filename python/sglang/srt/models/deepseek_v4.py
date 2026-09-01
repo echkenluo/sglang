@@ -2795,9 +2795,20 @@ class DeepseekV4Model(nn.Module):
             # implement MIXED or other extend-like modes (CR-8 major).
             if forward_batch.global_forward_mode != ForwardMode.EXTEND:
                 return False
+            # Padded children are fine (zero rows are exact through the
+            # scattered collectives, excluded from attention by the child's
+            # num_token_non_padded, and dropped at the token-range merge —
+            # same contract the DP TBO path runs daily). Reject only empty
+            # or inconsistent children: the G4 replay showed real agent
+            # traffic is ragged (173/204 padded forwards), and requiring
+            # unpadded children starved the pipeline to 9/204 coverage.
             for child in forward_batch.tbo_children:
                 start, end = child.tbo_parent_token_range
-                if end - start <= 0 or child.tbo_padded_len != end - start:
+                if (
+                    end - start <= 0
+                    or child.tbo_padded_len is None
+                    or child.tbo_padded_len < end - start
+                ):
                     _dsv4_tp_scatter_log_once(
                         "tbo_child_shape_fallback",
                         "chunk pipeline fell back: child token range "
