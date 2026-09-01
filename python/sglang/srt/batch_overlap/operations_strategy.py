@@ -182,7 +182,42 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 
 
 def _compute_moe_deepseek_v4_prefill(layer):
+    from sglang.srt.layers.communicator import get_attn_tp_context
     from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if get_attn_tp_context().input_scattered:
+        # TP-scattered chunk pipeline: the four scattered collective sites
+        # (attn AG / wo_b RS / MoE AG / MoE RS) are each split into a
+        # comm-stream launch (_a) + wait (_b) around a yield, so one child
+        # slot's collective overlaps the other slot's adjacent compute.
+        # Child A's attention (stage k) always precedes child B's (its
+        # stage k runs after A's in the alternating executor), which orders
+        # A's KV/indexer/compressor writes before B reads them — the same
+        # in-order compute stream carries both childs (design B4).
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.op_sc_ag_attn_a,
+            operations.YieldOperation(),
+            layer.op_sc_ag_attn_b,
+            layer.self_attn.op_attn_scattered,
+            layer.op_sc_rs_wo_a,
+            operations.YieldOperation(),
+            layer.op_sc_rs_wo_b,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_sc_ag_moe_a,
+            operations.YieldOperation(),
+            layer.op_sc_ag_moe_b,
+            layer.op_sc_moe,
+            layer.op_sc_rs_moe_a,
+            operations.YieldOperation(),
+            layer.op_sc_rs_moe_b,
+            layer.op_mhc_postprocess,
+        ]
+        return OperationsStrategy(
+            deep_gemm_num_sms=None,
+            tbo_delta_stages=0,
+            operations=ops,
+        )
 
     if get_moe_a2a_backend().is_none():
         # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv

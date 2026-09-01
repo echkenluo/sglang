@@ -215,6 +215,7 @@ _DSV4_TP_SCATTER_STATS = {
     "fp8_ag_attn": 0,
     "fp8_ag_moe": 0,
     "fp8_rs": 0,
+    "tbo": 0,
 }
 
 
@@ -248,13 +249,14 @@ def _dsv4_tp_scatter_maybe_log_stats() -> None:
         return
     logger.info(
         "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d "
-        "fp8_ag_attn=%d fp8_ag_moe=%d fp8_rs=%d",
+        "fp8_ag_attn=%d fp8_ag_moe=%d fp8_rs=%d tbo=%d",
         _DSV4_TP_SCATTER_STATS["engaged"],
         _DSV4_TP_SCATTER_STATS["padded"],
         _DSV4_TP_SCATTER_STATS["fallback"],
         _DSV4_TP_SCATTER_STATS["fp8_ag_attn"],
         _DSV4_TP_SCATTER_STATS["fp8_ag_moe"],
         _DSV4_TP_SCATTER_STATS["fp8_rs"],
+        _DSV4_TP_SCATTER_STATS["tbo"],
     )
 
 
@@ -330,11 +332,19 @@ def _dsv4_tp_fp8_packed_all_gather(
     return output
 
 
-def _dsv4_tp_all_gather_rows(x: torch.Tensor, site: str = "other") -> torch.Tensor:
-    """Gather token shards over the model TP group, dropping padding rows."""
+def _dsv4_tp_all_gather_rows(
+    x: torch.Tensor, site: str = "other", real_rows: Optional[int] = None
+) -> torch.Tensor:
+    """Gather token shards over the model TP group, dropping padding rows.
+
+    ``real_rows`` overrides the module-level forward row count; the TBO chunk
+    pipeline passes each child slot's own row count here because two
+    interleaved slots cannot share one global (design B2 per-slot rows).
+    """
     tp_group = get_tp_group()
     total_rows = x.shape[0] * tp_group.world_size
-    real_rows = _DSV4_TP_SCATTER_REAL_ROWS
+    if real_rows is None:
+        real_rows = _DSV4_TP_SCATTER_REAL_ROWS
     if not 0 < real_rows <= total_rows or total_rows - real_rows >= tp_group.world_size:
         raise RuntimeError(
             "DSV4 TP-scattered gather invariant violated: "
@@ -1451,6 +1461,7 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
+        defer_scatter_rs: bool = False,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
@@ -1633,6 +1644,13 @@ class MQALayer(MqaAttentionBase):
         use_tp_scattered = get_attn_tp_context().input_scattered
         o, _ = self.wo_b(o.flatten(1), skip_all_reduce=use_tp_scattered)
         if use_tp_scattered:
+            if defer_scatter_rs:
+                # Chunk pipeline: the caller (op_sc_rs_wo_a) launches the
+                # reduce-scatter on the comm stream so it overlaps the other
+                # slot's compute. Scattered admission implies attn_tp==tp, so
+                # the attn_tp_all_reduce below is inactive; return the TP
+                # partial full-row output directly.
+                return o
             o = _dsv4_tp_reduce_scatter_rows(o)
             _dsv4_tp_scatter_log_once(
                 "wo_b_rs",
@@ -1656,6 +1674,17 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_scattered(self, state):
+        """Chunk-pipeline attention op: full attention on the gathered rows,
+        wo_b reduce-scatter deferred to op_sc_rs_wo_a (comm-stream launch)."""
+        state.hidden_states_after_attn_pre_rs = self.forward(
+            x=state.pop("hidden_states_after_input_norm"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            x_quant=state.pop("attn_x_quant"),
+            defer_scatter_rs=True,
         )
 
 
@@ -2497,6 +2526,135 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
 
+    # ------------------------------------------------------------------
+    # TP-scattered chunk-pipeline TBO ops. The four scattered collective
+    # sites (attn AG / wo_b RS / MoE AG / MoE RS) are decomposed into a
+    # comm-stream launch (_a) and a compute-stream wait (_b) so one child
+    # slot's collective overlaps the other slot's compute. Single TP
+    # communicator (PoC verdict: a second communicator is slightly worse).
+    # op_mhc_* and op_mhc_postprocess are reused (row-local on scattered
+    # rows). Each child's row count lives on its ForwardBatch
+    # (_dsv4_sc_real_rows, design B2 per-slot rows).
+    # ------------------------------------------------------------------
+    def _sc_comm_launch(self, state, key, fn):
+        comm = get_dp_tbo_comm_stream()
+        compute = torch.cuda.current_stream()
+        with torch.cuda.stream(comm):
+            comm.wait_stream(compute)
+            out = fn()
+            event = _tbo_event((key, state.tbo_subbatch_index))
+            event.record(comm)
+        return out, event
+
+    @staticmethod
+    def _sc_comm_wait(state, out_key, event_key, keep_key):
+        torch.cuda.current_stream().wait_event(state.pop(event_key))
+        state.pop(keep_key)
+        out = state.pop(out_key)
+        # The output was allocated under the comm stream; mark it used on the
+        # compute stream so the allocator does not recycle it early.
+        out.record_stream(torch.cuda.current_stream())
+        return out
+
+    def op_sc_ag_attn_a(self, state):
+        x = state.pop("hidden_states_after_input_norm")
+        # The pre-gather quantized activation covers only the local shard;
+        # the attention path re-quantizes the gathered rows.
+        state.pop("attn_x_quant")
+        state.attn_x_quant = None
+        real_rows = state.forward_batch._dsv4_sc_real_rows
+        out, event = self._sc_comm_launch(
+            state,
+            "sc_ag_attn",
+            lambda: _dsv4_tp_all_gather_rows(x, site="attn", real_rows=real_rows),
+        )
+        state.sc_ag_attn_out = out
+        state.sc_ag_attn_event = event
+        state.sc_ag_attn_keep = x
+
+    def op_sc_ag_attn_b(self, state):
+        state.hidden_states_after_input_norm = self._sc_comm_wait(
+            state, "sc_ag_attn_out", "sc_ag_attn_event", "sc_ag_attn_keep"
+        )
+
+    def op_sc_rs_wo_a(self, state):
+        o = state.pop("hidden_states_after_attn_pre_rs")
+        out, event = self._sc_comm_launch(
+            state, "sc_rs_wo", lambda: _dsv4_tp_reduce_scatter_rows(o)
+        )
+        state.sc_rs_wo_out = out
+        state.sc_rs_wo_event = event
+        state.sc_rs_wo_keep = o
+
+    def op_sc_rs_wo_b(self, state):
+        state.hidden_states_after_attn = self._sc_comm_wait(
+            state, "sc_rs_wo_out", "sc_rs_wo_event", "sc_rs_wo_keep"
+        )
+
+    def op_sc_ag_moe_a(self, state):
+        local = state.pop("hidden_states_mlp_input")
+        # A replicated TP1 shared expert must run on the LOCAL scattered rows
+        # (same reason as the non-TBO scattered path: adding a replicated
+        # full-row result before the reduce-scatter would sum it per rank).
+        do_shared_local = (
+            getattr(self.mlp, "shared_experts", None) is not None
+            and getattr(self.mlp, "_shared_expert_tp1", False)
+        )
+        state.sc_do_shared_local = do_shared_local
+        state.sc_shared_local = (
+            self.mlp._forward_shared_experts(local)
+            if (do_shared_local and local.shape[0] > 0)
+            else None
+        )
+        real_rows = state.forward_batch._dsv4_sc_real_rows
+        out, event = self._sc_comm_launch(
+            state,
+            "sc_ag_moe",
+            lambda: _dsv4_tp_all_gather_rows(local, site="moe", real_rows=real_rows),
+        )
+        state.sc_ag_moe_out = out
+        state.sc_ag_moe_event = event
+        state.sc_ag_moe_keep = local
+
+    def op_sc_ag_moe_b(self, state):
+        state.sc_moe_input = self._sc_comm_wait(
+            state, "sc_ag_moe_out", "sc_ag_moe_event", "sc_ag_moe_keep"
+        )
+
+    def op_sc_moe(self, state):
+        fb = state.forward_batch
+        hidden = state.pop("sc_moe_input")
+        # mlp_reduce_scatter: the post-experts sum happens in the scattered
+        # reduce-scatter below, so the MoE-internal all_reduce must be skipped
+        # (same contract as the non-TBO scattered path).
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.sc_moe_out = self.mlp(
+                hidden,
+                fb,
+                input_ids=fb.input_ids,
+                input_ids_global=fb.input_ids,
+                skip_shared_experts=state.sc_do_shared_local,
+            )
+
+    def op_sc_rs_moe_a(self, state):
+        out_partial = state.pop("sc_moe_out")
+        out, event = self._sc_comm_launch(
+            state, "sc_rs_moe", lambda: _dsv4_tp_reduce_scatter_rows(out_partial)
+        )
+        state.sc_rs_moe_out = out
+        state.sc_rs_moe_event = event
+        state.sc_rs_moe_keep = out_partial
+
+    def op_sc_rs_moe_b(self, state):
+        hidden = self._sc_comm_wait(
+            state, "sc_rs_moe_out", "sc_rs_moe_event", "sc_rs_moe_keep"
+        )
+        shared_local = state.pop("sc_shared_local")
+        state.pop("sc_do_shared_local")
+        if shared_local is not None:
+            hidden = hidden + shared_local
+        state.hidden_states_mlp_output = hidden
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2613,7 +2771,7 @@ class DeepseekV4Model(nn.Module):
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
-        return (
+        base_ok = (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
@@ -2624,6 +2782,26 @@ class DeepseekV4Model(nn.Module):
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )
+        if not base_ok:
+            return False
+        if get_attn_tp_context().input_scattered:
+            # Chunk pipeline (scattered TBO): env opt-in plus fail-closed
+            # child-shape admission — both children non-empty and unpadded
+            # (tbo_padded_len == the token-range length), because the
+            # scattered ops key every collective on the child's real rows.
+            if not envs.SGLANG_DSV4_TP_SCATTER_TBO.get():
+                return False
+            for child in forward_batch.tbo_children:
+                start, end = child.tbo_parent_token_range
+                if end - start <= 0 or child.tbo_padded_len != end - start:
+                    _dsv4_tp_scatter_log_once(
+                        "tbo_child_shape_fallback",
+                        "chunk pipeline fell back: child token range "
+                        f"[{start},{end}) with tbo_padded_len="
+                        f"{child.tbo_padded_len}",
+                    )
+                    return False
+        return True
 
     def _forward_layers_tbo(
         self,
@@ -2655,6 +2833,24 @@ class DeepseekV4Model(nn.Module):
             )
             for idx, child in enumerate(forward_batch.tbo_children)
         ]
+
+        # Chunk pipeline (scattered TBO): the split above ran on FULL rows
+        # (design B2 — split before the entry reduce-scatter). Each child now
+        # takes its own scattered entry: record its row count on the child
+        # ForwardBatch (per-slot rows for the layer ops), then reduce-scatter
+        # its vocab-parallel-partial hidden into TP-owned rows. The exit
+        # gather happens per child after the overlapped layers, so the merge
+        # sees full rows again. Both are once-per-forward and stay
+        # synchronous (43x4 per-layer sites carry the overlap value).
+        sc_tbo = get_attn_tp_context().input_scattered
+        if sc_tbo:
+            _DSV4_TP_SCATTER_STATS["tbo"] += 1
+            for inp in inputs_arr:
+                child_fb = inp["forward_batch"]
+                child_fb._dsv4_sc_real_rows = inp["hidden_states"].shape[0]
+                inp["hidden_states"] = _dsv4_tp_reduce_scatter_rows(
+                    inp["hidden_states"]
+                )
 
         # Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
         # needs each ubatch's per-rank token counts, but tbo_padded_len is computed
@@ -2709,6 +2905,13 @@ class DeepseekV4Model(nn.Module):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
+        if sc_tbo:
+            for out in outputs_arr:
+                out["hidden_states"] = _dsv4_tp_all_gather_rows(
+                    out["hidden_states"],
+                    real_rows=out["forward_batch"]._dsv4_sc_real_rows,
+                )
+
         hidden_states, _ = _model_forward_tbo_merge_outputs(
             outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
         )
@@ -2754,6 +2957,7 @@ class DeepseekV4Model(nn.Module):
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
+        sc_tbo_forward = False
         if get_attn_tp_context().input_scattered:
             if self.pp_group.world_size != 1:
                 raise RuntimeError("DSV4 TP input-scattered requires pp_size=1")
@@ -2762,16 +2966,28 @@ class DeepseekV4Model(nn.Module):
                     "DSV4 TP input-scattered does not support DSpark aux capture"
                 )
             _dsv4_tp_scatter_begin_forward(hidden_states.shape[0])
-            # VocabParallelEmbedding intentionally skips its all-reduce while
-            # input_scattered is active. Its output is therefore still a TP
-            # partial, not a replicated tensor. Reduce-scatter both sums the
-            # vocab shards and assigns the resulting token rows to TP ranks.
-            hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
-            _dsv4_tp_scatter_log_once(
-                "model_input",
-                "reduced vocab-parallel embedding into TP-owned token rows via "
-                f"{_dsv4_tp_scatter_collective_name()}",
-            )
+            # Chunk pipeline: the TBO child split must happen on FULL rows
+            # (design B2), so _forward_layers_tbo owns the per-child entry
+            # reduce-scatter and exit gather for this forward.
+            sc_tbo_forward = self._can_run_tbo(forward_batch)
+            if sc_tbo_forward:
+                _dsv4_tp_scatter_log_once(
+                    "model_input_tbo",
+                    "chunk pipeline engaged: entry reduce-scatter deferred to "
+                    "the per-child split",
+                )
+            else:
+                # VocabParallelEmbedding intentionally skips its all-reduce
+                # while input_scattered is active. Its output is therefore
+                # still a TP partial, not a replicated tensor. Reduce-scatter
+                # both sums the vocab shards and assigns the resulting token
+                # rows to TP ranks.
+                hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
+                _dsv4_tp_scatter_log_once(
+                    "model_input",
+                    "reduced vocab-parallel embedding into TP-owned token rows "
+                    f"via {_dsv4_tp_scatter_collective_name()}",
+                )
         elif (
             envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
             and forward_batch.forward_mode.is_extend()
@@ -2839,11 +3055,14 @@ class DeepseekV4Model(nn.Module):
                 )
 
         if get_attn_tp_context().input_scattered:
-            hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
-            _dsv4_tp_scatter_log_once(
-                "model_output",
-                "restored full token rows before the DSV4 head",
-            )
+            if not sc_tbo_forward:
+                # In the chunk pipeline the per-child exit gather already
+                # restored full rows inside _forward_layers_tbo.
+                hidden_states = _dsv4_tp_all_gather_rows(hidden_states)
+                _dsv4_tp_scatter_log_once(
+                    "model_output",
+                    "restored full token rows before the DSV4 head",
+                )
             _dsv4_tp_scatter_maybe_log_stats()
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.

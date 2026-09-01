@@ -1204,6 +1204,12 @@ class Envs:
     # larger than FP8-AG's final-value quantization; gated behind the same
     # task-level quality gates. Default off.
     SGLANG_DSV4_TP_SCATTER_FP8_RS = EnvBool(False)
+    # Chunk pipeline: run prefill as two TBO child slots with the four
+    # scattered collective sites (attn AG / wo_b RS / MoE AG / MoE RS)
+    # launched on the comm stream so one child's collectives overlap the
+    # other child's compute. Requires --enable-two-batch-overlap and the
+    # scattered path; prefill-only, decode untouched. Default off.
+    SGLANG_DSV4_TP_SCATTER_TBO = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

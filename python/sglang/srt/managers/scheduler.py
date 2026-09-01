@@ -3047,6 +3047,31 @@ class Scheduler(
             ret, need_sync=need_mlp_sync
         )
 
+        # DSV4 TP-scattered chunk pipeline: without DP attention there is no
+        # MLP sync to populate tbo_split_seq_index, so assign the prefill
+        # split here (TP ranks see identical batches -> identical splits).
+        if (
+            ret is not None
+            and not self.require_mlp_sync
+            and self.server_args.enable_two_batch_overlap
+            and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
+            and self.spec_algorithm.is_none()
+            and ret.forward_mode.is_extend()
+            and not ret.forward_mode.is_target_verify()
+            and ret.extend_lens is not None
+        ):
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                compute_split_seq_index,
+            )
+
+            ret.tbo_split_seq_index = compute_split_seq_index(
+                forward_mode=ret.forward_mode,
+                num_tokens=sum(ret.extend_lens),
+                extend_lens=ret.extend_lens,
+                token_num_per_seq=None,
+            )
+            ret.global_forward_mode = ret.forward_mode
+
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
             ret, chunked_req=self.chunked_req

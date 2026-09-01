@@ -8689,11 +8689,19 @@ class ServerArgs:
             self.enable_two_batch_overlap
             and self.moe_a2a_backend == "none"
             and not self.enable_dp_attention
+            # The TP-scattered chunk pipeline is the second non-EP TBO path:
+            # plain TP attention with the scattered collectives overlapped.
+            and not (
+                envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
+                and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
+            )
         ):
             raise ValueError(
                 "When enabling two batch overlap without an EP a2a backend "
                 "(moe_a2a_backend='none'), --enable-dp-attention is required "
-                "(DeepSeek-V4 non-EP DP TBO path)."
+                "(DeepSeek-V4 non-EP DP TBO path), or the DSV4 TP-scattered "
+                "pipeline (SGLANG_DSV4_TP_INPUT_SCATTERED=1 and "
+                "SGLANG_DSV4_TP_SCATTER_TBO=1)."
             )
 
     def check_server_args(self):
