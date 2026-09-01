@@ -105,7 +105,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -2790,6 +2790,10 @@ class DeepseekV4Model(nn.Module):
             # (tbo_padded_len == the token-range length), because the
             # scattered ops key every collective on the child's real rows.
             if not envs.SGLANG_DSV4_TP_SCATTER_TBO.get():
+                return False
+            # Exact EXTEND only: the scattered op strategy does not
+            # implement MIXED or other extend-like modes (CR-8 major).
+            if forward_batch.global_forward_mode != ForwardMode.EXTEND:
                 return False
             for child in forward_batch.tbo_children:
                 start, end = child.tbo_parent_token_range

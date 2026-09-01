@@ -258,7 +258,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -3056,8 +3056,9 @@ class Scheduler(
             and self.server_args.enable_two_batch_overlap
             and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
             and self.spec_algorithm.is_none()
-            and ret.forward_mode.is_extend()
-            and not ret.forward_mode.is_target_verify()
+            # Exact EXTEND only: the DSV4 scattered op strategy raises on
+            # MIXED and every other extend-like mode (CR-8 major).
+            and ret.forward_mode == ForwardMode.EXTEND
             and ret.extend_lens is not None
         ):
             from sglang.srt.batch_overlap.two_batch_overlap import (

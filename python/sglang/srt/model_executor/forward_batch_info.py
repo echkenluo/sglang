@@ -1532,6 +1532,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if not input_scattered:
             return
         assert self.forward_mode.is_extend()
+        if (
+            self.can_run_tbo
+            and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
+            and self.forward_mode == ForwardMode.EXTEND
+        ):
+            # Chunk pipeline (no-DP scattered TBO): build the two child
+            # batches here — the MLP-sync path that normally invokes the
+            # preparer does not run without DP attention. Children inherit
+            # dp_padding_mode, so give the parent a concrete mode first
+            # (the stage executor dereferences it).
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                TboForwardBatchPreparer,
+            )
+
+            if self.dp_padding_mode is None:
+                self.dp_padding_mode = DpPaddingMode.SUM_LEN
+            TboForwardBatchPreparer.prepare(
+                batch=self, is_draft_worker=model_runner.is_draft_worker
+            )
+            if self.tbo_children is not None:
+                for child in self.tbo_children:
+                    child._pad_inputs_to_size(
+                        model_runner, child.tbo_padded_len, child.batch_size
+                    )
+                # Split-before-entry-RS: each child pads its own rows inside
+                # the scattered collectives; no parent-level padding.
+                return
+            # Children not constructed: fall through to the plain scattered
+            # path (the model-side admission will also reject TBO).
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size

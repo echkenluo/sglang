@@ -304,7 +304,12 @@ class AttnTpContext:
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.input_ids is not None
-            and not forward_batch.can_run_tbo
+            # The DSV4 chunk pipeline runs TBO ON the scattered path; only
+            # the (DP) TBO paths that bypass scattering exclude it here.
+            and (
+                not forward_batch.can_run_tbo
+                or envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
+            )
         )
 
     @property
