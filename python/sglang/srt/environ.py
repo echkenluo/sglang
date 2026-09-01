@@ -1210,6 +1210,12 @@ class Envs:
     # other child's compute. Requires --enable-two-batch-overlap and the
     # scattered path; prefill-only, decode untouched. Default off.
     SGLANG_DSV4_TP_SCATTER_TBO = EnvBool(False)
+    # Minimum extend tokens in a forward before the chunk pipeline engages.
+    # Small ragged forwards (agent-traffic increments) pay the doubled
+    # collective launches without enough compute to hide them (~8% slower on
+    # the 203-request replay at 100% exposure); full prefill chunks gain
+    # 9-11%. Below the threshold the forward keeps the stock scattered path.
+    SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS = EnvInt(4096)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

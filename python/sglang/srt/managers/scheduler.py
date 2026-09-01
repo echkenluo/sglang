@@ -3060,6 +3060,10 @@ class Scheduler(
             # MIXED and every other extend-like mode (CR-8 major).
             and ret.forward_mode == ForwardMode.EXTEND
             and ret.extend_lens is not None
+            # Small forwards pay the pipeline's split tax without enough
+            # compute to hide the collectives; keep them on the stock path.
+            and sum(ret.extend_lens)
+            >= envs.SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS.get()
         ):
             from sglang.srt.batch_overlap.two_batch_overlap import (
                 compute_split_seq_index,
