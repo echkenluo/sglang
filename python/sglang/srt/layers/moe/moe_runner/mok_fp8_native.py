@@ -157,9 +157,18 @@ def _summarize_m64_tails(expert_rows: list[int]) -> dict[str, int]:
 
 
 def _format_m64_tail_trace(
-    *, layer_id, rank: int, mode: str, summary: dict[str, int]
+    *,
+    layer_id,
+    rank: int,
+    mode: str,
+    num_tokens: int,
+    padded_tokens: int,
+    topk: int,
+    summary: dict[str, int],
 ) -> str:
     """Format one validated per-layer/rank M64 tail-work record."""
+    if min(num_tokens, padded_tokens, topk) <= 0 or num_tokens > padded_tokens:
+        raise ValueError("MoK M64 tail trace geometry is inconsistent")
     required = (
         "active_experts",
         "raw_rows",
@@ -192,7 +201,9 @@ def _format_m64_tail_trace(
     fields = " ".join(f"{field}={summary[field]}" for field in required)
     return (
         "MOK_M64_TAIL_TRACE "
-        f"layer={layer_id} rank={rank} mode={mode} {fields}"
+        f"layer={layer_id} rank={rank} mode={mode} "
+        f"tokens={num_tokens} padded_tokens={padded_tokens} topk={topk} "
+        f"{fields}"
     )
 
 
@@ -254,6 +265,9 @@ def _note_schedule_trace(
             layer_id=layer.layer_id,
             rank=rank,
             mode=mode,
+            num_tokens=num_tokens,
+            padded_tokens=padded_tokens,
+            topk=workspace.topk,
             summary=tail_summary,
         )
     )

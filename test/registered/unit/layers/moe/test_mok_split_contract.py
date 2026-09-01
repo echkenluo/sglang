@@ -342,9 +342,16 @@ class TestMoKSplitContract(unittest.TestCase):
             [3, 2, 2, 2, 2],
         )
         line = _format_m64_tail_trace(
-            layer_id=9, rank=3, mode="extend", summary=summary
+            layer_id=9,
+            rank=3,
+            mode="extend",
+            num_tokens=1044,
+            padded_tokens=2048,
+            topk=8,
+            summary=summary,
         )
         self.assertIn("layer=9 rank=3 mode=extend", line)
+        self.assertIn("tokens=1044 padded_tokens=2048 topk=8", line)
         self.assertIn("raw_rows=533 full_rows=256 tail_experts=11", line)
         self.assertIn("m64_rows=960 m32_rows=736 m16_rows=624", line)
 
@@ -355,7 +362,20 @@ class TestMoKSplitContract(unittest.TestCase):
                 layer_id=9,
                 rank=3,
                 mode="extend",
+                num_tokens=1044,
+                padded_tokens=2048,
+                topk=8,
                 summary=summary | {"tail_real_rows": 278},
+            )
+        with self.assertRaises(ValueError):
+            _format_m64_tail_trace(
+                layer_id=9,
+                rank=3,
+                mode="extend",
+                num_tokens=2049,
+                padded_tokens=2048,
+                topk=8,
+                summary=summary,
             )
 
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
