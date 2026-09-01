@@ -3048,34 +3048,51 @@ class Scheduler(
         )
 
         # DSV4 TP-scattered chunk pipeline: without DP attention there is no
-        # MLP sync to populate tbo_split_seq_index, so assign the prefill
-        # split here (TP ranks see identical batches -> identical splits).
+        # MLP sync to populate tbo_split_seq_index, so assign splits here
+        # (TP ranks see identical batches -> identical splits).
         if (
             ret is not None
             and not self.require_mlp_sync
             and self.server_args.enable_two_batch_overlap
             and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
             and self.spec_algorithm.is_none()
-            # Exact EXTEND only: the DSV4 scattered op strategy raises on
-            # MIXED and every other extend-like mode (CR-8 major).
-            and ret.forward_mode == ForwardMode.EXTEND
-            and ret.extend_lens is not None
-            # Small forwards pay the pipeline's split tax without enough
-            # compute to hide the collectives; keep them on the stock path.
-            and sum(ret.extend_lens)
-            >= envs.SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS.get()
         ):
             from sglang.srt.batch_overlap.two_batch_overlap import (
                 compute_split_seq_index,
             )
 
-            ret.tbo_split_seq_index = compute_split_seq_index(
-                forward_mode=ret.forward_mode,
-                num_tokens=sum(ret.extend_lens),
-                extend_lens=ret.extend_lens,
-                token_num_per_seq=None,
-            )
-            ret.global_forward_mode = ret.forward_mode
+            if (
+                # Exact EXTEND only: the DSV4 scattered op strategy raises
+                # on MIXED and every other extend-like mode (CR-8 major).
+                ret.forward_mode == ForwardMode.EXTEND
+                and ret.extend_lens is not None
+                # Small forwards pay the pipeline's split tax without enough
+                # compute to hide the collectives; keep them on the stock
+                # path.
+                and sum(ret.extend_lens)
+                >= envs.SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS.get()
+            ):
+                ret.tbo_split_seq_index = compute_split_seq_index(
+                    forward_mode=ret.forward_mode,
+                    num_tokens=sum(ret.extend_lens),
+                    extend_lens=ret.extend_lens,
+                    token_num_per_seq=None,
+                )
+                ret.global_forward_mode = ret.forward_mode
+            elif ret.forward_mode.is_decode():
+                # Decode runs non-TBO (prefill-only strategy), but with
+                # --enable-two-batch-overlap the decode graph runner requires
+                # can_run_tbo (a populated split index) to replay graphs —
+                # the DP deployments get this from the MLP sync. Without it,
+                # decode silently drops to eager (~7x slower, found by the
+                # threshold-mode confirm window). The index is bookkeeping
+                # only: no children are built on the decode path.
+                ret.tbo_split_seq_index = compute_split_seq_index(
+                    forward_mode=ret.forward_mode,
+                    num_tokens=len(ret.reqs),
+                    extend_lens=None,
+                    token_num_per_seq=1,
+                )
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
