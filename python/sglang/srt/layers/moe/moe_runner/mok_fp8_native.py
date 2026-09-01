@@ -121,6 +121,81 @@ def _format_schedule_trace(
     )
 
 
+def _summarize_m64_tails(expert_rows: list[int]) -> dict[str, int]:
+    """Return exact and bucketed work for a full-M64 plus small-tail design.
+
+    ``expert_rows`` contains the real rows received by each local expert.  A
+    weight tile cannot span experts, so only the final partial M64 of each
+    active expert is eligible for a smaller kernel.  The M32/M16 values are
+    compute-row upper bounds for bucketed tail kernels, not performance
+    predictions.
+    """
+    if any(type(rows) is not int or rows < 0 for rows in expert_rows):
+        raise ValueError("MoK expert row counts must be non-negative integers")
+
+    tails = [rows % 64 for rows in expert_rows if rows % 64]
+    full_rows = sum((rows // 64) * 64 for rows in expert_rows)
+
+    def bucketed_tail_rows(tile: int) -> int:
+        return sum(((tail + tile - 1) // tile) * tile for tail in tails)
+
+    return {
+        "active_experts": sum(rows > 0 for rows in expert_rows),
+        "raw_rows": sum(expert_rows),
+        "full_rows": full_rows,
+        "tail_experts": len(tails),
+        "tail_real_rows": sum(tails),
+        "m64_rows": full_rows + 64 * len(tails),
+        "m32_rows": full_rows + bucketed_tail_rows(32),
+        "m16_rows": full_rows + bucketed_tail_rows(16),
+        "bin_1_8": sum(1 <= tail <= 8 for tail in tails),
+        "bin_9_16": sum(9 <= tail <= 16 for tail in tails),
+        "bin_17_32": sum(17 <= tail <= 32 for tail in tails),
+        "bin_33_48": sum(33 <= tail <= 48 for tail in tails),
+        "bin_49_63": sum(49 <= tail <= 63 for tail in tails),
+    }
+
+
+def _format_m64_tail_trace(
+    *, layer_id, rank: int, mode: str, summary: dict[str, int]
+) -> str:
+    """Format one validated per-layer/rank M64 tail-work record."""
+    required = (
+        "active_experts",
+        "raw_rows",
+        "full_rows",
+        "tail_experts",
+        "tail_real_rows",
+        "m64_rows",
+        "m32_rows",
+        "m16_rows",
+        "bin_1_8",
+        "bin_9_16",
+        "bin_17_32",
+        "bin_33_48",
+        "bin_49_63",
+    )
+    if set(summary) != set(required):
+        raise ValueError("MoK M64 tail trace has an unexpected field set")
+    if any(type(summary[field]) is not int or summary[field] < 0 for field in required):
+        raise ValueError("MoK M64 tail trace fields must be non-negative integers")
+    if not (
+        summary["raw_rows"]
+        == summary["full_rows"] + summary["tail_real_rows"]
+        <= summary["m16_rows"]
+        <= summary["m32_rows"]
+        <= summary["m64_rows"]
+    ):
+        raise ValueError("MoK M64 tail trace row accounting is inconsistent")
+    if sum(summary[field] for field in required[-5:]) != summary["tail_experts"]:
+        raise ValueError("MoK M64 tail histogram does not cover every tail")
+    fields = " ".join(f"{field}={summary[field]}" for field in required)
+    return (
+        "MOK_M64_TAIL_TRACE "
+        f"layer={layer_id} rank={rank} mode={mode} {fields}"
+    )
+
+
 def _note_schedule_trace(
     *,
     layer,
@@ -149,6 +224,18 @@ def _note_schedule_trace(
         .item()
     )
     scheduled_rows = int(workspace.schedule_num_tokens.item())
+    expert_rows = (
+        workspace.schedule_tokens_per_expert_and_peer.view(
+            layer.num_local_experts, -1
+        )
+        .sum(dim=1)
+        .tolist()
+    )
+    tail_summary = _summarize_m64_tails(expert_rows)
+    if tail_summary["raw_rows"] != raw_route_rows:
+        raise RuntimeError("MoK route gather and per-expert row counts disagree")
+    if tail_summary["m64_rows"] != scheduled_rows:
+        raise RuntimeError("MoK M64 tail accounting and scheduled rows disagree")
     line = _format_schedule_trace(
         layer_id=layer.layer_id,
         rank=rank,
@@ -162,6 +249,14 @@ def _note_schedule_trace(
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
     logger.info(line)
+    logger.info(
+        _format_m64_tail_trace(
+            layer_id=layer.layer_id,
+            rank=rank,
+            mode=mode,
+            summary=tail_summary,
+        )
+    )
     return line
 
 

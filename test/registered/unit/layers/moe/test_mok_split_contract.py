@@ -317,6 +317,47 @@ class TestMoKSplitContract(unittest.TestCase):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 _format_schedule_trace(**(base | override))
 
+    def test_m64_tail_trace_separates_full_tiles_and_bucketed_tails(self):
+        from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
+            _format_m64_tail_trace,
+            _summarize_m64_tails,
+        )
+
+        summary = _summarize_m64_tails(
+            [0, 1, 8, 9, 16, 17, 32, 33, 48, 49, 63, 64, 65, 128]
+        )
+        self.assertEqual(summary["active_experts"], 13)
+        self.assertEqual(summary["raw_rows"], 533)
+        self.assertEqual(summary["full_rows"], 256)
+        self.assertEqual(summary["tail_experts"], 11)
+        self.assertEqual(summary["tail_real_rows"], 277)
+        self.assertEqual(summary["m64_rows"], 960)
+        self.assertEqual(summary["m32_rows"], 736)
+        self.assertEqual(summary["m16_rows"], 624)
+        self.assertEqual(
+            [
+                summary[f"bin_{name}"]
+                for name in ("1_8", "9_16", "17_32", "33_48", "49_63")
+            ],
+            [3, 2, 2, 2, 2],
+        )
+        line = _format_m64_tail_trace(
+            layer_id=9, rank=3, mode="extend", summary=summary
+        )
+        self.assertIn("layer=9 rank=3 mode=extend", line)
+        self.assertIn("raw_rows=533 full_rows=256 tail_experts=11", line)
+        self.assertIn("m64_rows=960 m32_rows=736 m16_rows=624", line)
+
+        with self.assertRaises(ValueError):
+            _summarize_m64_tails([1, -1])
+        with self.assertRaises(ValueError):
+            _format_m64_tail_trace(
+                layer_id=9,
+                rank=3,
+                mode="extend",
+                summary=summary | {"tail_real_rows": 278},
+            )
+
     def test_min_tokens_gate_defaults_off_and_skips_forward_context(self):
         from unittest import mock
 
