@@ -106,6 +106,16 @@ class NgramCorpus:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
+    def batch_get_with_lens(
+        self,
+        req_ids: List[str],
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return batch_get outputs plus the number of real nodes per request."""
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.match_stateful_lens(state_ids, batch_tokens, total_lens)
+
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
         for rid in req_ids:

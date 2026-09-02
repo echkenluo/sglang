@@ -29,6 +29,8 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
     }
   }
 
+  info.num_valid = static_cast<int32_t>(info.token.size());
+
   // zero padding to length
   while (info.token.size() < static_cast<size_t>(draft_token_num)) {
     info.token.emplace_back(0);
@@ -49,7 +51,8 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
 }
 
 std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
-  const auto n = static_cast<int>(result.token.size());
+  const auto full_n = static_cast<int>(result.token.size());
+  const auto n = std::clamp(static_cast<int>(result.num_valid), 0, full_n);
   if (n <= 1) {
     return {};
   }
@@ -58,7 +61,7 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
   std::vector<bool> has_child(n, false);
   for (int i = 1; i < n; ++i) {
     for (int j = i - 1; j >= 0; --j) {
-      if (result.mask[i * n + j]) {
+      if (result.mask[i * full_n + j]) {
         parent[i] = j;
         has_child[j] = true;
         break;
@@ -76,9 +79,6 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
       path.emplace_back(result.token[cursor]);
     }
     std::reverse(path.begin(), path.end());
-    if (path.size() == 1 && path.front() == 0) {
-      continue;
-    }
     paths.emplace_back(std::move(path));
   }
   return paths;
@@ -131,6 +131,9 @@ void Result::truncate(size_t n) {
     }
     token.resize(n);
     mask.resize(n * n);
+    if (num_valid > static_cast<int32_t>(n)) {
+      num_valid = static_cast<int32_t>(n);
+    }
   }
 }
 
