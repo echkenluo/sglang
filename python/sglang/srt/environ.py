@@ -1220,6 +1220,12 @@ class Envs:
     SGLANG_OPT_USE_MOK_FP8_NATIVE = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_STRICT = EnvBool(False)
     SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH = EnvBool(False)
+    # Replace the split dispatch/W13/activation/W2/combine sequence with the
+    # MoK warp-role megakernel, which runs all of it in one launch. Requires
+    # SGLANG_OPT_USE_MOK_FP8_NATIVE; the variant selects the consumer/stage
+    # layout ("c2s4" or "c1s6") the megakernel is launched with.
+    SGLANG_OPT_MOK_WARPROLE = EnvBool(False)
+    SGLANG_OPT_MOK_WARPROLE_VARIANT = EnvStr("c2s4")
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
