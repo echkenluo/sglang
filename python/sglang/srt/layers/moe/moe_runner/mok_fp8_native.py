@@ -560,6 +560,58 @@ def _run_native_core(
         num_local_experts=layer.num_local_experts,
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
+    if envs.SGLANG_OPT_MOK_WARPROLE.get():
+        try:
+            from mok import warprole as mok_warprole
+        except ImportError as exc:
+            raise RuntimeError(
+                "SGLANG_OPT_MOK_WARPROLE requires the MoK warp-role megakernel"
+            ) from exc
+        # warprole_forward acquires and releases the workspace lease itself, so
+        # the schedule build hands the lease back here and takes it again after
+        # the launch.  The outer boundary therefore still owns exactly one
+        # lease across the caller's materializing copy, exactly as below.
+        mok_functional.release_workspace_lease(workspace)
+        # State creation rendezvouses symmetric memory and barriers, so every
+        # EP rank must reach it together; the strict contract already puts them
+        # on the same layer and shape, which is what the split path relies on
+        # for its own workspace and schedule collectives.
+        state = mok_warprole.get_warprole_state(
+            workspace,
+            get_tp_group().device_group,
+            device=padded_hidden.device,
+            capacity=workspace.schedule_capacity,
+        )
+        # The megakernel fuses dispatch, W13, the clamped SwiGLU with its FP8
+        # quantization, W2, combine and the reduce into one launch, so the
+        # split sequence below has no counterpart here.  Activations are the
+        # freshly quantized tensors rather than the workspace symmetric
+        # buffers -- on the split path dispatch_fp8_block publishes them -- so
+        # the wrapper copies them in.  Router weights and top-k ids already
+        # satisfy its contiguous float32/int32 [T,topk] contract: the shape
+        # contract validates them and the padding path builds them that way.
+        variant = envs.SGLANG_OPT_MOK_WARPROLE_VARIANT.get()
+        _report_warprole_active(layer, variant, workspace.schedule_capacity)
+        out = mok_warprole.warprole_forward(
+            workspace,
+            state,
+            schedule,
+            input_fp8,
+            input_scale,
+            padded_topk_weights,
+            padded_topk_ids,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            variant=variant,
+            swiglu_limit=layer.moe_runner_config.swiglu_limit,
+        )
+        mok_functional.acquire_workspace_lease(workspace)
+        # Same handback as the combine path below: the result is a persistent
+        # buffer overwritten by the next call, and the outer boundary copies it
+        # into new storage before releasing the lease.
+        return out
     gate_up_size = layer.w13_weight.shape[1]
     intermediate_size = layer.w2_weight.shape[2]
     routed_x, routed_x_scale, m_indices = mok_functional.dispatch_fp8_block(
@@ -932,6 +984,22 @@ def maybe_run_mok_fp8_native(
     except RuntimeError:
         _die_if_trapped(workspace, mok_functional)
         raise
+
+
+_REPORTED_WARPROLE = False
+
+
+def _report_warprole_active(layer, variant: str, capacity: int) -> None:
+    """One-shot marker for the warp-role megakernel path (grepped by the E2E runner)."""
+    global _REPORTED_WARPROLE
+    if not _REPORTED_WARPROLE:
+        _REPORTED_WARPROLE = True
+        logger.info(
+            "MoK warp-role megakernel active: layer=%s variant=%s capacity=%d",
+            layer.layer_id,
+            variant,
+            capacity,
+        )
 
 
 def _report_active(
