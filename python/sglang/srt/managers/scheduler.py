@@ -4238,6 +4238,18 @@ class Scheduler(
             ret["scale_phase"] = ElasticEPStateManager.get_scale_phase()
             ret["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
 
+        if not self.spec_algorithm.is_none():
+            # Cumulative speculative counters for external delta measurements:
+            # the lifetime totals plus the not-yet-flushed log interval.
+            ret["cum_spec_accept_length"] = (
+                self.metrics_reporter.spec_total_num_accept_tokens
+                + self.metrics_reporter.spec_num_accept_tokens
+            )
+            ret["cum_spec_accept_count"] = (
+                self.metrics_reporter.spec_total_num_forward_ct
+                + self.metrics_reporter.spec_num_forward_ct
+            )
+
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0
