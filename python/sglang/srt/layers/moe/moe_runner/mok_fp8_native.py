@@ -628,6 +628,14 @@ def _run_native_core(
             variant=variant,
             swiglu_limit=layer.moe_runner_config.swiglu_limit,
         )
+        if os.environ.get("SGLANG_MOK_LIVE_AUDIT_DIR"):
+            # Diagnostic only: read intermediates while this call still owns
+            # the workspace. The audit never supplies the model's output.
+            from .mok_fp8_live_audit import audit_warprole_layer
+
+            audit_warprole_layer(
+                layer, state, schedule, out, variant, input_fp8.shape[0]
+            )
         # Same handback as the combine path below: the result is a persistent
         # buffer overwritten by the next call, and the outer boundary copies it
         # into new storage before releasing the lease.
