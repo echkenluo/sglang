@@ -1299,6 +1299,8 @@ class Envs:
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # Opt in to the F28-derived Ada wo_a kernel; requires FP8_WO_A_GEMM.
+    SGLANG_DSV4_SM89_FP8_WO_A = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)

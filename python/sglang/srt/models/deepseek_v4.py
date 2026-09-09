@@ -1621,8 +1621,6 @@ class MQALayer(MqaAttentionBase):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            import deep_gemm
-
             from sglang.srt.layers import deep_gemm_wrapper
 
             T, G, D = o.shape
@@ -1632,7 +1630,7 @@ class MQALayer(MqaAttentionBase):
                 o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                 recipe = (1, 1, 128)
             else:
-                # sm90 (Hopper): fp32 scales.
+                # SM90 DeepGEMM / SM89 Triton: unpacked FP32 scales.
                 o_fp8, o_s = sglang_per_token_group_quant_fp8(
                     o.reshape(T * G, D).contiguous(),
                     group_size=128,
@@ -1642,13 +1640,26 @@ class MQALayer(MqaAttentionBase):
                 o_s = o_s.view(T, G, -1)
                 recipe = (1, 128, 128)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
-                recipe=recipe,
-            )
+            if envs.SGLANG_DSV4_SM89_FP8_WO_A.get():
+                from sglang.kernels.ops.dsv4_sm89_fp8_einsum import sm89_fp8_einsum
+
+                sm89_fp8_einsum(
+                    o_fp8,
+                    o_s,
+                    self.wo_a.weight.view(G, R, D),
+                    self.wo_a.weight_scale_inv.data,
+                    output,
+                )
+            else:
+                import deep_gemm
+
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_s),
+                    (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                    output,
+                    recipe=recipe,
+                )
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -3324,6 +3335,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
+
+        if envs.SGLANG_DSV4_SM89_FP8_WO_A.get():
+            log_info_on_rank0(
+                logger, f"SM89 Triton FP8-storage wo_a ready: nextn={is_nextn}"
+            )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if _FP8_WO_A_GEMM:

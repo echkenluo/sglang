@@ -7742,16 +7742,25 @@ class ServerArgs:
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
         # it, mirroring the forward scale split: the ue8m0 path
         # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+        # fp32-scale path (use FP4 expert ckpt), or explicit SM89 Triton opt-in.
+        if envs.SGLANG_DSV4_SM89_FP8_WO_A.get():
+            if not is_cuda() or get_device_sm() != 89:
+                raise ValueError("SGLANG_DSV4_SM89_FP8_WO_A requires SM89 CUDA GPUs")
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+                raise ValueError("SM89 FP8 wo_a requires SGLANG_OPT_FP8_WO_A_GEMM=1")
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             from sglang.srt.layers import deep_gemm_wrapper
 
             sm = get_device_sm()
             explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
-            supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and is_sm90_supported()
-                and explicit
+            supported = (
+                (sm == 89 and envs.SGLANG_DSV4_SM89_FP8_WO_A.get())
+                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or (
+                    deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                    and is_sm90_supported()
+                    and explicit
+                )
             )
             if not supported and explicit:
                 logger.warning(
