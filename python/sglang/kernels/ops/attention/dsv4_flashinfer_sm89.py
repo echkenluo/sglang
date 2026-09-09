@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSV4 adapter for the pinned FlashInfer SM89 sparse MLA fork.
 
-Dependency: F28 FlashInfer 0.6.18 with the committed SGLang page-128
-extension. The unmodified F28 distribution lacks SGLang's SWA page size.
+Dependency: F28 FlashInfer 0.6.18. The page-128 extension is optional;
+the current SGLang CUDA pool uses physical page 256 and logical window 128.
 
 The cache view describes a page, not independent 584-byte token records:
 KV payloads precede the page scale footer. Preserve stride(0), including
@@ -39,11 +39,9 @@ class Dsv4FlashInferSm89:
             _SparseMLAPagedAttentionRunner,
         )
 
-        if not {64, 128, 256}.issubset(_DECODE_DSV4_PAGE_BLOCK_SIZES):
-            raise RuntimeError(
-                "DSV4 SM89 adapter requires the F28 FlashInfer fork with "
-                "SGLang SWA page-128 dispatch support"
-            )
+        if not {64, 256}.issubset(_DECODE_DSV4_PAGE_BLOCK_SIZES):
+            raise RuntimeError("DSV4 SM89 adapter requires the F28 FlashInfer fork")
+        self.supported_main_pages = _DECODE_DSV4_PAGE_BLOCK_SIZES
         # The runner rejects architectures other than 89/120/121. Our model
         # dispatch is SM89-only; other SGLang backends remain unchanged.
         self.runner = _SparseMLAPagedAttentionRunner(
@@ -70,6 +68,11 @@ class Dsv4FlashInferSm89:
         if q.dtype != torch.bfloat16 or head_dim_v != 512:
             raise ValueError("DSV4 SM89 sparse MLA requires BF16 query and d_v=512")
         k_cache = self._packed_cache_bytes(k_cache)
+        if k_cache.shape[1] not in self.supported_main_pages:
+            raise ValueError(
+                f"FlashInfer main cache page {k_cache.shape[1]} is not instantiated; "
+                f"available pages: {sorted(self.supported_main_pages)}"
+            )
         extra_k_cache = self._packed_cache_bytes(extra_k_cache)
         q3 = q.squeeze(1).contiguous()
         out = torch.empty_like(q3)

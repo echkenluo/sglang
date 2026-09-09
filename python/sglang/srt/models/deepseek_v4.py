@@ -160,7 +160,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm89_supported, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -711,6 +711,11 @@ class MqaAttentionBase(nn.Module):
                 attn_tp_rank, attn_tp_size = 0, 1
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
+        self._sm89_flashinfer_native_heads = (
+            envs.SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS.get()
+            and envs.SGLANG_DSV4_SM89_FLASHINFER.get()
+            and is_sm89_supported()
+        )
 
         self.layer_id = layer_id
         self.dim = config.hidden_size
@@ -853,13 +858,20 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+    def _attention_compute_heads(self) -> int:
+        # The SM89 FlashInfer fork specializes TP-local H8/H16/H32. Keeping
+        # FlashMLA's H64 padding here would execute attention for dummy heads.
+        if self._sm89_flashinfer_native_heads:
+            return self.n_local_heads
+        return 64 if self.n_local_heads <= 64 else self.n_heads
+
     def _local_attn_sink(self) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            padded_num_heads = self._attention_compute_heads()
             sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
@@ -1501,7 +1513,7 @@ class MQALayer(MqaAttentionBase):
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            padded_num_heads = self._attention_compute_heads()
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward

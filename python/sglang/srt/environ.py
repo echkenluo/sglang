@@ -1299,6 +1299,7 @@ class Envs:
 
     # GEMM / kernel fusion
     SGLANG_DSV4_SM89_FLASHINFER = EnvBool(False)
+    SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # Opt in to the F28-derived Ada wo_a kernel; requires FP8_WO_A_GEMM.
     SGLANG_DSV4_SM89_FP8_WO_A = EnvBool(False)
