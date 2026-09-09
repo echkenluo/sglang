@@ -4,7 +4,6 @@
 import unittest
 
 import torch
-
 from sglang.kernels.ops.dsv4_sm89_fp8_einsum import sm89_fp8_einsum
 
 
@@ -20,8 +19,13 @@ class TestSm89Fp8Einsum(unittest.TestCase):
         # Nonuniform power-of-two scales exercise both scale axes; these are
         # exact BF16 multipliers, so a dense FP32 reference is independent of
         # the kernel's per-K-block dot accumulation order.
-        sa = torch.pow(2.0, torch.randint(-4, 1, (tokens, groups, hidden // 128), device="cuda")).float()
-        sb = torch.pow(2.0, torch.randint(-4, 1, (groups, rank // 128, hidden // 128), device="cuda")).float()
+        sa = torch.pow(
+            2.0, torch.randint(-4, 1, (tokens, groups, hidden // 128), device="cuda")
+        ).float()
+        sb = torch.pow(
+            2.0,
+            torch.randint(-4, 1, (groups, rank // 128, hidden // 128), device="cuda"),
+        ).float()
         return a.to(torch.float8_e4m3fn), sa, b.to(torch.float8_e4m3fn), sb
 
     def check_result(self, a, sa, b, sb, out):
@@ -38,7 +42,10 @@ class TestSm89Fp8Einsum(unittest.TestCase):
             return
         rel_l2 = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-12)).item()
         self.assertLessEqual(rel_l2, 0.004)
-        self.assertLessEqual((out.float() - ref).abs().max().item(), 0.02 * ref.abs().max().item() + 0.001)
+        self.assertLessEqual(
+            (out.float() - ref).abs().max().item(),
+            0.02 * ref.abs().max().item() + 0.001,
+        )
 
     def test_actual_tp8_and_padding_boundaries(self):
         for tokens in (0, 1, 7, 8, 9, 16, 17, 511, 512, 513, 4096):
