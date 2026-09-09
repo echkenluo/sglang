@@ -122,8 +122,8 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
             (64, 256, 64, 128),
             (65, 64, 2, 128),
             (513, 256, 64, 128),
-            # Actual SGLang SWA geometry, including dispatch boundaries and
-            # a full 4K prefill chunk. Compressed C4/C128 pages are 64/2.
+            # Optional page-128 geometry and full 4K chunks. Actual CUDA
+            # storage pages are 256; the logical SWA window is 128.
             (1, 128, 0, 128),
             (7, 128, 2, 128),
             (16, 128, 64, 128),
@@ -158,8 +158,42 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
                         out, lse = self.adapter(**kwargs)
                         self.check_reference(kwargs, scopes, out, lse)
 
+    def test_native_heads_match_padded_valid_heads(self):
+        from sglang.srt.models.deepseek_v4 import MqaAttentionBase
+
+        model = MqaAttentionBase.__new__(MqaAttentionBase)
+        torch.nn.Module.__init__(model)
+        model.attn_tp_size, model.attn_tp_rank = 8, 3
+        model.n_heads, model.n_local_heads = 64, 8
+        model.attn_sink = torch.arange(64, device="cuda", dtype=torch.float32)
+        for enabled, expected in ((False, 64), (True, 8)):
+            model._sm89_flashinfer_native_heads = enabled
+            model._attn_sink_local = None
+            self.assertEqual(model._attention_compute_heads(), expected)
+            sink = model._local_attn_sink()
+            self.assertEqual(sink.numel(), expected)
+            torch.testing.assert_close(sink[:8], model.attn_sink[24:32])
+        for tokens, extra in ((1, 0), (16, 2), (65, 64), (4096, 64)):
+            with self.subTest(tokens=tokens, extra=extra):
+                kwargs, scopes = self.case(tokens, 256, extra)
+                native, lse = self.adapter(**kwargs)
+                self.check_reference(kwargs, scopes, native, lse)
+                padded = dict(kwargs)
+                q = torch.full(
+                    (tokens, 1, 64, 512),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                q[:, :, :8] = kwargs["q"]
+                sink = torch.zeros(64, device="cuda")
+                sink[:8] = kwargs["attn_sink"]
+                padded.update(q=q, attn_sink=sink)
+                old, _ = self.adapter(**padded)
+                torch.testing.assert_close(native, old[:, :, :8], atol=0.05, rtol=0.05)
+
     def test_graph_replay(self):
-        kwargs, scopes = self.case(16, 128, 2)
+        kwargs, scopes = self.case(16, 256, 2)
         # Match the real KVPool API, including its reinterpretation of footer
         # bytes as FP8 values. No arithmetic is valid on this storage view.
         for key in ("k_cache", "extra_k_cache"):

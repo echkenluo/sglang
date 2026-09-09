@@ -1299,6 +1299,7 @@ class Envs:
 
     # GEMM / kernel fusion
     SGLANG_DSV4_SM89_FLASHINFER = EnvBool(False)
+    SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
