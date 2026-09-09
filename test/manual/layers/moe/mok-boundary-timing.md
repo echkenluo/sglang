@@ -56,3 +56,12 @@ Six tests cover disabled identity, deferred synchronization, nested scopes,
 event reuse, fallback/exception preservation, capture/capacity omissions,
 active-scope drain rejection and keyword/small-input behavior. CUDA event and
 actual-model validation remain pending.
+
+The separate `test_mok_boundary_timing_cuda.py` requires an owned CUDA device.
+It exercises nested scopes on two joined streams, compares the outer interval
+with enclosing reference CUDA events, checks the real JSON export, and verifies
+that graph capture is explicitly omitted rather than counted as replay timing.
+Set `MOK_BOUNDARY_CUDA_TEST_OUTPUT` to a fresh persistent directory to retain the
+warmup, checked-call and reference records. These two CUDA tests are prepared
+but have not yet run; syntax validation is not a CUDA pass. They also do not
+establish actual model coverage or acceptable instrumentation overhead.
