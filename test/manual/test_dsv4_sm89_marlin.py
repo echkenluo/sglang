@@ -77,17 +77,25 @@ class TestSm89Mxfp4Marlin(unittest.TestCase):
                     gate_up = (
                         (x[token_ids].float() @ ref13[expert].float().T)
                         .bfloat16()
-                        .float()
                     )
                     gate, up = gate_up.chunk(2, -1)
+                    # The production clamp path uses separate BF16 PyTorch
+                    # operations: SiLU rounds before the multiplication.
                     activation = (
                         torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
-                    ).bfloat16()
+                    )
                     value = activation.float() @ ref2[expert].float().T
                     value = (value * weights[token_ids, slots, None]).bfloat16().float()
                     ref.index_add_(0, token_ids, value)
+                # The expert sum is stored into a BF16 output buffer.
+                ref = ref.bfloat16().float()
                 self.assertTrue(torch.isfinite(out).all().item())
                 relative_l2 = ((out.float() - ref).norm() / ref.norm()).item()
+                print(
+                    f"tokens={tokens} relative_l2={relative_l2:.8f} "
+                    f"max_abs={(out.float() - ref).abs().max().item():.8f}",
+                    flush=True,
+                )
                 self.assertLessEqual(relative_l2, 0.02)
                 torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.05)
 
