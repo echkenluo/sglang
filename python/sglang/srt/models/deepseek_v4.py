@@ -160,7 +160,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm89_supported, is_sm120_supported
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -714,7 +714,8 @@ class MqaAttentionBase(nn.Module):
         self._sm89_flashinfer_native_heads = (
             envs.SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS.get()
             and envs.SGLANG_DSV4_SM89_FLASHINFER.get()
-            and is_sm89_supported()
+            and _is_cuda
+            and torch.cuda.get_device_capability() == (8, 9)
         )
 
         self.layer_id = layer_id
