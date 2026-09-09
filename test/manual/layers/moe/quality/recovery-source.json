@@ -1,0 +1,12 @@
+{
+  "source_commit": "3d5ca220a5696535a539025d619b497a0aa2472d",
+  "files_sha256": {
+    "logprob_client.py": "e17049835f3ba7523947c68af3ec35e06e2f881e9cbe182e13e0cd0ad66bf14e",
+    "gsm8k_client.py": "5dda7870cf52815d79b9543527db34b39ad409fd2b5cdfa3cb030485552d0440",
+    "longgen_client.py": "2e149f8b8d0b108b12dc850e263cfb81122db84c5b74ece1af3fe729189d07db",
+    "tests/test_logprob_client_v4.py": "9bbe20d7913352d9f03c24a7acf4ba2cfd986ddca72b47aff226d65dbfee29dc",
+    "tests/test_gsm8k_client_v4.py": "a7f34fc2e6f07e13b4361709aa9fbf67a44d62fa8d50d87f56db8b8b4d05bbe8",
+    "tests/test_longgen_client_v4.py": "b484f7d8c8e8324a9e7d06c76359a4bcbd15f0ae8ed933c36cd3526f0fb3783e"
+  },
+  "scope": "exact client and client-test recovery only; no runtime or formal quality gate validation"
+}
