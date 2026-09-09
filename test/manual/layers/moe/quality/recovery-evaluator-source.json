@@ -1,0 +1,22 @@
+{
+  "source_commit": "3d5ca220a5696535a539025d619b497a0aa2472d",
+  "purpose": "recover frozen statistical contract only; current runtime manifests and formal assets remain pending",
+  "files": {
+    "test/manual/layers/moe/quality/phase2_v4_power.py": {
+      "sha256": "2f8d9001d683c339b3d01c211f8ce2908a46aa4620385939f708d0b693cae442",
+      "bytes": 58963
+    },
+    "test/manual/layers/moe/quality/quality_gate_eval.py": {
+      "sha256": "5dcb49df2a37f859da7e56c3572c7c88dcafeeae23a580491a9017a475e0fd50",
+      "bytes": 43692
+    },
+    "test/manual/layers/moe/test_phase2_v4_power.py": {
+      "sha256": "09b13d74623b72d72535a49c3c8adf3c4dcd22746f2d03d621cfdbd74d3911be",
+      "bytes": 21009
+    },
+    "test/manual/layers/moe/test_phase2_v4_eval_e2e.py": {
+      "sha256": "327ee5dd5e573e591b2831ef80043f110283ca83176a326312c2f5f561feebc9",
+      "bytes": 14944
+    }
+  }
+}
