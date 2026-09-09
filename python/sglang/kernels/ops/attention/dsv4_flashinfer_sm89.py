@@ -16,6 +16,24 @@ import torch
 class Dsv4FlashInferSm89:
     """Backend-owned runner; no module-global workspace shared across GPUs."""
 
+    @staticmethod
+    def _packed_cache_bytes(cache):
+        if cache is None:
+            return None
+        if (
+            cache.ndim != 4
+            or cache.shape[2:] != (1, 584)
+            or cache.dtype not in (torch.uint8, torch.float8_e4m3fn)
+        ):
+            raise ValueError(
+                "Expected packed DSV4 NHD cache [pages,page_size,1,584] "
+                f"as uint8 or FP8 storage view, got {cache.shape} {cache.dtype}"
+            )
+        # KVPool.get_key_buffer returns a view in the configured FP8 dtype.
+        # Reinterpret bytes; a numerical cast would corrupt the mixed FP8/BF16
+        # payload and E8M0 footer. Equal element sizes preserve page strides.
+        return cache.view(torch.uint8)
+
     def __init__(self):
         from flashinfer.mla._sparse_mla_sm120 import (
             _DECODE_DSV4_PAGE_BLOCK_SIZES,
@@ -49,15 +67,8 @@ class Dsv4FlashInferSm89:
             raise ValueError(f"Expected DSV4 query [T,1,H,512], got {q.shape}")
         if q.dtype != torch.bfloat16 or head_dim_v != 512:
             raise ValueError("DSV4 SM89 sparse MLA requires BF16 query and d_v=512")
-        for cache in (k_cache, extra_k_cache):
-            if cache is not None and (
-                cache.ndim != 4
-                or cache.shape[2:] != (1, 584)
-                or cache.dtype != torch.uint8
-            ):
-                raise ValueError(
-                    "Expected packed DSV4 NHD byte cache [pages,page_size,1,584]"
-                )
+        k_cache = self._packed_cache_bytes(k_cache)
+        extra_k_cache = self._packed_cache_bytes(extra_k_cache)
         q3 = q.squeeze(1).contiguous()
         out = torch.empty_like(q3)
         lse = torch.empty(q3.shape[:2], dtype=torch.float32, device=q.device)
