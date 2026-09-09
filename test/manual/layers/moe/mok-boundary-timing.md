@@ -54,14 +54,18 @@ python3 test/manual/layers/moe/test_mok_boundary_timing.py
 
 Six tests cover disabled identity, deferred synchronization, nested scopes,
 event reuse, fallback/exception preservation, capture/capacity omissions,
-active-scope drain rejection and keyword/small-input behavior. CUDA event and
-actual-model validation remain pending.
+active-scope drain rejection and keyword/small-input behavior. Actual-model
+coverage and observer overhead validation remain pending.
 
 The separate `test_mok_boundary_timing_cuda.py` requires an owned CUDA device.
 It exercises nested scopes on two joined streams, compares the outer interval
 with enclosing reference CUDA events, checks the real JSON export, and verifies
 that graph capture is explicitly omitted rather than counted as replay timing.
 Set `MOK_BOUNDARY_CUDA_TEST_OUTPUT` to a fresh persistent directory to retain the
-warmup, checked-call and reference records. These two CUDA tests are prepared
-but have not yet run; syntax validation is not a CUDA pass. They also do not
-establish actual model coverage or acceptable instrumentation overhead.
+warmup, checked-call and reference records. Both CUDA tests passed on GPU9 H20
+GPU0 with PyTorch 2.11.0+cu130 on 2026-09-09 at 15:58 UTC (source 512bda2,
+recorder SHA256 9bc2e479c9ce252eab9969df6fa9e4aa204745562d8a7163e254413b92d322ff).
+The run retained four event exports and checked their GPU UUID and recorder
+source hash; no tests were skipped. These tests do not establish actual model
+coverage or acceptable instrumentation overhead. The original result bundle is
+`boundary-cuda-probe-v1` under the AILearning H20 MoK experiment assets.
