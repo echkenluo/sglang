@@ -125,11 +125,26 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
         ):
             with self.subTest(tokens=tokens, page=page, extra=extra):
                 kwargs, scopes = self.case(tokens, page, extra)
-                out, lse = self.adapter(**kwargs)
-                self.check_reference(kwargs, scopes, out, lse)
+                for dtype in (torch.uint8, torch.float8_e4m3fn):
+                    with self.subTest(storage_view=dtype):
+                        for key in ("k_cache", "extra_k_cache"):
+                            if key not in kwargs:
+                                continue
+                            original = kwargs[key]
+                            kwargs[key] = original.view(dtype)
+                            packed = self.adapter._packed_cache_bytes(kwargs[key])
+                            self.assertEqual(packed.data_ptr(), original.data_ptr())
+                            self.assertEqual(packed.stride(), original.stride())
+                            self.assertTrue(torch.equal(packed, original.view(torch.uint8)))
+                        out, lse = self.adapter(**kwargs)
+                        self.check_reference(kwargs, scopes, out, lse)
 
     def test_graph_replay(self):
         kwargs, scopes = self.case(16, 256, 2)
+        # Match the real KVPool API, including its reinterpretation of footer
+        # bytes as FP8 values. No arithmetic is valid on this storage view.
+        for key in ("k_cache", "extra_k_cache"):
+            kwargs[key] = kwargs[key].view(torch.float8_e4m3fn)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
