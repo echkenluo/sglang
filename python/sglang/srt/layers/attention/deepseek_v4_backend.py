@@ -509,6 +509,16 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self._sm89_flashinfer = None
+        if envs.SGLANG_DSV4_SM89_FLASHINFER.get():
+            if not _is_sm89:
+                raise ValueError("SGLANG_DSV4_SM89_FLASHINFER requires SM89 GPUs")
+            from sglang.kernels.ops.attention.dsv4_flashinfer_sm89 import (
+                Dsv4FlashInferSm89,
+            )
+
+            self._sm89_flashinfer = Dsv4FlashInferSm89()
+            logger.info("DSV4 SM89 FlashInfer sparse MLA adapter enabled")
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
@@ -1753,7 +1763,11 @@ class DeepseekV4AttnBackend(
                         triton_fp8_attention_fwd,
                     )
 
-                    attention_fn = triton_fp8_attention_fwd
+                    attention_fn = (
+                        self._sm89_flashinfer
+                        if self._sm89_flashinfer is not None
+                        else triton_fp8_attention_fwd
+                    )
                 elif _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache as attention_fn
                 else:
