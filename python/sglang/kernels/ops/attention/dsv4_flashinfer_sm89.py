@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSV4 adapter for the pinned FlashInfer SM89 sparse MLA fork.
 
-Validated dependency target (GPU validation pending at initial implementation):
-flashinfer 0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213,
-wheel SHA256 72b774b474b7f961c2993b9cdd2337d2bec7c70560d508fee654f3423757863d.
+Dependency: F28 FlashInfer 0.6.18 with the committed SGLang page-128
+extension. The unmodified F28 distribution lacks SGLang's SWA page size.
 
 The cache view describes a page, not independent 584-byte token records:
 KV payloads precede the page scale footer. Preserve stride(0), including
@@ -40,8 +39,11 @@ class Dsv4FlashInferSm89:
             _SparseMLAPagedAttentionRunner,
         )
 
-        if not {64, 256}.issubset(_DECODE_DSV4_PAGE_BLOCK_SIZES):
-            raise RuntimeError("DSV4 SM89 adapter requires the F28 FlashInfer fork")
+        if not {64, 128, 256}.issubset(_DECODE_DSV4_PAGE_BLOCK_SIZES):
+            raise RuntimeError(
+                "DSV4 SM89 adapter requires the F28 FlashInfer fork with "
+                "SGLang SWA page-128 dispatch support"
+            )
         # The runner rejects architectures other than 89/120/121. Our model
         # dispatch is SM89-only; other SGLang backends remain unchanged.
         self.runner = _SparseMLAPagedAttentionRunner(
