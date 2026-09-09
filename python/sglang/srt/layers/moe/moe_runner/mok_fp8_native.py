@@ -206,6 +206,20 @@ def native_shape_contract_error(
     return None
 
 
+def warprole_shape_contract_error(
+    *, hidden_size: int, intermediate_size: int, topk: int,
+    ep_size: int, variant: str,
+) -> Optional[str]:
+    """Reject unsupported warp-role specializations before any workspace work."""
+    if (hidden_size, intermediate_size, topk) != (4096, 2048, 6):
+        return "warp-role requires hidden=4096, intermediate=2048, topk=6"
+    if ep_size not in (4, 8):
+        return "warp-role requires EP4 or EP8"
+    if variant not in ("c1s6", "c2s4"):
+        return "warp-role variant must be c1s6 or c2s4"
+    return None
+
+
 def native_runtime_contract_error(layer, hidden_states, topk_output) -> Optional[str]:
     """Validate the production-only conditions not encoded by tensor shapes."""
     from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
@@ -267,6 +281,16 @@ def native_runtime_contract_error(layer, hidden_states, topk_output) -> Optional
     )
     if error is not None:
         return error
+    if envs.SGLANG_OPT_MOK_WARPROLE.get():
+        error = warprole_shape_contract_error(
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=layer.w2_weight.shape[2],
+            topk=topk_output.topk_ids.shape[1],
+            ep_size=layer.moe_ep_size,
+            variant=envs.SGLANG_OPT_MOK_WARPROLE_VARIANT.get(),
+        )
+        if error is not None:
+            return error
     tensors = (
         hidden_states,
         topk_output.topk_ids,
@@ -549,29 +573,14 @@ def _run_native_core(
         scale_tma_aligned=False,
         scale_ue8m0=False,
     )
-    # The split orchestrator owns the workspace across dispatch, both GEMMs,
-    # and combine.  Release happens only after the caller-owned output copy.
-    # Concurrent reuse fails closed in the acquire kernel (REENTRANT trap).
-    mok_functional.acquire_workspace_lease(workspace)
-    schedule = mok_functional.build_schedule(
-        workspace,
-        config,
-        padded_topk_ids,
-        num_local_experts=layer.num_local_experts,
-        expert_padding=_ROUTE_EXPERT_PADDING,
-    )
-    if envs.SGLANG_OPT_MOK_WARPROLE.get():
+    use_warprole = envs.SGLANG_OPT_MOK_WARPROLE.get()
+    if use_warprole:
         try:
             from mok import warprole as mok_warprole
         except ImportError as exc:
             raise RuntimeError(
                 "SGLANG_OPT_MOK_WARPROLE requires the MoK warp-role megakernel"
             ) from exc
-        # warprole_forward acquires and releases the workspace lease itself, so
-        # the schedule build hands the lease back here and takes it again after
-        # the launch.  The outer boundary therefore still owns exactly one
-        # lease across the caller's materializing copy, exactly as below.
-        mok_functional.release_workspace_lease(workspace)
         # State creation rendezvouses symmetric memory and barriers, so every
         # EP rank must reach it together; the strict contract already puts them
         # on the same layer and shape, which is what the split path relies on
@@ -582,6 +591,18 @@ def _run_native_core(
             device=padded_hidden.device,
             capacity=workspace.schedule_capacity,
         )
+    # Both paths own the workspace continuously from schedule through combine.
+    # Release happens only after the caller-owned output copy.
+    # Concurrent reuse fails closed in the acquire kernel (REENTRANT trap).
+    mok_functional.acquire_workspace_lease(workspace)
+    schedule = mok_functional.build_schedule(
+        workspace,
+        config,
+        padded_topk_ids,
+        num_local_experts=layer.num_local_experts,
+        expert_padding=_ROUTE_EXPERT_PADDING,
+    )
+    if use_warprole:
         # The megakernel fuses dispatch, W13, the clamped SwiGLU with its FP8
         # quantization, W2, combine and the reduce into one launch, so the
         # split sequence below has no counterpart here.  Activations are the
@@ -592,7 +613,7 @@ def _run_native_core(
         # contract validates them and the padding path builds them that way.
         variant = envs.SGLANG_OPT_MOK_WARPROLE_VARIANT.get()
         _report_warprole_active(layer, variant, workspace.schedule_capacity)
-        out = mok_warprole.warprole_forward(
+        out = mok_warprole.warprole_forward_leased(
             workspace,
             state,
             schedule,
@@ -607,7 +628,6 @@ def _run_native_core(
             variant=variant,
             swiglu_limit=layer.moe_runner_config.swiglu_limit,
         )
-        mok_functional.acquire_workspace_lease(workspace)
         # Same handback as the combine path below: the result is a persistent
         # buffer overwritten by the next call, and the outer boundary copies it
         # into new storage before releasing the lease.

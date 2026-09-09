@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _conservative_route_capacity_factor,
     _route_padding_config,
     native_shape_contract_error,
+    warprole_shape_contract_error,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,6 +43,21 @@ def _make_shape_inputs():
 
 
 class TestMoKSplitContract(unittest.TestCase):
+    def test_warprole_specialization_before_workspace_creation(self):
+        supported = dict(hidden_size=4096, intermediate_size=2048, topk=6,
+                         ep_size=8, variant="c2s4")
+        for ep_size in (4, 8):
+            for variant in ("c1s6", "c2s4"):
+                self.assertIsNone(warprole_shape_contract_error(
+                    **{**supported, "ep_size": ep_size, "variant": variant}
+                ))
+        for key, value in (("hidden_size", 7168), ("intermediate_size", 3072),
+                           ("topk", 8), ("ep_size", 16), ("variant", "unknown")):
+            with self.subTest(key=key, value=value):
+                self.assertIsNotNone(warprole_shape_contract_error(
+                    **{**supported, key: value}
+                ))
+
     def test_v4_shape_contract(self):
         self.assertIsNone(native_shape_contract_error(**_make_shape_inputs()))
 
