@@ -69,11 +69,23 @@ class Recorder:
             raise RuntimeError("cannot drain boundary timing inside an active scope")
         # Caller must already have established scheduler idleness. This is the
         # only synchronization in the recorder, outside measured requests.
-        if self.pending:
-            self.cuda.synchronize()
+        references = {}
+        for row, events, _ in self.pending:
+            references.setdefault(row["device"], (row["sequence"], events[0]))
+        for device in references:
+            self.cuda.synchronize(device)
         rows = []
         for row, events, _ in self.pending:
+            reference_sequence, reference = references[row["device"]]
+            # Reuse existing events, after idle synchronization. Offsets share
+            # a clock only within this device/flush. Another stream can start
+            # before the reference; preserve negative offsets rather than
+            # pretending host submission order is GPU execution order.
+            start_ms = 0.0 if reference is events[0] else reference.elapsed_time(events[0])
+            end_ms = reference.elapsed_time(events[1])
             rows.append({**row, "cuda_elapsed_ms": events[0].elapsed_time(events[1]),
+                         "cuda_reference_sequence": reference_sequence,
+                         "cuda_start_ms": start_ms, "cuda_end_ms": end_ms,
                          "host_enqueue_span_ns": row["host_end_ns"] - row["host_start_ns"]})
             self.pool[row["device"]].append(events)
         result = {"rows": rows, "skipped": dict(self.skipped),
@@ -133,7 +145,9 @@ def flush_if_enabled():
         "rows": [], "skipped": {}, "complete_eager_recording": True,
         "intervals_are_additive": False, "graph_replay_measured": False,
     }
-    payload.update(schema="mok-boundary-timing-v1", rank=rank, pid=os.getpid(),
+    payload.update(schema="mok-boundary-timing-v2",
+                   cuda_clock_scope="same device and flush only; offsets relative to cuda_reference_sequence",
+                   rank=rank, pid=os.getpid(),
                    flush_index=_flush_index, min_tokens=MIN_TOKENS, max_records=MAX_RECORDS,
                    device_uuid=str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
                    recorder_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

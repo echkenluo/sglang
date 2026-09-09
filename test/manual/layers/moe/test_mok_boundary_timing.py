@@ -21,12 +21,13 @@ class FakeCuda:
         self.syncs = 0
         self.events = 0
         self.recorded = []
+        self.synchronized_devices = []
 
     def is_current_stream_capturing(self):
         return self.capturing
 
     def current_stream(self, device):
-        return types.SimpleNamespace(cuda_stream=71)
+        return types.SimpleNamespace(cuda_stream=71 + device.index, device_index=device.index)
 
     def Event(self, *, enable_timing):
         self.events += 1
@@ -34,17 +35,22 @@ class FakeCuda:
 
         class Event:
             def record(self, stream):
+                self.tick = len(owner.recorded)
+                self.device = stream.device_index
                 owner.recorded.append(stream.cuda_stream)
 
             def elapsed_time(self, other):
                 if owner.syncs == 0:
                     raise AssertionError("elapsed_time before drain synchronization")
-                return 1.25
+                if self.device != other.device:
+                    raise AssertionError("cross-device elapsed_time")
+                return (other.tick - self.tick) * 0.25
 
         return Event()
 
-    def synchronize(self):
+    def synchronize(self, device):
         self.syncs += 1
+        self.synchronized_devices.append(device)
 
 
 class BoundaryTimingTest(unittest.TestCase):
@@ -80,11 +86,32 @@ class BoundaryTimingTest(unittest.TestCase):
         payload = self.recorder.drain()
         self.assertEqual(self.cuda.syncs, 1)
         self.assertEqual([r["parent"] for r in payload["rows"]], [None, 0])
-        self.assertEqual([r["cuda_elapsed_ms"] for r in payload["rows"]], [1.25, 1.25])
+        self.assertEqual([r["cuda_elapsed_ms"] for r in payload["rows"]], [0.75, 0.25])
+        self.assertEqual([r["cuda_reference_sequence"] for r in payload["rows"]], [0, 0])
+        self.assertEqual([r["cuda_start_ms"] for r in payload["rows"]], [0.0, 0.25])
+        self.assertEqual([r["cuda_end_ms"] for r in payload["rows"]], [0.75, 0.5])
         self.assertFalse(payload["intervals_are_additive"])
         self.assertTrue(payload["complete_eager_recording"])
         outer(self.owner, self.hidden)
         self.assertEqual(self.cuda.events, 4, "reuse events after draining warmup")
+
+    def test_each_device_has_its_own_reference_and_synchronization(self):
+        first = self.recorder.begin("full_moe", self.owner, self.hidden)
+        self.recorder.finish(first, "returned_output")
+        other_hidden = types.SimpleNamespace(shape=(1024, 4096), device=types.SimpleNamespace(index=1))
+        other = self.recorder.begin("full_moe", self.owner, other_hidden)
+        self.recorder.finish(other, "returned_output")
+        last = self.recorder.begin("full_moe", self.owner, self.hidden)
+        self.recorder.finish(last, "returned_output")
+        rows = self.recorder.drain()["rows"]
+        self.assertEqual(self.cuda.synchronized_devices, [0, 1])
+        self.assertEqual([r["cuda_reference_sequence"] for r in rows], [0, 1, 0])
+        self.assertEqual([r["cuda_start_ms"] for r in rows], [0.0, 0.0, 1.0])
+        again = self.recorder.begin("full_moe", self.owner, self.hidden)
+        self.recorder.finish(again, "returned_output")
+        row = self.recorder.drain()["rows"][0]
+        self.assertEqual(row["cuda_reference_sequence"], 3)
+        self.assertEqual(row["cuda_start_ms"], 0.0)
 
     def test_none_exception_and_parent_reset_are_recorded(self):
         @m.boundary("mok_native_call")
