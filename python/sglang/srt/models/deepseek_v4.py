@@ -216,6 +216,7 @@ _DSV4_TP_SCATTER_STATS = {
     "fp8_ag_moe": 0,
     "fp8_rs": 0,
     "tbo": 0,
+    "dspark_aux_ag": 0,
 }
 
 
@@ -249,7 +250,7 @@ def _dsv4_tp_scatter_maybe_log_stats() -> None:
         return
     logger.info(
         "[DSV4-TP-SCATTER-STATS] engaged=%d padded=%d fallback=%d "
-        "fp8_ag_attn=%d fp8_ag_moe=%d fp8_rs=%d tbo=%d",
+        "fp8_ag_attn=%d fp8_ag_moe=%d fp8_rs=%d tbo=%d dspark_aux_ag=%d",
         _DSV4_TP_SCATTER_STATS["engaged"],
         _DSV4_TP_SCATTER_STATS["padded"],
         _DSV4_TP_SCATTER_STATS["fallback"],
@@ -257,6 +258,7 @@ def _dsv4_tp_scatter_maybe_log_stats() -> None:
         _DSV4_TP_SCATTER_STATS["fp8_ag_moe"],
         _DSV4_TP_SCATTER_STATS["fp8_rs"],
         _DSV4_TP_SCATTER_STATS["tbo"],
+        _DSV4_TP_SCATTER_STATS["dspark_aux_ag"],
     )
 
 
@@ -372,6 +374,17 @@ def _dsv4_tp_all_gather_rows(
     if real_rows < output.shape[0]:
         output = output.narrow(0, 0, real_rows)
     return output
+
+
+def _dsv4_dspark_aux_hidden_state(completed: torch.Tensor) -> torch.Tensor:
+    """Restore full token order for DSpark after local mHC reduction."""
+    aux = completed.mean(dim=1)
+    if get_attn_tp_context().input_scattered:
+        # DSpark consumes replicated target states. Gather after the mHC mean
+        # to avoid communicating all residual channels; keep this site BF16.
+        aux = _dsv4_tp_all_gather_rows(aux, site="dspark_aux")
+        _DSV4_TP_SCATTER_STATS["dspark_aux_ag"] += 1
+    return aux
 
 
 def _dsv4_tp_fp8_a2a_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
@@ -2976,15 +2989,14 @@ class DeepseekV4Model(nn.Module):
         if get_attn_tp_context().input_scattered:
             if self.pp_group.world_size != 1:
                 raise RuntimeError("DSV4 TP input-scattered requires pp_size=1")
-            if self.dspark_layers_to_capture is not None:
-                raise RuntimeError(
-                    "DSV4 TP input-scattered does not support DSpark aux capture"
-                )
             _dsv4_tp_scatter_begin_forward(hidden_states.shape[0])
             # Chunk pipeline: the TBO child split must happen on FULL rows
             # (design B2), so _forward_layers_tbo owns the per-child entry
             # reduce-scatter and exit gather for this forward.
-            sc_tbo_forward = self._can_run_tbo(forward_batch)
+            sc_tbo_forward = (
+                self._can_run_tbo(forward_batch)
+                and self.dspark_layers_to_capture is None
+            )
             if sc_tbo_forward:
                 _dsv4_tp_scatter_log_once(
                     "model_input_tbo",
@@ -3063,7 +3075,9 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    dspark_aux_hidden_states.append(
+                        _dsv4_dspark_aux_hidden_state(completed)
+                    )
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
