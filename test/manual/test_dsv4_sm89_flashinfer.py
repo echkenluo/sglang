@@ -2,6 +2,8 @@
 """L20 adapter gate against dense attention on known footer-packed KV."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from sglang.kernels.ops.attention.dsv4_flashinfer_sm89 import Dsv4FlashInferSm89
@@ -137,6 +139,8 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
             # active draft entries); 16 requests produce 80 query rows.
             (5, 128, 0, 192),
             (80, 128, 0, 192),
+            (5, 256, 0, 192),
+            (80, 256, 0, 192),
         ):
             with self.subTest(
                 tokens=tokens, page=page, extra=extra, main_topk=main_topk
@@ -173,6 +177,64 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
             sink = model._local_attn_sink()
             self.assertEqual(sink.numel(), expected)
             torch.testing.assert_close(sink[:8], model.attn_sink[24:32])
+        # Exercise the real draft forward, which owns a separate Q-padding
+        # branch from target attention. Stub projection/cache math only; verify
+        # the tensors that actually cross the attention-backend boundary.
+        from sglang.srt.models import deepseek_v4_dspark as draft_module
+
+        draft = draft_module.DSparkAttention.__new__(draft_module.DSparkAttention)
+        torch.nn.Module.__init__(draft)
+        draft.attn_tp_size, draft.attn_tp_rank = 8, 3
+        draft.n_heads, draft.n_local_heads = 64, 8
+        draft.head_dim, draft.rope_head_dim = 512, 64
+        draft.n_local_groups, draft.o_lora_rank = 1, 8
+        draft.alt_streams, draft._use_fast_kernel = None, False
+        draft.attn = SimpleNamespace()
+        draft.attn_sink = model.attn_sink
+        draft.freqs_cis = torch.ones(1, 32, device="cuda", dtype=torch.complex64)
+        draft.wo_a = torch.nn.Linear(4096, 8, bias=False, device="cuda")
+        draft.wo_b = lambda x: (x, None)
+        draft.kv_proj_only = lambda x: x.new_zeros(x.shape[0], 512)
+        draft._store_block_kv = lambda **kw: None
+        for tokens in (1, 80):
+            x = torch.zeros(tokens, 8, device="cuda", dtype=torch.bfloat16)
+            positions = torch.zeros(tokens, device="cuda", dtype=torch.long)
+            q = torch.randn(tokens, 8, 512, device="cuda", dtype=torch.bfloat16)
+
+            def compute_q(hidden, pos, q_out=None):
+                if q_out is not None:
+                    q_out.copy_(q)
+                    return q_out
+                return q
+
+            draft._compute_q = compute_q
+            for enabled, heads in ((False, 64), (True, 8)):
+                draft._sm89_flashinfer_native_heads = enabled
+                draft._attn_sink_local = None
+                seen = []
+
+                def forward(**kw):
+                    seen.append(True)
+                    self.assertEqual(kw["q"].shape, (tokens, heads, 512))
+                    self.assertEqual(kw["attn_sink"].numel(), heads)
+                    torch.testing.assert_close(kw["q"][:, :8], q)
+                    torch.testing.assert_close(
+                        kw["attn_sink"][:8], draft.attn_sink[24:32]
+                    )
+                    return torch.zeros_like(kw["q"])
+
+                backend = SimpleNamespace(forward=forward)
+                with (
+                    patch.object(draft_module, "_resolve_dspark_pool"),
+                    patch(
+                        "sglang.srt.model_executor.forward_context.get_attn_backend",
+                        return_value=backend,
+                    ),
+                ):
+                    out = draft(positions, x, SimpleNamespace())
+                self.assertEqual(seen, [True])
+                self.assertEqual(out.shape, (tokens, 8))
+
         for tokens, extra in ((1, 0), (16, 2), (65, 64), (4096, 64)):
             with self.subTest(tokens=tokens, extra=extra):
                 kwargs, scopes = self.case(tokens, 256, extra)
@@ -193,24 +255,25 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
                 torch.testing.assert_close(native, old[:, :, :8], atol=0.05, rtol=0.05)
 
     def test_graph_replay(self):
-        kwargs, scopes = self.case(16, 256, 2)
-        # Match the real KVPool API, including its reinterpretation of footer
-        # bytes as FP8 values. No arithmetic is valid on this storage view.
-        for key in ("k_cache", "extra_k_cache"):
-            kwargs[key] = kwargs[key].view(torch.float8_e4m3fn)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                self.adapter(**kwargs)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out, lse = self.adapter(**kwargs)
-        for multiplier in (0.5, 2.0, 0.25):
-            kwargs["q"].mul_(multiplier)
-            graph.replay()
-            self.check_reference(kwargs, scopes, out, lse)
+        for tokens, extra, topk in ((16, 2, 128), (5, 0, 192), (80, 0, 192)):
+            kwargs, scopes = self.case(tokens, 256, extra, topk)
+            # Match the real KVPool API, including its reinterpretation of footer
+            # bytes as FP8 values. No arithmetic is valid on this storage view.
+            for key in ("k_cache", "extra_k_cache"):
+                kwargs[key] = kwargs[key].view(torch.float8_e4m3fn)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    self.adapter(**kwargs)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out, lse = self.adapter(**kwargs)
+            for multiplier in (0.5, 2.0, 0.25):
+                kwargs["q"].mul_(multiplier)
+                graph.replay()
+                self.check_reference(kwargs, scopes, out, lse)
 
 
 if __name__ == "__main__":
