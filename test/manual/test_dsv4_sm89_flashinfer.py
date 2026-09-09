@@ -260,7 +260,8 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
             # Match the real KVPool API, including its reinterpretation of footer
             # bytes as FP8 values. No arithmetic is valid on this storage view.
             for key in ("k_cache", "extra_k_cache"):
-                kwargs[key] = kwargs[key].view(torch.float8_e4m3fn)
+                if key in kwargs:
+                    kwargs[key] = kwargs[key].view(torch.float8_e4m3fn)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
