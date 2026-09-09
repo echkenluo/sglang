@@ -190,7 +190,11 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        # Keep draft Q and the inherited local sink on the same head layout.
+        if (
+            self.n_local_heads < _PAD_NUM_HEADS
+            and not self._sm89_flashinfer_native_heads
+        ):
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
