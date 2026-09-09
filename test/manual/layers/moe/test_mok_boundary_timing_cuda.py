@@ -27,6 +27,8 @@ class BoundaryTimingCudaTest(unittest.TestCase):
             self.addCleanup(temporary.cleanup)
             self.directory = Path(temporary.name)
         self.m.DIRECTORY = str(self.directory)
+        self.m.MIN_TOKENS = 256
+        self.m.MAX_RECORDS = 32
         self.m._recorder = self.m.Recorder(torch.cuda, 32)
         self.owner = types.SimpleNamespace(layer_id=7)
         self.x = torch.ones((256, 256), device="cuda", dtype=torch.float32)
