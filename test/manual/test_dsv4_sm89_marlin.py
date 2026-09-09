@@ -84,8 +84,12 @@ class TestSm89Mxfp4Marlin(unittest.TestCase):
                     activation = (
                         torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
                     )
-                    value = activation.float() @ ref2[expert].float().T
-                    value = (value * weights[token_ids, slots, None]).bfloat16().float()
+                    # marlin_template.h stores the GEMM accumulator in BF16,
+                    # converts each routing weight to BF16, then uses __hmul2.
+                    # Preserve both rounding boundaries in the dense oracle.
+                    value = (activation.float() @ ref2[expert].float().T).bfloat16()
+                    route = weights[token_ids, slots, None].bfloat16()
+                    value = (value * route).float()
                     ref.index_add_(0, token_ids, value)
                 # The expert sum is stored into a BF16 output buffer.
                 ref = ref.bfloat16().float()
