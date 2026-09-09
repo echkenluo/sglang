@@ -37,7 +37,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
 
         self.assertFalse(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
@@ -47,7 +47,30 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
         self.assertTrue(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
+
+    def test_preserves_allocator_when_requested(self):
+        for timeout, idle in ((None, False), (5.0, True)):
+            with self.subTest(timeout=timeout, idle=idle):
+                scheduler = self._new_scheduler()
+                scheduler.is_fully_idle.return_value = idle
+                output = scheduler.flush_wrapper.handle(
+                    FlushCacheReqInput(timeout_s=timeout, empty_cache=False)
+                )
+                self.assertTrue(output.success)
+                scheduler.flush_cache.assert_called_once_with(False)
+
+    def test_deferred_flush_retains_allocator_policy(self):
+        scheduler = self._new_scheduler()
+        request = FlushCacheReqInput(timeout_s=5.0, empty_cache=False)
+        self.assertIsNone(scheduler.flush_wrapper.handle(request))
+        scheduler.flush_cache.assert_not_called()
+        scheduler.is_fully_idle.return_value = True
+        scheduler.flush_wrapper.check_pending()
+        scheduler.flush_cache.assert_called_once_with(False)
+        output, original = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args
+        self.assertTrue(output.success)
+        self.assertIs(original, request)
 
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
@@ -88,7 +111,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper.check_pending()
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
         out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertTrue(out.success)
 
