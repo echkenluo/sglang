@@ -103,6 +103,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
+from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -1481,6 +1482,7 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
+    @mok_boundary("shared_expert")
     def _forward_shared_experts(
         self,
         hidden_states,

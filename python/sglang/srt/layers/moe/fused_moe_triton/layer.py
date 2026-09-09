@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
@@ -1442,6 +1443,7 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, topk_output, pre_quant_input=pre_quant_input
             )
 
+    @mok_boundary("routed_moe")
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
