@@ -37,16 +37,16 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
         known = torch.cat(((nope.float() * scales).bfloat16(), rope), -1)
         return raw[:, :width].view(pages, page_size, 1, 584), known.flatten(0, 1)
 
-    def case(self, tokens, page_size, extra_page_size):
+    def case(self, tokens, page_size, extra_page_size, main_topk=128):
         torch.manual_seed(20260909 + tokens + page_size)
         cache, kv = self.packed_cache(8, page_size)
         q = torch.randn(tokens, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
         # Noncontiguous index row strides are common after prefix slicing.
         ids = torch.randint(
-            kv.shape[0], (tokens, 256), device="cuda", dtype=torch.int32
-        )[:, :128]
+            kv.shape[0], (tokens, main_topk + 128), device="cuda", dtype=torch.int32
+        )[:, :main_topk]
         ids[:, 3] = -1
-        lengths = torch.arange(tokens, device="cuda", dtype=torch.int32) % 128 + 1
+        lengths = torch.arange(tokens, device="cuda", dtype=torch.int32) % main_topk + 1
         sink = torch.linspace(-2, 2, 8, device="cuda")
         kwargs = {
             "q": q,
@@ -115,16 +115,33 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
             torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
     def test_layouts_lengths_and_dispatch_boundaries(self):
-        for tokens, page, extra in (
-            (1, 64, 0),
-            (7, 256, 2),
-            (16, 64, 64),
-            (64, 256, 64),
-            (65, 64, 2),
-            (513, 256, 64),
+        for tokens, page, extra, main_topk in (
+            (1, 64, 0, 128),
+            (7, 256, 2, 128),
+            (16, 64, 64, 128),
+            (64, 256, 64, 128),
+            (65, 64, 2, 128),
+            (513, 256, 64, 128),
+            # Actual SGLang SWA geometry, including dispatch boundaries and
+            # a full 4K prefill chunk. Compressed C4/C128 pages are 64/2.
+            (1, 128, 0, 128),
+            (7, 128, 2, 128),
+            (16, 128, 64, 128),
+            (64, 128, 64, 128),
+            (65, 128, 2, 128),
+            (513, 128, 64, 128),
+            (4096, 128, 0, 128),
+            (4096, 128, 2, 128),
+            (4096, 128, 64, 128),
+            # DSpark draft uses padded 192-wide indices (128 context + 5
+            # active draft entries); 16 requests produce 80 query rows.
+            (5, 128, 0, 192),
+            (80, 128, 0, 192),
         ):
-            with self.subTest(tokens=tokens, page=page, extra=extra):
-                kwargs, scopes = self.case(tokens, page, extra)
+            with self.subTest(
+                tokens=tokens, page=page, extra=extra, main_topk=main_topk
+            ):
+                kwargs, scopes = self.case(tokens, page, extra, main_topk)
                 for dtype in (torch.uint8, torch.float8_e4m3fn):
                     with self.subTest(storage_view=dtype):
                         for key in ("k_cache", "extra_k_cache"):
@@ -135,12 +152,14 @@ class TestDsv4FlashInferSm89(unittest.TestCase):
                             packed = self.adapter._packed_cache_bytes(kwargs[key])
                             self.assertEqual(packed.data_ptr(), original.data_ptr())
                             self.assertEqual(packed.stride(), original.stride())
-                            self.assertTrue(torch.equal(packed, original.view(torch.uint8)))
+                            self.assertTrue(
+                                torch.equal(packed, original.view(torch.uint8))
+                            )
                         out, lse = self.adapter(**kwargs)
                         self.check_reference(kwargs, scopes, out, lse)
 
     def test_graph_replay(self):
-        kwargs, scopes = self.case(16, 256, 2)
+        kwargs, scopes = self.case(16, 128, 2)
         # Match the real KVPool API, including its reinterpretation of footer
         # bytes as FP8 values. No arithmetic is valid on this storage view.
         for key in ("k_cache", "extra_k_cache"):
