@@ -9,11 +9,19 @@ import math
 import tilelang
 import tilelang.language as T
 import torch
+import triton
+import triton.language as tl
 
-from sglang.kernels.ops.layernorm.mhc import mhc_pre_gemm_sqrsum_tilelang
+from sglang.kernels.ops.layernorm.mhc import _compute_num_split_for_mhc_pre
 
 
-@tilelang.jit
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    },
+)
 def mhc_pre_big_fuse_broadcast_with_norm_tilelang(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -201,12 +209,15 @@ def mhc_pre_broadcast(
     comb = torch.empty(tokens, 16, device=residual.device, dtype=torch.float32)
     output = torch.empty_like(residual)
     if tokens:
-        mul = torch.empty(tokens, 24, device=residual.device, dtype=torch.float32)
-        sqr = torch.empty(tokens, device=residual.device, dtype=torch.float32)
-        mhc_pre_gemm_sqrsum_tilelang(residual, fn_broadcast, mul, sqr, 24, hidden)
+        n_splits = _compute_num_split_for_mhc_pre(tokens, hidden)
+        mul = torch.empty(
+            n_splits, tokens, 24, device=residual.device, dtype=torch.float32
+        )
+        sqr = torch.empty(n_splits, tokens, device=residual.device, dtype=torch.float32)
+        tf32_hc_prenorm_gemm_triton(residual, fn_broadcast, mul, sqr, n_splits)
         mhc_pre_big_fuse_broadcast_with_norm_tilelang(
-            mul.unsqueeze(0),
-            sqr.unsqueeze(0),
+            mul,
+            sqr,
             hc_scale,
             hc_base,
             residual,
@@ -222,5 +233,130 @@ def mhc_pre_broadcast(
             post_mult,
             sinkhorn_repeat,
             norm_eps,
+            n_splits=n_splits,
         )
     return residual_out, post.unsqueeze(-1), comb.view(tokens, 4, 4), output
+
+
+# F28 masked SM89 GEMM fallback, from the same fixed source revision.
+@triton.jit
+def _tf32_hc_prenorm_gemm_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    M,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    stride_xm: tl.constexpr,
+    stride_xk: tl.constexpr,
+    stride_fnn: tl.constexpr,
+    stride_fnk: tl.constexpr,
+    stride_outs,
+    stride_outm: tl.constexpr,
+    stride_outn: tl.constexpr,
+    stride_sqs,
+    stride_sqm: tl.constexpr,
+    NUM_SPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    split_k = tl.cdiv(K, NUM_SPLIT)
+    split_begin = pid_s * split_k
+    split_end = tl.minimum(split_begin + split_k, K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for k0 in tl.range(0, split_k, BLOCK_K):
+        k = split_begin + k0 + offs_k
+        k_mask = k < split_end
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + k[None, :] * stride_xk,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        fn = tl.load(
+            fn_ptr + offs_n[None, :] * stride_fnn + k[:, None] * stride_fnk,
+            mask=(offs_n[None, :] < N) & k_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        acc += tl.dot(x, fn, input_precision="tf32", out_dtype=tl.float32)
+        sq += tl.sum(x * x, axis=1)
+
+    tl.store(
+        out_ptr
+        + pid_s * stride_outs
+        + offs_m[:, None] * stride_outm
+        + offs_n[None, :] * stride_outn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+    if pid_n == 0:
+        tl.store(
+            sqrsum_ptr + pid_s * stride_sqs + offs_m * stride_sqm,
+            sq,
+            mask=offs_m < M,
+        )
+
+
+def tf32_hc_prenorm_gemm_triton(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> None:
+    assert x.dim() == 2
+    assert fn.dim() == 2
+    assert out.dim() == 3
+    assert sqrsum.dim() == 2
+
+    m, k = x.shape
+    n = fn.shape[0]
+    assert fn.shape[1] == k
+    assert out.shape == (num_split, m, n)
+    assert sqrsum.shape == (num_split, m)
+
+    if m == 0:
+        return
+
+    block_m = 16
+    block_n = triton.next_power_of_2(n)
+    block_n = min(max(block_n, 16), 32)
+    block_k = 64
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n), num_split)
+    _tf32_hc_prenorm_gemm_kernel[grid](
+        x,
+        fn,
+        out,
+        sqrsum,
+        m,
+        k,
+        n,
+        x.stride(0),
+        x.stride(1),
+        fn.stride(0),
+        fn.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        sqrsum.stride(0),
+        sqrsum.stride(1),
+        num_split,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
