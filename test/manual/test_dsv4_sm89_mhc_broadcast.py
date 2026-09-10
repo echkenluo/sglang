@@ -6,6 +6,8 @@ from unittest.mock import patch
 import statistics
 import unittest
 
+import os
+
 import torch
 import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.srt.environ import envs
@@ -18,7 +20,8 @@ from sglang.srt.layers.attention.dsv4.f28_mhc_broadcast import mhc_pre_broadcast
 )
 class TestMhcBroadcast(unittest.TestCase):
     def test_numerics_and_graph(self):
-        torch.manual_seed(20260910)
+        # Seeds may vary across isolated process runs without changing thresholds.
+        torch.manual_seed(int(os.environ.get("MHC_BROADCAST_TEST_SEED", "20260910")))
         with ExitStack() as stack:
             for name, value in (
                 ("is_dsa_prefill_cp_round_robin_split", lambda: False),
