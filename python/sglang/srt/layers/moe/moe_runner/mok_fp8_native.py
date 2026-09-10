@@ -543,6 +543,38 @@ _PREFILL_GRAPH_POOL = None
 _PREFILL_GRAPH_DISABLED = False
 
 
+def _quantize_mok_workspace_input(padded_hidden, workspace):
+    """Use the ordinary quant kernel with leased symmetric output buffers.
+
+    The caller must acquire the workspace before this function writes it and
+    keep that lease through schedule, remote reads, and the output handback.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        _run_per_token_group_quant_8bit_kernel,
+        fp8_max,
+        fp8_min,
+    )
+
+    x_q, x_s = workspace.x_buffer, workspace.x_scale_buffer
+    tokens, hidden = padded_hidden.shape
+    if (
+        hidden != 4096
+        or padded_hidden.dtype != torch.bfloat16
+        or x_q.dtype != torch.float8_e4m3fn
+        or x_s.dtype != torch.float32
+        or tuple(x_q.shape) != (tokens, hidden)
+        or tuple(x_s.shape) != (tokens, hidden // 128)
+        or any(t.device != padded_hidden.device for t in (x_q, x_s))
+        or not all(t.is_contiguous() for t in (padded_hidden, x_q, x_s))
+    ):
+        raise ValueError("MoK direct input quantization requires matching contiguous buffers")
+    _run_per_token_group_quant_8bit_kernel(
+        padded_hidden, x_q, x_s, 128, 1e-10, fp8_min, fp8_max,
+        scale_ue8m0=False, fuse_silu_and_mul=False, masked_m=None,
+    )
+    return x_q, x_s
+
+
 @mok_path_scope("core")
 def _run_native_core(
     layer,
@@ -569,14 +601,18 @@ def _run_native_core(
     )
 
     hidden_size = padded_hidden.shape[1]
-    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
-        padded_hidden,
-        128,
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    )
     use_warprole = envs.SGLANG_OPT_MOK_WARPROLE.get()
+    direct_input_quant = (
+        use_warprole and envs.SGLANG_OPT_MOK_DIRECT_INPUT_QUANT.get()
+    )
+    if not direct_input_quant:
+        input_fp8, input_scale = sglang_per_token_group_quant_fp8(
+            padded_hidden,
+            128,
+            column_major_scales=False,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        )
     if use_warprole:
         try:
             from mok import warprole as mok_warprole
@@ -598,6 +634,13 @@ def _run_native_core(
     # Release happens only after the caller-owned output copy.
     # Concurrent reuse fails closed in the acquire kernel (REENTRANT trap).
     mok_functional.acquire_workspace_lease(workspace)
+    if direct_input_quant:
+        # Remote readers use these same tensor objects, so the wrapper skips
+        # both publication copies. Quantization is inside the lease and runs
+        # before the existing phase-0 peer barrier on the current stream.
+        input_fp8, input_scale = _quantize_mok_workspace_input(
+            padded_hidden, workspace
+        )
     schedule = mok_functional.build_schedule(
         workspace,
         config,
@@ -609,9 +652,9 @@ def _run_native_core(
         # The megakernel fuses dispatch, W13, the clamped SwiGLU with its FP8
         # quantization, W2, combine and the reduce into one launch, so the
         # split sequence below has no counterpart here.  Activations are the
-        # freshly quantized tensors rather than the workspace symmetric
-        # buffers -- on the split path dispatch_fp8_block publishes them -- so
-        # the wrapper copies them in.  Router weights and top-k ids already
+        # freshly quantized tensors. Direct-input quantization already writes
+        # the workspace symmetric buffers; otherwise the wrapper publishes
+        # them with copies.  Router weights and top-k ids already
         # satisfy its contiguous float32/int32 [T,topk] contract: the shape
         # contract validates them and the padding path builds them that way.
         variant = envs.SGLANG_OPT_MOK_WARPROLE_VARIANT.get()

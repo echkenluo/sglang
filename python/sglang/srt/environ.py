@@ -1236,6 +1236,8 @@ class Envs:
     # layout ("c2s4" or "c1s6") the megakernel is launched with.
     SGLANG_OPT_MOK_WARPROLE = EnvBool(False)
     SGLANG_OPT_MOK_WARPROLE_VARIANT = EnvStr("c2s4")
+    # Quantize into leased symmetric inputs, avoiding temporary buffers/copies.
+    SGLANG_OPT_MOK_DIRECT_INPUT_QUANT = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

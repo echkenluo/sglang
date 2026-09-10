@@ -348,5 +348,87 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertFalse(envs.SGLANG_MOE_PATH_HIT_COUNTERS.default)
 
 
+class TestMoKDirectInputQuant(unittest.TestCase):
+    def buffers(self):
+        from types import SimpleNamespace
+        hidden = torch.empty((256, 4096), dtype=torch.bfloat16)
+        workspace = SimpleNamespace(
+            x_buffer=torch.empty((256, 4096), dtype=torch.float8_e4m3fn),
+            x_scale_buffer=torch.empty((256, 32), dtype=torch.float32),
+            schedule_capacity=2048,
+        )
+        return hidden, workspace
+
+    def test_uses_exact_buffers_and_original_quant_parameters(self):
+        from unittest import mock
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native as native
+        from sglang.kernels.ops.quantization import fp8_kernel
+        hidden, workspace = self.buffers()
+        with mock.patch.object(fp8_kernel, "_run_per_token_group_quant_8bit_kernel") as kernel:
+            q, scales = native._quantize_mok_workspace_input(hidden, workspace)
+        self.assertIs(q, workspace.x_buffer)
+        self.assertIs(scales, workspace.x_scale_buffer)
+        positional, keywords = kernel.call_args
+        self.assertIs(positional[0], hidden)
+        self.assertIs(positional[1], q)
+        self.assertIs(positional[2], scales)
+        self.assertEqual(positional[3:], (128, 1e-10, fp8_kernel.fp8_min, fp8_kernel.fp8_max))
+        self.assertEqual(keywords, dict(scale_ue8m0=False, fuse_silu_and_mul=False, masked_m=None))
+        workspace.x_scale_buffer = torch.empty((256, 31), dtype=torch.float32)
+        with mock.patch.object(fp8_kernel, "_run_per_token_group_quant_8bit_kernel") as kernel:
+            with self.assertRaises(ValueError):
+                native._quantize_mok_workspace_input(hidden, workspace)
+            kernel.assert_not_called()
+
+    def test_workspace_write_follows_successful_acquire(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest import mock
+        from sglang.srt.layers.moe.moe_runner import mok_fp8_native as native
+        from sglang.kernels.ops.quantization import fp8_kernel
+        hidden, workspace = self.buffers()
+        ids = torch.empty((256, 6), dtype=torch.int32)
+        weights = torch.empty((256, 6), dtype=torch.float32)
+        layer = SimpleNamespace(num_local_experts=64, w13_weight=None,
+            w13_weight_scale_inv=None, w2_weight=None, w2_weight_scale_inv=None,
+            moe_runner_config=SimpleNamespace(swiglu_limit=10.0))
+        for reject in (False, True):
+            events = []
+            def acquire(ws):
+                events.append("acquire")
+                if reject:
+                    raise RuntimeError("workspace already owned")
+            def quant(*args, **kwargs):
+                self.assertEqual(events, ["state", "acquire"])
+                events.append("quant")
+            def forward(ws, state, schedule, q, scales, *args, **kwargs):
+                self.assertIs(q, ws.x_buffer)
+                self.assertIs(scales, ws.x_scale_buffer)
+                events.append("forward")
+                return hidden
+            functional = SimpleNamespace(acquire_workspace_lease=acquire,
+                build_schedule=lambda *a, **k: events.append("schedule"))
+            warp = SimpleNamespace(
+                get_warprole_state=lambda *a, **k: events.append("state"),
+                warprole_forward_leased=forward)
+            with mock.patch.dict(sys.modules, {"mok": SimpleNamespace(warprole=warp)}), \
+                 mock.patch.object(native, "get_tp_group", return_value=SimpleNamespace(device_group=None)), \
+                 mock.patch.object(native, "_report_warprole_active"), \
+                 mock.patch.object(fp8_kernel, "_run_per_token_group_quant_8bit_kernel", side_effect=quant), \
+                 mock.patch.object(fp8_kernel, "sglang_per_token_group_quant_fp8") as ordinary, \
+                 envs.SGLANG_OPT_MOK_WARPROLE.override(True), \
+                 envs.SGLANG_OPT_MOK_DIRECT_INPUT_QUANT.override(True):
+                if reject:
+                    with self.assertRaisesRegex(RuntimeError, "workspace already owned"):
+                        native._run_native_core(layer, workspace, functional, None, hidden, ids, weights)
+                    self.assertEqual(events, ["state", "acquire"])
+                else:
+                    result = native._run_native_core(layer, workspace, functional, None, hidden, ids, weights)
+                    self.assertIs(result, hidden)
+                    self.assertEqual(events, ["state", "acquire", "quant", "schedule", "forward"])
+                ordinary.assert_not_called()
+        self.assertFalse(envs.SGLANG_OPT_MOK_DIRECT_INPUT_QUANT.default)
+
+
 if __name__ == "__main__":
     unittest.main()
