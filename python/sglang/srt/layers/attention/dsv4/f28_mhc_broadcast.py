@@ -4,12 +4,13 @@
 
 import math
 
+# This module is imported only inside the enabled runtime path. Import the real
+# DSL here: copying mhc.T would retain its stale lazy proxy after mhc loads it.
+import tilelang
+import tilelang.language as T
 import torch
-from sglang.kernels.ops.layernorm.mhc import (
-    T,
-    tilelang,
-    mhc_pre_gemm_sqrsum_tilelang,
-)
+
+from sglang.kernels.ops.layernorm.mhc import mhc_pre_gemm_sqrsum_tilelang
 
 
 @tilelang.jit
