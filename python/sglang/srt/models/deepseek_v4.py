@@ -430,7 +430,9 @@ def _dsv4_tp_fp8_a2a_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     return dequant.view(world, shard, hidden).sum(dim=0).to(x.dtype)
 
 
-def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
+def _dsv4_tp_reduce_scatter_rows(
+    x: torch.Tensor, *, allow_fp8: bool = True
+) -> torch.Tensor:
     """Sum TP partials and retain the rank-owned first-dimension token shard.
 
     The default uses ReduceScatter. The diagnostic preserve-AR mode uses the
@@ -457,7 +459,8 @@ def _dsv4_tp_reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     # that tensor is 3D (mHC streams) and runs once per forward, vs 2x43
     # per-layer 2D sites which carry ~all of the RS cost (CR-5).
     if (
-        envs.SGLANG_DSV4_TP_SCATTER_FP8_RS.get()
+        allow_fp8
+        and envs.SGLANG_DSV4_TP_SCATTER_FP8_RS.get()
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.shape[-1] % _DSV4_FP8_AG_GROUP_SIZE == 0
@@ -2047,7 +2050,23 @@ class DeepseekV4DecoderLayer(nn.Module):
     ]:
         use_fused = self.use_fused_mhc_post_pre
 
-        if prev_residual is not None and use_fused:
+        if (
+            prev_residual is None
+            and hidden_states.ndim == 2
+            and envs.SGLANG_DSV4_SM89_MHC_BROADCAST.get()
+            and getattr(self, "hc_attn_fn_broadcast", None) is not None
+        ):
+            from sglang.srt.layers.attention.dsv4.f28_mhc_broadcast import mhc_pre_broadcast
+
+            residual, post, comb, hidden_states = mhc_pre_broadcast(
+                hidden_states, self.hc_attn_fn_broadcast,
+                self.hc_attn_scale, self.hc_attn_base,
+                self.rms_norm_eps, self.hc_eps, _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters, self._input_layernorm_weight_bf16,
+                self.input_layernorm.variance_epsilon,
+            )
+            x_quant = None
+        elif prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
@@ -2979,7 +2998,17 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            use_broadcast = (
+                envs.SGLANG_DSV4_SM89_MHC_BROADCAST.get()
+                and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+                and self.hc_mult == 4
+                and self.pp_group.world_size == 1
+                and not dsa_use_prefill_cp(forward_batch)
+                and (self.dspark_layers_to_capture is not None
+                     or not self._can_run_tbo(forward_batch))
+            )
+            if not use_broadcast:
+                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -3033,7 +3062,11 @@ class DeepseekV4Model(nn.Module):
                 # still a TP partial, not a replicated tensor. Reduce-scatter
                 # both sums the vocab shards and assigns the resulting token
                 # rows to TP ranks.
-                hidden_states = _dsv4_tp_reduce_scatter_rows(hidden_states)
+                # A 2D broadcast embedding must retain the original BF16
+                # entry reduction instead of entering the per-layer FP8 codec.
+                hidden_states = _dsv4_tp_reduce_scatter_rows(
+                    hidden_states, allow_fp8=False
+                )
                 _dsv4_tp_scatter_log_once(
                     "model_input",
                     "reduced vocab-parallel embedding into TP-owned token rows "
@@ -3374,6 +3407,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+            if envs.SGLANG_DSV4_SM89_MHC_BROADCAST.get() and layer_id == 0:
+                weight = layer.hc_attn_fn.detach().view(24, 4, -1).sum(dim=1).contiguous()
+                if getattr(layer, "hc_attn_fn_broadcast", None) is None:
+                    layer.hc_attn_fn_broadcast = weight
+                else:
+                    layer.hc_attn_fn_broadcast.copy_(weight)
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
