@@ -1236,6 +1236,9 @@ class Envs:
     # layout ("c2s4" or "c1s6") the megakernel is launched with.
     SGLANG_OPT_MOK_WARPROLE = EnvBool(False)
     SGLANG_OPT_MOK_WARPROLE_VARIANT = EnvStr("c2s4")
+    # Eager prefill only: reuse a compatible allocated workspace with at most
+    # twice the requested padded token capacity. Preserve exact-shape default.
+    SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

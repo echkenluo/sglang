@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.moe_runner import mok_fp8_native
 from sglang.srt.layers.moe.moe_runner.mok_fp8_native import (
     _admit_workspace_geometry,
     _conservative_route_capacity_factor,
@@ -40,6 +42,91 @@ def _make_shape_inputs():
         "num_global_experts": local_experts * ep_size,
         "ep_size": ep_size,
     }
+
+
+class TestMoKWorkspaceReuse(unittest.TestCase):
+    def setUp(self):
+        self.geometry = dict(
+            group=mock.Mock(group_name="reuse-ep"), device=torch.device("cuda", 0),
+            hidden_size=4096, topk=6, num_local_experts=64,
+        )
+        for name in ("_READY_WORKSPACE_GEOMETRIES", "_REPORTED_WORKSPACE_REUSE",
+                     "_WORKSPACE_GEOMETRIES"):
+            self.enterContext(mock.patch.object(mok_fp8_native, name, set()))
+        self.enterContext(envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE.override(True))
+        self.enterContext(envs.SGLANG_OPT_MOK_WARPROLE.override(True))
+        self.enterContext(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.override(False))
+        self.extend = self.enterContext(mock.patch.object(
+            mok_fp8_native, "get_is_extend_in_batch", return_value=True
+        ))
+
+    def ready(self, tokens, **overrides):
+        mok_fp8_native._READY_WORKSPACE_GEOMETRIES.add(
+            mok_fp8_native._workspace_geometry_key(**self.geometry_args(tokens, **overrides))
+        )
+
+    def geometry_args(self, tokens, **overrides):
+        args = dict(self.geometry, num_local_tokens=tokens)
+        args.update(overrides)
+        args.setdefault("schedule_capacity_factor", _conservative_route_capacity_factor(
+            base_rows=tokens * args["topk"], num_local_experts=args["num_local_experts"],
+            ep_size=4, expert_padding=64,
+        ))
+        return args
+
+    def select(self, tokens, **overrides):
+        return mok_fp8_native._select_workspace_tokens(
+            ep_size=4, **self.geometry_args(tokens, **overrides)
+        )
+
+    def test_observed_service_shape_transition_uses_three_workspaces(self):
+        selected = []
+        for tokens in (1024, 3072, 256, 768, 1024, 3072, 2048, 1024, 3072):
+            capacity = self.select(tokens)
+            selected.append(capacity)
+            self.ready(capacity)
+        self.assertEqual(selected, [1024, 3072, 256, 1024, 1024, 3072, 3072, 1024, 3072])
+        self.assertEqual(len(mok_fp8_native._READY_WORKSPACE_GEOMETRIES), 3)
+
+    def test_smallest_sufficient_capacity_and_exact_hit(self):
+        self.ready(4096)
+        self.ready(3072)
+        self.assertEqual(self.select(2048), 3072)
+        self.ready(2048)
+        self.assertEqual(self.select(2048), 2048)
+        self.assertEqual(self.select(8192), 8192)
+
+    def test_isolates_group_device_shape_and_capacity(self):
+        for mismatch in (
+            dict(group=mock.Mock(group_name="other")), dict(device=torch.device("cuda", 1)),
+            dict(hidden_size=8192), dict(topk=8), dict(num_local_experts=32),
+            dict(schedule_capacity_factor=4),
+        ):
+            with self.subTest(mismatch=mismatch):
+                mok_fp8_native._READY_WORKSPACE_GEOMETRIES.clear()
+                self.ready(3072, **mismatch)
+                self.assertEqual(self.select(2048), 2048)
+
+    def test_admission_is_not_allocation_and_capacity_ratio_is_bounded(self):
+        self.assertTrue(_admit_workspace_geometry(**self.geometry_args(3072)))
+        self.assertEqual(self.select(2048), 2048)
+        self.ready(1024)
+        self.assertEqual(self.select(256), 256)
+        self.assertEqual(self.select(512), 1024)
+        self.assertEqual(self.select(2), 2)
+
+    def test_opt_in_eager_prefill_scope(self):
+        self.assertFalse(envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE.default)
+        self.ready(3072)
+        for env, value in (
+            (envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE, False),
+            (envs.SGLANG_OPT_MOK_WARPROLE, False),
+            (envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH, True),
+        ):
+            with env.override(value):
+                self.assertEqual(self.select(2048), 2048)
+        self.extend.return_value = False
+        self.assertEqual(self.select(2048), 2048)
 
 
 class TestMoKSplitContract(unittest.TestCase):

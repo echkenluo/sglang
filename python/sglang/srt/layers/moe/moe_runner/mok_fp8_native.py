@@ -107,6 +107,10 @@ _REPORTED_ACTIVE = False
 _ROUTE_EXPERT_PADDING = 64
 _WORKSPACE_GEOMETRY_LOCK = threading.Lock()
 _WORKSPACE_GEOMETRIES: set[tuple] = set()
+# Admission precedes allocation. Only successfully returned workspaces are
+# eligible for reuse; an admitted shape alone is not an allocation receipt.
+_READY_WORKSPACE_GEOMETRIES: set[tuple] = set()
+_REPORTED_WORKSPACE_REUSE: set[tuple] = set()
 
 
 def native_shape_contract_error(
@@ -465,7 +469,7 @@ def _report_fallback(reason: str) -> None:
         logger.info("MoK full-native fallback: %s", reason)
 
 
-def _admit_workspace_geometry(
+def _workspace_geometry_key(
     *,
     group,
     device: torch.device,
@@ -474,7 +478,75 @@ def _admit_workspace_geometry(
     topk: int,
     num_local_experts: int,
     schedule_capacity_factor: int,
-) -> bool:
+) -> tuple:
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    return (
+        group.group_name,
+        device_index,
+        num_local_tokens,
+        hidden_size,
+        topk,
+        num_local_experts,
+        schedule_capacity_factor,
+    )
+
+
+def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
+    """Choose the smallest ready, compatible eager-prefill workspace.
+
+    The serialized TP/EP forward path observes the same shapes and allocation
+    history on every rank. Selection is host-only and adds no collective.
+    Padding uses invalid expert IDs, so extra rows do not add expert work,
+    but communication and scratch traffic grow: cap the capacity ratio at 2.
+    Graph capture retains its existing exact-shape contract.
+    """
+    requested = geometry["num_local_tokens"]
+    if (
+        requested < 256
+        or not envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE.get()
+        or not envs.SGLANG_OPT_MOK_WARPROLE.get()
+        or envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()
+        or not get_is_extend_in_batch()
+    ):
+        return requested
+    key = _workspace_geometry_key(**geometry)
+    selected = requested
+    with _WORKSPACE_GEOMETRY_LOCK:
+        if key in _READY_WORKSPACE_GEOMETRIES:
+            return requested
+        candidates = []
+        for ready in _READY_WORKSPACE_GEOMETRIES:
+            tokens = ready[2]
+            if (
+                ready[:2] != key[:2]
+                or ready[3:6] != key[3:6]
+                or not requested <= tokens <= 2 * requested
+            ):
+                continue
+            factor = _conservative_route_capacity_factor(
+                base_rows=tokens * geometry["topk"],
+                num_local_experts=geometry["num_local_experts"],
+                ep_size=ep_size,
+                expert_padding=_ROUTE_EXPERT_PADDING,
+            )
+            if ready[6] == factor:
+                candidates.append(tokens)
+        if candidates:
+            selected = min(candidates)
+            report_key = (key, selected)
+            if report_key not in _REPORTED_WORKSPACE_REUSE:
+                _REPORTED_WORKSPACE_REUSE.add(report_key)
+                logger.info(
+                    "MoK workspace reused: requested_tokens=%d capacity_tokens=%d",
+                    requested,
+                    selected,
+                )
+    return selected
+
+
+def _admit_workspace_geometry(**geometry) -> bool:
     """Admit a bounded set of extension workspace geometries.
 
     The extension caches one workspace per geometry and does not evict.  The
@@ -494,18 +566,7 @@ def _admit_workspace_geometry(
     if cap <= 0:
         return True
 
-    device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    key = (
-        group.group_name,
-        device_index,
-        num_local_tokens,
-        hidden_size,
-        topk,
-        num_local_experts,
-        schedule_capacity_factor,
-    )
+    key = _workspace_geometry_key(**geometry)
     with _WORKSPACE_GEOMETRY_LOCK:
         if key in _WORKSPACE_GEOMETRIES:
             return True
@@ -517,8 +578,8 @@ def _admit_workspace_geometry(
             "capacity_factor=%d",
             len(_WORKSPACE_GEOMETRIES),
             cap,
-            num_local_tokens,
-            schedule_capacity_factor,
+            geometry["num_local_tokens"],
+            geometry["schedule_capacity_factor"],
         )
         return True
 
@@ -900,6 +961,25 @@ def maybe_run_mok_fp8_native(
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
 
+    selected_tokens = _select_workspace_tokens(
+        group=group,
+        device=hidden_states.device,
+        num_local_tokens=padded_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        num_local_experts=layer.num_local_experts,
+        schedule_capacity_factor=capacity_factor,
+        ep_size=layer.moe_ep_size,
+    )
+    if selected_tokens != padded_tokens:
+        padded_tokens = selected_tokens
+        capacity_factor = _conservative_route_capacity_factor(
+            base_rows=padded_tokens * topk,
+            num_local_experts=layer.num_local_experts,
+            ep_size=layer.moe_ep_size,
+            expert_padding=_ROUTE_EXPERT_PADDING,
+        )
+
     # The conservative multiplier accounts for the scheduler's per-expert
     # alignment under the worst valid route distribution.  Decode uses the
     # smallest legal chunk; 1024 bytes keeps larger route gathers compact and
@@ -930,6 +1010,18 @@ def maybe_run_mok_fp8_native(
         topk=topk,
         num_local_experts=layer.num_local_experts,
     )
+    with _WORKSPACE_GEOMETRY_LOCK:
+        _READY_WORKSPACE_GEOMETRIES.add(
+            _workspace_geometry_key(
+                group=group,
+                device=hidden_states.device,
+                num_local_tokens=padded_tokens,
+                hidden_size=hidden_size,
+                topk=topk,
+                num_local_experts=layer.num_local_experts,
+                schedule_capacity_factor=capacity_factor,
+            )
+        )
     _register_trap_watchdog(workspace, mok_functional)
 
     _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
