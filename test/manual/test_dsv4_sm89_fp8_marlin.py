@@ -42,6 +42,11 @@ class TestFp8Marlin(unittest.TestCase):
             dense = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(
                 128, 1
             )
+            # marlin_template.h scale() uses BF16 __hmul2 before the MMA.
+            # Compare the implementation with that rounded W8A16 contract;
+            # the unrounded FP8*FP32-scale oracle is a separate precision delta.
+            unrounded_dense = dense
+            dense = dense.bfloat16().float()
             prepare_fp8_layer_for_marlin(layer, size_k_first=False)
             for rows in (1, 6, 16, 128, 513):
                 x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
@@ -59,7 +64,14 @@ class TestFp8Marlin(unittest.TestCase):
                     )
                     torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.02)
 
-                check(call())
+                eager = call()
+                check(eager)
+                unrounded_ref = x.float() @ unrounded_dense.T
+                print(
+                    f"FP8_PRECISION n={n} k={k} rows={rows} unrounded_weight_l2="
+                    f"{((eager.float()-unrounded_ref).norm()/unrounded_ref.norm()).item():.8g}",
+                    flush=True,
+                )
                 stream = torch.cuda.Stream()
                 with torch.cuda.stream(stream):
                     for _ in range(3):
