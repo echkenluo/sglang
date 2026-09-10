@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -101,6 +102,34 @@ def get_scalar_type(
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+
+
+@triton.jit
+def _sm89_swiglu_clamp_kernel(
+    x, out, n: tl.constexpr, limit: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    gate = tl.load(x + row * 2 * n + col, col < n, 0).to(tl.float32)
+    up = tl.load(x + row * 2 * n + n + col, col < n, 0).to(tl.float32)
+    gate = tl.minimum(gate, limit)
+    up = tl.maximum(tl.minimum(up, limit), -limit)
+    # F28 packed_silu_kernel returns BF16 before multiplication. Keep that
+    # rounding boundary while fusing clamp, SiLU, multiplication and store.
+    act = (gate / (1.0 + tl.exp(-gate))).to(out.dtype.element_ty).to(tl.float32)
+    tl.store(out + row * n + col, act * up, col < n)
+
+
+def sm89_swiglu_clamp(output, input, limit):
+    n = input.shape[1] // 2
+    _sm89_swiglu_clamp_kernel[(input.shape[0], triton.cdiv(n, 256))](
+        input,
+        output,
+        n,
+        limit,
+        256,
+        enable_fp_fusion=False,
+    )
 
 
 def swiglu_limit_func(
@@ -341,7 +370,14 @@ def fused_marlin_moe(
             clamp_limit,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
-        swiglu_limit_func(
+        clamp_fn = swiglu_limit_func
+        if (
+            is_mxfp4_marlin
+            and envs.SGLANG_DSV4_SM89_MARLIN_CLAMP.get()
+            and torch.cuda.get_device_capability(hidden_states.device) == (8, 9)
+        ):
+            clamp_fn = sm89_swiglu_clamp
+        clamp_fn(
             intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
             clamp_limit,
