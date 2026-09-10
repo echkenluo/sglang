@@ -59,10 +59,19 @@ are retained as failures. Disabled hooks return the original functions.
 
 At scheduler-idle `/flush_cache?empty_cache=false`, every rank synchronizes its
 device and atomically publishes a read-only snapshot. Quality runs require an
-empty pre-client snapshot and a matching post-client snapshot for all four ranks.
+validated pre-client snapshot and a matching post-client snapshot for all four
+ranks. Health checks can run model forwards: preserve their baseline counts and
+subtract them when validating client coverage instead of assuming a zero start.
 The audit requires eager execution with CP, PP, overlap and speculation disabled;
 it does not count CUDA graph replay. Successful Python return alone is not device
 completion, and these counters are neither numerical quality nor E2E evidence.
+
+Snapshot v2 records model input rows (including upstream batch padding) separately
+from rank-local MoE rows. DSV4's attention-TP scatter uses `tensor_split`; the
+recorder checks that partition at each layer and exports a model-batch histogram.
+The validator independently derives expected per-layer token/bucket counts from
+that histogram. It does not require local rows to equal global model input rows
+or require equal local totals when the split has a remainder.
 
 CPU coverage tests (no GPU model validation):
 

@@ -66,6 +66,36 @@ def batch_policy(rows, policy):
     return mode, reason
 
 
+def runtime_layout():
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    return {"attn_tp_size": parallel.attn_tp_size,
+            "attn_tp_rank": parallel.attn_tp_rank,
+            "attn_dp_size": parallel.attn_dp_size,
+            "attn_cp_size": parallel.attn_cp_size,
+            "moe_ep_size": parallel.moe_ep_size,
+            "backend": get_moe_a2a_backend().value,
+            "tp_attention_scatter": envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()}
+
+
+def local_moe_tokens(tokens, layout):
+    """Mirror tensor_split's row partition, including a possible remainder.
+
+    DSV4 _run_moe_ffn_dp_sync scatters replicated attention-TP tokens before
+    the EP MoE call. Model input_ids may already include MLP-sync padding.
+    CP/DP-attention paths are outside this recorder's quality contract.
+    """
+    if layout["attn_cp_size"] != 1 or layout["attn_dp_size"] != 1:
+        raise ValueError("MoK path audit requires CP1 and attention DP1")
+    if layout["tp_attention_scatter"] and layout["attn_tp_size"] > 1 and layout["backend"] != "none":
+        quotient, remainder = divmod(tokens, layout["attn_tp_size"])
+        return quotient + int(layout["attn_tp_rank"] < remainder)
+    return tokens
+
+
 class Recorder:
     def __init__(self):
         self.rows = {}
@@ -73,6 +103,8 @@ class Recorder:
         self.errors = {}
         self.active = 0
         self.policy = None
+        self.layout = None
+        self.batches = {}
         self.order = hashlib.sha256()
 
     def error(self, name):
@@ -84,6 +116,12 @@ class Recorder:
         elif self.policy != policy:
             self.error("policy_changed")
 
+    def check_layout(self, layout):
+        if self.layout is None:
+            self.layout = dict(layout)
+        elif self.layout != layout:
+            self.error("layout_changed")
+
     def begin_outer(self, owner, hidden, policy, mode, eligibility):
         self.check_policy(policy)
         layer_id = getattr(owner, "layer_id", None)
@@ -93,8 +131,10 @@ class Recorder:
             self.error("outer_without_model")
         else:
             model["layers"].append(layer_id)
-            if rows != model["tokens"]:
+            if rows != model["local_tokens"]:
                 self.error("model_moe_token_mismatch")
+            if (mode, eligibility) != (model["mode"], model["eligibility"]):
+                self.error("model_moe_policy_mismatch")
         if _outer.get() is not None:
             self.error("nested_outer")
         if not isinstance(layer_id, int):
@@ -117,7 +157,9 @@ class Recorder:
             raise RuntimeError("path audit snapshot inside active execution")
         return {"rows": [dict(v) for _, v in sorted(self.rows.items(), key=lambda x: str(x[0]))],
                 "models": dict(self.models), "errors": dict(self.errors),
-                "policy": self.policy, "model_order_sha256": self.order.hexdigest()}
+                "policy": self.policy, "layout": self.layout,
+                "model_batches": [dict(v) for _, v in sorted(self.batches.items())],
+                "model_order_sha256": self.order.hexdigest()}
 
 
 def _get_recorder():
@@ -150,8 +192,20 @@ def scope(label):
             if label == "model":
                 if _model.get() is not None:
                     recorder.error("nested_model")
-                frame = {"layers": [], "tokens": int(bound["input_ids"].shape[0]),
+                layout, policy = runtime_layout(), runtime_policy()
+                recorder.check_layout(layout)
+                recorder.check_policy(policy)
+                tokens = int(bound["input_ids"].shape[0])
+                local_tokens = local_moe_tokens(tokens, layout)
+                mode, eligibility = batch_policy(local_tokens, policy)
+                frame = {"layers": [], "tokens": tokens, "local_tokens": local_tokens,
+                         "mode": mode, "eligibility": eligibility,
                          "expected": list(range(owner.start_layer, owner.end_layer))}
+                key = (mode, tokens, local_tokens, eligibility)
+                row = recorder.batches.setdefault(key, {"mode": mode,
+                    "model_tokens": tokens, "local_tokens": local_tokens,
+                    "eligibility": eligibility, "calls": 0})
+                row["calls"] += 1
                 context_token = _model.set(frame)
                 counters = recorder.models
             elif label == "outer":
@@ -190,7 +244,7 @@ def scope(label):
                     if frame["layers"] != frame["expected"]:
                         recorder.error("model_layer_coverage")
                     recorder.order.update(json.dumps(
-                        [frame["tokens"], frame["layers"], outcome],
+                        [frame["tokens"], frame["mode"], frame["layers"], outcome],
                         separators=(",", ":")).encode() + b"\n")
                     _model.reset(context_token)
                 elif label == "outer":
@@ -226,11 +280,12 @@ def flush_if_enabled():
 
     recorder = _get_recorder()
     recorder.check_policy(runtime_policy())
+    recorder.check_layout(runtime_layout())
     payload = recorder.snapshot()
     device = torch.cuda.current_device()
     torch.cuda.synchronize(device)
     rank = dist.get_rank() if dist.is_initialized() else 0
-    payload.update(schema="mok-path-audit-v1", rank=rank, pid=os.getpid(),
+    payload.update(schema="mok-path-audit-v2", rank=rank, pid=os.getpid(),
                    session_id=_session_id, flush_index=_flush_index,
                    device_uuid=str(torch.cuda.get_device_properties(device).uuid),
                    device=device, monotonic_ns=time.monotonic_ns(),

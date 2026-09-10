@@ -27,10 +27,14 @@ class PathAuditTest(unittest.TestCase):
         self.hidden = types.SimpleNamespace(shape=(512, 4096), device=types.SimpleNamespace(index=0))
         self.model = types.SimpleNamespace(start_layer=0, end_layer=3)
         self.owner = types.SimpleNamespace(layer_id=0)
+        self.layout = {"attn_tp_size": 4, "attn_tp_rank": 0, "attn_dp_size": 1,
+                       "attn_cp_size": 1, "moe_ep_size": 4, "backend": "deepep",
+                       "tp_attention_scatter": True}
         self.patches = [patch.object(m, "DIRECTORY", "/audit"),
                         patch.object(m, "_recorder", self.recorder),
                         patch.object(m, "_flush_index", 0),
                         patch.object(m, "runtime_policy", side_effect=lambda: dict(self.policy)),
+                        patch.object(m, "runtime_layout", side_effect=lambda: dict(self.layout)),
                         patch.object(m, "batch_policy", side_effect=lambda *args: ("extend", self.eligibility))]
         for p in self.patches:
             p.start()
@@ -75,7 +79,10 @@ class PathAuditTest(unittest.TestCase):
                 outer(self.owner, self.hidden)
             return input_ids
 
-        return model(self.model, self.hidden)
+        inputs = types.SimpleNamespace(shape=(self.hidden.shape[0] * 4,))
+        result = model(self.model, inputs)
+        self.assertIs(result, inputs)
+        return self.hidden
 
     def test_disabled_returns_original_function(self):
         def function(owner):
@@ -139,6 +146,29 @@ class PathAuditTest(unittest.TestCase):
         self.recorder.active = 1
         with self.assertRaises(RuntimeError):
             self.recorder.snapshot()
+
+    def test_tensor_split_uses_local_rows_not_model_rows(self):
+        self.assertEqual(m.local_moe_tokens(4096, self.layout), 1024)
+        for rank in range(4):
+            self.layout['attn_tp_rank'] = rank
+            self.assertEqual(m.local_moe_tokens(1025, self.layout), 257 if rank == 0 else 256)
+            self.assertEqual(m.local_moe_tokens(1, self.layout), 1 if rank == 0 else 0)
+        self.invoke()
+        snapshot = self.recorder.snapshot()
+        self.assertEqual(snapshot['errors'], {})
+        self.assertEqual(snapshot['model_batches'], [{'mode': 'extend', 'model_tokens': 2048,
+            'local_tokens': 512, 'eligibility': 'eligible', 'calls': 1}])
+
+    def test_wrong_local_rows_are_still_rejected(self):
+        with patch.object(m, 'local_moe_tokens', return_value=513):
+            self.invoke()
+        self.assertEqual(self.recorder.errors['model_moe_token_mismatch'], 3)
+
+    def test_cp_and_dp_layouts_are_not_silently_accepted(self):
+        for key in ('attn_cp_size', 'attn_dp_size'):
+            layout = dict(self.layout); layout[key] = 2
+            with self.assertRaises(ValueError):
+                m.local_moe_tokens(512, layout)
 
     def test_flush_sync_failure_publishes_nothing_and_success_is_cumulative(self):
         syncs = []
