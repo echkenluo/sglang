@@ -78,3 +78,26 @@ CPU coverage tests (no GPU model validation):
 ```text
 python3 -m unittest discover -s test/manual/layers/moe -p test_mok_path_audit.py -v
 ```
+
+## Explicit target-session cleanup recovery
+
+The power manifest may include `target_cleanup_recovery` with schema
+`phase2-v4-target-cleanup-recovery-v1`. Its `source_root` must be the sibling
+`target-cleanup-recovery` directory, containing exactly `runtime-exit.json`,
+`host-exit.json`, and `host-binding.json`, each bound by SHA256 in `artifacts`.
+The descriptor also binds `target_receipt_sha256` and `targets_sha256` to the
+unaltered raw target artifacts.
+
+This permits only a target-generation session whose client returned zero and
+whose sole error was a server worker still exiting after TERM/KILL. The later
+host receipt must confirm container disappearance, empty GPU applications and
+released port, with matching owner, image, and clean runtime source heads.
+The original target receipt must still say rc12. Scoring sessions D/S/P/F are
+never recovered through this path. Without explicit evidence, rc12 remains an
+error. Recovery is included in the source digest and never rewrites raw files.
+
+This is an evaluator-only change. The serving checkout and target generator
+remain pinned to their actual runtime revisions; manifest `evaluator_sha256`
+identifies the new evaluator separately. Statistical thresholds, sample counts,
+bootstrap logic and quality requirements are unchanged. The new 8 tests exercise
+synthetic recovery evidence; 32 power tests passed, not a real-model quality GO.

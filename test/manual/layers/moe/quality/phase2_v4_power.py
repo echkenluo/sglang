@@ -405,6 +405,8 @@ def _required_raw_filenames() -> frozenset[str]:
 
 REQUIRED_RAW_FILENAMES = _required_raw_filenames()
 REQUIRED_SOURCE_SHA_KEYS = REQUIRED_RAW_FILENAMES
+TARGET_RECOVERY_ROOT = "target-cleanup-recovery"
+TARGET_RECOVERY_FILES = frozenset({"runtime-exit.json", "host-exit.json", "host-binding.json"})
 FORBIDDEN_REPORTED_KEYS = frozenset(
     {"families", "rates", "passes", "overall_pass", "single_gate_zero_effect"}
 )
@@ -437,6 +439,21 @@ def validate_power_input(payload: object) -> dict:
         "artifacts",
         "provenance",
     }
+    if "target_cleanup_recovery" in payload:
+        expected_keys.add("target_cleanup_recovery")
+        recovery = payload["target_cleanup_recovery"]
+        if (
+            not isinstance(recovery, dict)
+            or set(recovery) != {"schema", "source_root", "artifacts", "target_receipt_sha256", "targets_sha256"}
+            or recovery["schema"] != "phase2-v4-target-cleanup-recovery-v1"
+            or recovery["source_root"] != TARGET_RECOVERY_ROOT
+            or not isinstance(recovery["artifacts"], dict)
+            or set(recovery["artifacts"]) != TARGET_RECOVERY_FILES
+            or not all(_is_sha256(v) for v in recovery["artifacts"].values())
+            or not _is_sha256(recovery["target_receipt_sha256"])
+            or not _is_sha256(recovery["targets_sha256"])
+        ):
+            raise QualityContractError("invalid target cleanup recovery descriptor")
     if set(payload) != expected_keys:
         extra = sorted(set(payload) - expected_keys)
         missing = sorted(expected_keys - set(payload))
@@ -560,7 +577,8 @@ def _validate_targets(path: Path, provenance: Mapping[str, str]) -> dict:
 
 
 def _validate_path_and_receipt(
-    root: Path, tag: str, targets_sha: str, artifact_shas: Mapping[str, str]
+    root: Path, tag: str, targets_sha: str, artifact_shas: Mapping[str, str],
+    *, recovered_target_receipt_sha: str | None = None,
 ) -> tuple[str, str]:
     mode, stage = RAW_CONTRACT[tag]
     path_name = f"path-config-receipt-{tag}-{stage}.json"
@@ -569,6 +587,8 @@ def _validate_path_and_receipt(
     receipt = _load_json(root / receipt_name, receipt_name)
     expected_free_run = 0
     try:
+        if recovered_target_receipt_sha is not None and (tag != "t-s" or receipt.get("rc") != 12):
+            raise ValueError("cleanup recovery applies only to a failed target session")
         if not isinstance(path_payload, dict) or set(path_payload) != {
             "schema", "mode", "tag", "stage", "port", "free_run", "startup_ok",
             "prefill_backend", "cuda_graph", "radix_cache", "overlap_schedule",
@@ -600,7 +620,11 @@ def _validate_path_and_receipt(
         if (
             receipt["schema"] != "phase2-v4-session-receipt-v1"
             or receipt["mode"] != mode or receipt["tag"] != tag
-            or receipt["stage"] != stage or receipt["rc"] != 0
+            or receipt["stage"] != stage
+            or not (receipt["rc"] == 0 or (
+                tag == "t-s" and stage == "target-build" and receipt["rc"] == 12
+                and recovered_target_receipt_sha is not None
+                and recovered_target_receipt_sha == artifact_shas[receipt_name]))
             or receipt["path_ok"] != 1 or receipt["free_run"] != 0
             or receipt["path_config_sha256"] != artifact_shas[path_name]
         ):
@@ -735,6 +759,64 @@ class RawControlAssets:
     gsm_correct: Mapping[str, Sequence[int]]
 
 
+def _validate_target_cleanup_recovery(manifest: Path, payload: dict) -> str | None:
+    """Accept completed target work only after hash-bound host release proof.
+
+    Never rewrite the original rc12, accept a failed client, or recover a
+    D/S/P/F scoring session. All statistical gates and target validation remain.
+    """
+    recovery = payload.get("target_cleanup_recovery")
+    if recovery is None:
+        return None
+    root = manifest.parent / TARGET_RECOVERY_ROOT
+    if (root.is_symlink() or not root.is_dir() or root.resolve().parent != manifest.parent.resolve()
+            or {p.name for p in root.iterdir()} != TARGET_RECOVERY_FILES):
+        raise QualityContractError("invalid target cleanup recovery directory")
+    records = {}
+    for name, digest in recovery["artifacts"].items():
+        path = root / name
+        if (path.is_symlink() or not path.is_file() or path.resolve().parent != root.resolve()
+                or _sha256(path) != digest):
+            raise QualityContractError("target cleanup recovery artifact mismatch: " + name)
+        records[name] = _load_json(path, name)
+    try:
+        runtime, host, binding = (records[n] for n in ("runtime-exit.json", "host-exit.json", "host-binding.json"))
+        processes = {p["name"]: p for p in runtime["processes"]}
+        errors = runtime["cleanup_errors"]
+        if (runtime["schema"] != "mok-quality-process-exit-v1" or runtime["rc"] != 12
+                or runtime["last_phase"] != "workload" or runtime["error"] is not None
+                or len(runtime["processes"]) != 2 or set(processes) != {"target", "server"}
+                or len(errors) != 1 or errors[0]["name"] != "server"
+                or errors[0]["returncode"] != -9 or not errors[0]["live_members"]):
+            raise ValueError("failure was not exclusively server cleanup")
+        target, server = processes["target"], processes["server"]
+        if (target["raw_returncode"] != 0 or target["shell_returncode"] != 0
+                or target["signals"] or target["live_members_after_cleanup"]
+                or server["raw_returncode"] != -9 or server["shell_returncode"] != 137
+                or server["signals"] != [15, 9]
+                or server["live_members_after_cleanup"] != errors[0]["live_members"]):
+            raise ValueError("target client failed or shutdown sequence differs")
+        if (host["rc"] != 12 or host["released"] is not True or host["remaining"] is not None
+                or host["gpu_apps_after"].strip() or host["port_error"] is not None
+                or host["observed_unix_ns"] < runtime["ended_unix_ns"]
+                or host["owner"] != binding["owner"] or binding["tag"] != "t-s"
+                or host["container"] != "mok-quality-control-" + binding["owner"][:12]
+                or binding["container"]["owner"] != binding["owner"]
+                or binding["container"]["image"] != binding["preflight"]["image"]["image_id"]):
+            raise ValueError("host release or container identity is not bound")
+        for repo in ("sglang", "mok"):
+            if (binding["preflight"][repo]["head"] != payload["provenance"][repo + "_head"]
+                    or binding["preflight"][repo]["clean"] is not True):
+                raise ValueError("target runtime differs from control provenance")
+        name = "path-receipt-t-s-target-build.json"
+        if (recovery["target_receipt_sha256"] != payload["artifacts"][name]
+                or recovery["targets_sha256"] != payload["artifacts"]["targets-freeze.json"]):
+            raise ValueError("recovery is not bound to these target artifacts")
+        return recovery["target_receipt_sha256"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise QualityContractError("invalid target cleanup recovery evidence: " + str(error)) from error
+
+
 def load_raw_control_assets(manifest_path: str | Path) -> RawControlAssets:
     manifest = Path(manifest_path)
     if manifest.is_symlink() or not manifest.is_file():
@@ -768,7 +850,9 @@ def load_raw_control_assets(manifest_path: str | Path) -> RawControlAssets:
     targets_path = root / "targets-freeze.json"
     targets = _validate_targets(targets_path, payload["provenance"])
     targets_sha = payload["artifacts"]["targets-freeze.json"]
-    _validate_path_and_receipt(root, "t-s", targets_sha, payload["artifacts"])
+    recovery_sha = _validate_target_cleanup_recovery(manifest, payload)
+    _validate_path_and_receipt(root, "t-s", targets_sha, payload["artifacts"],
+                               recovered_target_receipt_sha=recovery_sha)
     teachers: dict[str, Sequence[dict]] = {}
     gsm: dict[str, Sequence[int]] = {}
     for tag in RAW_TAGS:
@@ -780,8 +864,11 @@ def load_raw_control_assets(manifest_path: str | Path) -> RawControlAssets:
             targets_sha, path_config_sha,
         )
         gsm[tag] = _validate_gsm(root, tag, payload["provenance"])
+    digest_input = payload["artifacts"]
+    if recovery_sha is not None:
+        digest_input = {"raw": payload["artifacts"], "target_cleanup_recovery": payload["target_cleanup_recovery"]}
     source_digest = hashlib.sha256(
-        json.dumps(payload["artifacts"], sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return RawControlAssets(
         manifest_sha256=_sha256(manifest),

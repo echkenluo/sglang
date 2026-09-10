@@ -561,3 +561,69 @@ def test_optional_numpy_small_outer_raw_recomputation(tmp_path, monkeypatch):
         record["injection_policy"] == "margin-plus-25pct"
         for record in result["exact_margin_effects"].values()
     )
+
+
+def _add_target_shutdown_recovery(manifest):
+    """Fixture only: target finished, server teardown exceeded its inner wait."""
+    import phase2_v4_power as power
+    payload = json.loads(manifest.read_text())
+    name = 'path-receipt-t-s-target-build.json'
+    receipt_path = manifest.parent / RAW_DIRECTORY_NAME / name
+    receipt = json.loads(receipt_path.read_text()); receipt['rc'] = 12
+    _write_json(receipt_path, receipt); payload['artifacts'][name] = _digest(receipt_path)
+    owner = 'c' * 32
+    runtime = {'schema': 'mok-quality-process-exit-v1', 'rc': 12, 'last_phase': 'workload',
+        'error': None, 'ended_unix_ns': 100,
+        'cleanup_errors': [{'name': 'server', 'returncode': -9, 'live_members': [485]}],
+        'processes': [
+            {'name': 'target', 'raw_returncode': 0, 'shell_returncode': 0, 'signals': [], 'live_members_after_cleanup': []},
+            {'name': 'server', 'raw_returncode': -9, 'shell_returncode': 137, 'signals': [15, 9], 'live_members_after_cleanup': [485]}]}
+    host = {'rc': 12, 'released': True, 'remaining': None, 'gpu_apps_after': '', 'port_error': None,
+            'observed_unix_ns': 101, 'owner': owner, 'container': 'mok-quality-control-' + owner[:12]}
+    binding = {'owner': owner, 'tag': 't-s', 'container': {'owner': owner, 'image': 'sha256:' + 'e' * 64},
+        'preflight': {'image': {'image_id': 'sha256:' + 'e' * 64},
+                      **{repo: {'head': payload['provenance'][repo + '_head'], 'clean': True} for repo in ('sglang', 'mok')}}}
+    root = manifest.parent / power.TARGET_RECOVERY_ROOT; root.mkdir()
+    for name, value in [('runtime-exit.json', runtime), ('host-exit.json', host), ('host-binding.json', binding)]:
+        _write_json(root / name, value)
+    payload['target_cleanup_recovery'] = {
+        'schema': 'phase2-v4-target-cleanup-recovery-v1', 'source_root': power.TARGET_RECOVERY_ROOT,
+        'artifacts': {p.name: _digest(p) for p in root.iterdir()},
+        'target_receipt_sha256': payload['artifacts']['path-receipt-t-s-target-build.json'],
+        'targets_sha256': payload['artifacts']['targets-freeze.json']}
+    _write_json(manifest, payload)
+    return payload
+
+
+def test_target_cleanup_recovery_keeps_original_failure_and_loads_complete_controls(tmp_path):
+    manifest = _make_raw_power_fixture(tmp_path)
+    original = load_raw_control_assets(manifest)
+    payload = _add_target_shutdown_recovery(manifest)
+    recovered = load_raw_control_assets(manifest)
+    assert recovered.teachers == original.teachers and recovered.gsm_correct == original.gsm_correct
+    assert recovered.source_digest != original.source_digest
+    assert json.loads((tmp_path / RAW_DIRECTORY_NAME / 'path-receipt-t-s-target-build.json').read_text())['rc'] == 12
+    assert recovered.artifact_shas == payload['artifacts']
+
+
+@pytest.mark.parametrize('failure', ['client', 'host-live', 'source', 'wrong-target', 'hash', 'score-session', 'no-proof'])
+def test_target_cleanup_recovery_rejects_invalid_evidence(tmp_path, failure):
+    import phase2_v4_power as power
+    manifest = _make_raw_power_fixture(tmp_path); payload = _add_target_shutdown_recovery(manifest)
+    root = tmp_path / power.TARGET_RECOVERY_ROOT
+    if failure in ('client', 'host-live', 'source'):
+        name = {'client': 'runtime-exit.json', 'host-live': 'host-exit.json', 'source': 'host-binding.json'}[failure]
+        p = root / name; value = json.loads(p.read_text())
+        if failure == 'client': value['processes'][0]['raw_returncode'] = 7
+        elif failure == 'host-live': value['released'] = False
+        else: value['preflight']['sglang']['head'] = '0' * 40
+        _write_json(p, value); payload['target_cleanup_recovery']['artifacts'][name] = _digest(p)
+    elif failure == 'wrong-target': payload['target_cleanup_recovery']['targets_sha256'] = '0' * 64
+    elif failure == 'hash': (root / 'host-exit.json').write_text('{}')
+    elif failure == 'score-session':
+        name = 'path-receipt-d1-bundle.json'; p = tmp_path / RAW_DIRECTORY_NAME / name
+        value = json.loads(p.read_text()); value['rc'] = 12; _write_json(p, value)
+        payload['artifacts'][name] = _digest(p)
+    elif failure == 'no-proof': del payload['target_cleanup_recovery']
+    _write_json(manifest, payload)
+    with pytest.raises(QualityContractError): load_raw_control_assets(manifest)
