@@ -504,9 +504,11 @@ class C4IndexerBackendMixin:
             return False
         if (
             c4_indexer.use_fp4_indexer
-            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or (not envs.SGLANG_DSV4_SM89_F28_INDEXER.get() and (
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            ))
         ):
             return False
         if (
@@ -612,8 +614,6 @@ class C4IndexerBackendMixin:
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         plan: NonPagedIndexerPlan,
     ) -> torch.Tensor:
-        import deep_gemm
-
         k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
             layer_id=c4_indexer.layer_id,
             seq_len_tensor=plan.gather_seq_lens,
@@ -623,6 +623,17 @@ class C4IndexerBackendMixin:
         )
         k_fp8 = k_u8.view(FP8_DTYPE)
         k_scale = scale_u8.view(torch.float32).squeeze(-1)
+        if envs.SGLANG_DSV4_SM89_F28_INDEXER.get():
+            from sglang.srt.layers.attention.dsv4.f28_mqa import fp8_mqa_logits_triton
+
+            if torch.cuda.get_device_capability(q_indexer.device) != (8, 9):
+                raise RuntimeError("F28 nonpaged indexer requires SM89")
+            return fp8_mqa_logits_triton(
+                q_indexer[: plan.query_rows], (k_fp8, k_scale),
+                weights[: plan.query_rows], plan.ks, plan.ke, native_fp8=False,
+            )
+        import deep_gemm
+
         return deep_gemm.fp8_mqa_logits(
             q_indexer[: plan.query_rows],
             (k_fp8, k_scale),
@@ -760,7 +771,7 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
-        if nonpaged_plan is not None and not envs.SGLANG_DSV4_SM89_F28_INDEXER.get():
+        if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
