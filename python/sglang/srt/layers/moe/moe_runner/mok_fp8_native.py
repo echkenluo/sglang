@@ -397,7 +397,9 @@ def _conservative_route_capacity_factor(
     ) * factor_alignment
 
 
-def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
+def _route_padding_config(
+    num_tokens: int, topk: int, *, power_of_two: bool = False
+) -> tuple[int, int]:
     """Return the padded token count and route-gather chunk size."""
     if num_tokens <= 0 or topk <= 0:
         raise ValueError("token and top-k counts must be positive")
@@ -407,7 +409,13 @@ def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
             (num_tokens + route_token_alignment - 1) // route_token_alignment
         ) * route_token_alignment
         return padded_tokens, 16
-    return max(256, ((num_tokens + 255) // 256) * 256), 1024
+    padded_tokens = max(256, ((num_tokens + 255) // 256) * 256)
+    if power_of_two:
+        # Cache one workspace for a capacity range. Existing callers fill the
+        # extra input rows with zeros and routing IDs with -1, then slice the
+        # owned output back to num_tokens. Real expert rows are unchanged.
+        padded_tokens = 1 << (padded_tokens - 1).bit_length()
+    return padded_tokens, 1024
 
 
 def _required_route_capacity_factor(
@@ -887,7 +895,14 @@ def maybe_run_mok_fp8_native(
     # Decode only needs enough padding for the even-token reducer and an M16
     # route-buffer chunk.  Retain M256 token padding for larger batches until
     # their route-chunk/capacity tradeoff is measured independently.
-    padded_tokens, route_chunk_bytes = _route_padding_config(num_tokens, topk)
+    padded_tokens, route_chunk_bytes = _route_padding_config(
+        num_tokens,
+        topk,
+        power_of_two=(
+            envs.SGLANG_OPT_MOK_WARPROLE.get()
+            and envs.SGLANG_OPT_MOK_WARPROLE_TOKEN_BUCKETS.get()
+        ),
+    )
 
     # SGLang's TP/EP model contract gives every rank the same padded shape,
     # and the MoK workspace validates that invariant when a shape is first

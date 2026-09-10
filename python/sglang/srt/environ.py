@@ -1236,6 +1236,10 @@ class Envs:
     # layout ("c2s4" or "c1s6") the megakernel is launched with.
     SGLANG_OPT_MOK_WARPROLE = EnvBool(False)
     SGLANG_OPT_MOK_WARPROLE_VARIANT = EnvStr("c2s4")
+    # Share warp-role workspaces across power-of-two token capacities. Existing
+    # -1 route padding excludes extra rows from the expert GEMMs. Experimental:
+    # reduces cached geometries but can increase input/reduction padding work.
+    SGLANG_OPT_MOK_WARPROLE_TOKEN_BUCKETS = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

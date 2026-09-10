@@ -74,6 +74,37 @@ class TestMoKSplitContract(unittest.TestCase):
         self.assertEqual(_route_padding_config(4, 8), (4, 16))
         self.assertEqual(_route_padding_config(5, 8), (256, 1024))
 
+    def test_bucket_padding_preserves_decode_and_capacity_bounds(self):
+        for tokens in range(1, 5):
+            self.assertEqual(
+                _route_padding_config(tokens, 6, power_of_two=True),
+                _route_padding_config(tokens, 6),
+            )
+        for tokens in (5, 255, 256, 257, 513, 1536, 3074, 4097, 8192):
+            padded, chunk = _route_padding_config(tokens, 6, power_of_two=True)
+            self.assertGreaterEqual(padded, tokens)
+            self.assertLess(padded, 2 * max(256, tokens))
+            self.assertEqual(padded & (padded - 1), 0)
+            self.assertEqual(chunk, 1024)
+            for ep_size in (4, 8):
+                experts = 256 // ep_size
+                factor = _conservative_route_capacity_factor(
+                    base_rows=padded * 6,
+                    num_local_experts=experts,
+                    ep_size=ep_size,
+                    expert_padding=64,
+                )
+                capacity = padded * 6 * factor
+                self.assertGreaterEqual(capacity, ep_size * tokens * 6 + experts * 63)
+                self.assertEqual(capacity % 256, 0)
+
+    def test_observed_ep4_shapes_share_bucket_workspaces(self):
+        tokens = (256, 512, 1024, 1536, 2048, 3072, 3074, 4096)
+        old = {_route_padding_config(t, 6)[0] for t in tokens}
+        bucketed = {_route_padding_config(t, 6, power_of_two=True)[0] for t in tokens}
+        self.assertEqual(len(old), 8)
+        self.assertEqual(bucketed, {256, 512, 1024, 2048, 4096})
+
     def test_capacity_factor_covers_concentrated_routes(self):
         self.assertEqual(
             _conservative_route_capacity_factor(
@@ -86,6 +117,7 @@ class TestMoKSplitContract(unittest.TestCase):
         )
 
     def test_feature_is_opt_in(self):
+        self.assertFalse(envs.SGLANG_OPT_MOK_WARPROLE_TOKEN_BUCKETS.default)
         self.assertFalse(envs.SGLANG_OPT_USE_MOK_FP8_NATIVE.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_STRICT.default)
         self.assertFalse(envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.default)
