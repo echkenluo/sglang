@@ -634,8 +634,16 @@ def fp8_paged_mqa_logits_triton(
     return logits
 
 
-def sglang_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
-                            metadata, max_model_len, clean_logits=False):
+def sglang_paged_mqa_logits(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_tables,
+    metadata,
+    max_model_len,
+    clean_logits=False,
+):
     """Adapt SGLang's paged-only indexer call without copying cache storage."""
     if torch.cuda.get_device_capability(q.device) != (8, 9):
         raise RuntimeError("F28 indexer opt-in is validated only for SM89")
