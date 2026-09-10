@@ -43,6 +43,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
+from sglang.srt.utils.mok_path_audit import scope as mok_path_scope
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
@@ -2346,6 +2347,7 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    @mok_path_scope("model")
     def forward(
         self,
         input_ids: torch.Tensor,

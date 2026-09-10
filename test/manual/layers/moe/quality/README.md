@@ -48,3 +48,24 @@ execution requires an explicit new run directory and verified runtime manifest.
 ```text
 python3 -m pytest -q test/manual/layers/moe/test_phase2_v4_power.py test/manual/layers/moe/test_phase2_v4_eval_e2e.py
 ```
+
+## Eager path coverage audit
+
+`SGLANG_MOK_PATH_AUDIT_DIR` opts into cumulative CPU counters at the DSV4 model,
+routed MoE, native adapter and native core boundaries. Each model call checks
+ordered layer coverage; each returned MoE call checks its native/core outcomes
+against the active token policy. Hidden fallback, omitted layers and exceptions
+are retained as failures. Disabled hooks return the original functions.
+
+At scheduler-idle `/flush_cache?empty_cache=false`, every rank synchronizes its
+device and atomically publishes a read-only snapshot. Quality runs require an
+empty pre-client snapshot and a matching post-client snapshot for all four ranks.
+The audit requires eager execution with CP, PP, overlap and speculation disabled;
+it does not count CUDA graph replay. Successful Python return alone is not device
+completion, and these counters are neither numerical quality nor E2E evidence.
+
+CPU coverage tests (no GPU model validation):
+
+```text
+python3 -m unittest discover -s test/manual/layers/moe -p test_mok_path_audit.py -v
+```

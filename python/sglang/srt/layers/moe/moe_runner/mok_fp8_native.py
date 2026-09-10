@@ -16,6 +16,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
+from sglang.srt.utils.mok_path_audit import scope as mok_path_scope
 from sglang.srt.layers.dp_attention import (
     get_is_extend_in_batch,
     get_max_sequence_length,
@@ -542,6 +543,7 @@ _PREFILL_GRAPH_POOL = None
 _PREFILL_GRAPH_DISABLED = False
 
 
+@mok_path_scope("core")
 def _run_native_core(
     layer,
     workspace,
@@ -798,6 +800,7 @@ def _capture_prefill_graph(
 
 @torch.no_grad()
 @mok_boundary("mok_native_call")
+@mok_path_scope("native")
 def maybe_run_mok_fp8_native(
     layer, hidden_states, topk_output, *, pre_quant_input=None
 ):

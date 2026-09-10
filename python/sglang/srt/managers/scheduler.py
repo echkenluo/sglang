@@ -4135,6 +4135,12 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
+            if os.environ.get("SGLANG_MOK_PATH_AUDIT_DIR"):
+                from sglang.srt.utils.mok_path_audit import (
+                    flush_if_enabled as flush_path_audit,
+                )
+
+                flush_path_audit()
             if os.environ.get("SGLANG_MOK_BOUNDARY_TIMING_DIR"):
                 from sglang.srt.utils.mok_boundary_timing import (
                     flush_if_enabled,

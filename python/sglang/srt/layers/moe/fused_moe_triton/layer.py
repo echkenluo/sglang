@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
+from sglang.srt.utils.mok_path_audit import scope as mok_path_scope
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
@@ -1444,6 +1445,7 @@ class FusedMoE(torch.nn.Module):
             )
 
     @mok_boundary("routed_moe")
+    @mok_path_scope("outer")
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
