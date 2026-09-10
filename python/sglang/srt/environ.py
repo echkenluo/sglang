@@ -1225,6 +1225,7 @@ class Envs:
     # 9-11%. Below the threshold the forward keeps the stock scattered path.
     SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS = EnvInt(4096)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
+    SGLANG_DSV4_SM89_F28_INDEXER = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)

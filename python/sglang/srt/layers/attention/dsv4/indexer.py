@@ -706,6 +706,10 @@ class C4IndexerBackendMixin:
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+        elif envs.SGLANG_DSV4_SM89_F28_INDEXER.get():
+            from sglang.srt.layers.attention.dsv4.f28_mqa import (
+                sglang_paged_mqa_logits as fn,
+            )
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -756,7 +760,7 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
-        if nonpaged_plan is not None:
+        if nonpaged_plan is not None and not envs.SGLANG_DSV4_SM89_F28_INDEXER.get():
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
