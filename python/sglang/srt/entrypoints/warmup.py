@@ -7,6 +7,7 @@ import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -127,13 +128,19 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-@warmup("prefill_shapes")
-async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
-
-    Uses power-of-2 sizes plus intermediate points to cover the shape space
-    that fused_moe, attention extend, and other Triton kernels may encounter.
-    """
+def _prefill_warmup_sizes(configured: str) -> List[int]:
+    if configured:
+        try:
+            sizes = [int(value.strip()) for value in configured.split(",")]
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_PREFILL_WARMUP_SIZES must be comma-separated positive integers"
+            ) from exc
+        if any(size <= 0 for size in sizes):
+            raise ValueError("SGLANG_PREFILL_WARMUP_SIZES must contain positive integers")
+        # Ascending order creates each requested capacity before larger
+        # workspaces can satisfy it through eager-prefill workspace reuse.
+        return sorted(set(sizes))
     page_size = 64
     sizes = set()
     base = 64
@@ -144,9 +151,22 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         if mid <= 32768:
             sizes.add(mid)
         base *= 2
-    sizes = sorted(sizes)
+    return sorted(sizes)
 
-    for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
+
+@warmup("prefill_shapes")
+async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warm prefill shapes before serving, including lazy communication buffers.
+
+    SGLANG_PREFILL_WARMUP_SIZES optionally selects exact token counts. Unset
+    retains the power-of-two and intermediate sweep through 32K. Actual local
+    shapes still depend on TP/EP, chunking, and admission, so callers should
+    inspect activation records before claiming shape coverage.
+    """
+    sizes = _prefill_warmup_sizes(envs.SGLANG_PREFILL_WARMUP_SIZES.get())
+    logger.info("Prefill startup warmup token counts: %s", sizes)
+
+    for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes"):
         generate_req_input = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             sampling_params={
@@ -158,4 +178,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
-        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+        # Complete the request and surface errors after its first yield before
+        # advancing to another shape or marking server startup complete.
+        async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+            pass

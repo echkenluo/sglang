@@ -1017,6 +1017,9 @@ class Envs:
     # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
     # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
+    # Optional token counts for --warmups=prefill_shapes. These forwards run
+    # before the HTTP server accepts requests; unset keeps the default sweep.
+    SGLANG_PREFILL_WARMUP_SIZES = EnvStr("")
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
