@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate existing FP8 Marlin linear for L20 block-128 serving shapes."""
+
 import unittest
 
 import torch
@@ -9,31 +10,55 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 
 
-@unittest.skipUnless(torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9), "requires SM89")
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9),
+    "requires SM89",
+)
 class TestFp8Marlin(unittest.TestCase):
     def test_block_scales_and_graph(self):
         torch.manual_seed(20260910)
         torch.backends.cuda.matmul.allow_tf32 = False
-        for n, k in ((512, 4096), (1024, 4096), (4096, 512), (1024, 1024)):
+        for n, k in (
+            (512, 4096),
+            (1024, 4096),
+            (1536, 4096),
+            (4096, 1024),
+            (4096, 12288),
+            (4096, 256),
+            (8192, 1024),
+        ):
             layer = torch.nn.Module()
             layer.output_size_per_partition, layer.input_size_per_partition = n, k
             layer.orig_dtype = torch.bfloat16
             layer.weight_block_size = [128, 128]
             weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
-            scales = (torch.rand(n // 128, k // 128, device="cuda") * 0.02 + 0.01).bfloat16().float()
+            scales = (
+                (torch.rand(n // 128, k // 128, device="cuda") * 0.02 + 0.01)
+                .bfloat16()
+                .float()
+            )
             layer.weight = torch.nn.Parameter(weight, requires_grad=False)
             layer.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
-            dense = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            dense = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(
+                128, 1
+            )
             prepare_fp8_layer_for_marlin(layer, size_k_first=False)
             for rows in (1, 6, 16, 128, 513):
                 x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+
                 def call():
-                    return apply_fp8_marlin_linear(x, layer.weight, layer.weight_scale, layer.workspace, n, k, None)
+                    return apply_fp8_marlin_linear(
+                        x, layer.weight, layer.weight_scale, layer.workspace, n, k, None
+                    )
+
                 def check(out):
                     ref = (x.float() @ dense.T).bfloat16().float()
                     self.assertTrue(torch.isfinite(out).all().item())
-                    self.assertLess((out.float()-ref).norm().item() / ref.norm().item(), 0.002)
+                    self.assertLess(
+                        (out.float() - ref).norm().item() / ref.norm().item(), 0.002
+                    )
                     torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.02)
+
                 check(call())
                 stream = torch.cuda.Stream()
                 with torch.cuda.stream(stream):
@@ -47,7 +72,10 @@ class TestFp8Marlin(unittest.TestCase):
                     x.normal_()
                     graph.replay()
                     check(out)
-                print(f"FP8_MARLIN n={n} k={k} rows={rows} graph_updates=3 passed", flush=True)
+                print(
+                    f"FP8_MARLIN n={n} k={k} rows={rows} graph_updates=3 passed",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
