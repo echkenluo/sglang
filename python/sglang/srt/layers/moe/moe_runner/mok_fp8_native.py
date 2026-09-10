@@ -616,6 +616,13 @@ def _run_native_core(
         # contract validates them and the padding path builds them that way.
         variant = envs.SGLANG_OPT_MOK_WARPROLE_VARIANT.get()
         _report_warprole_active(layer, variant, workspace.schedule_capacity)
+        capture_args = {}
+        if os.environ.get("SGLANG_MOK_LIVE_AUDIT_W13", "0") != "0":
+            from .mok_fp8_live_audit import prepare_w13_capture
+
+            capture = prepare_w13_capture(layer, state, variant, input_fp8.shape[0])
+            if capture is not None:
+                capture_args["audit_w13"] = capture
         out = mok_warprole.warprole_forward_leased(
             workspace,
             state,
@@ -630,6 +637,7 @@ def _run_native_core(
             layer.w2_weight_scale_inv,
             variant=variant,
             swiglu_limit=layer.moe_runner_config.swiglu_limit,
+            **capture_args,
         )
         if os.environ.get("SGLANG_MOK_LIVE_AUDIT_DIR"):
             # Diagnostic only: read intermediates while this call still owns
@@ -637,7 +645,8 @@ def _run_native_core(
             from .mok_fp8_live_audit import audit_warprole_layer
 
             audit_warprole_layer(
-                layer, state, schedule, out, variant, input_fp8.shape[0]
+                layer, state, schedule, out, variant, input_fp8.shape[0],
+                actual_w13=capture_args.get("audit_w13"),
             )
         # Same handback as the combine path below: the result is a persistent
         # buffer overwritten by the next call, and the outer boundary copies it

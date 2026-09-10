@@ -78,7 +78,50 @@ def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens):
+def prepare_w13_capture(layer, state, variant, input_tokens):
+    """Explicit caller-owned storage for this layer's first eligible live call."""
+    enabled = os.environ.get("SGLANG_MOK_LIVE_AUDIT_W13", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("SGLANG_MOK_LIVE_AUDIT_W13 must be 0 or 1")
+    if enabled == "0":
+        return None
+    if not os.environ.get("SGLANG_MOK_LIVE_AUDIT_DIR"):
+        raise ValueError("W13 capture requires a live audit directory")
+    if variant != "c2s4" or torch.cuda.is_current_stream_capturing():
+        raise ValueError("live W13 capture requires eager c2s4")
+    if (input_tokens < int(os.environ.get("SGLANG_MOK_LIVE_AUDIT_MIN_TOKENS", "1024"))
+            or int(layer.layer_id) in _SEEN):
+        return None
+    return torch.full((state.capacity, layer.w13_weight.shape[1]), float("nan"),
+                      dtype=torch.bfloat16, device=state.hidden.device)
+
+
+def capture_sample_rows(indices, peers, peer_slots, pipeline_rows, rank, layer_id):
+    """First/last real routes, per-rank/layer top eight, and prior worst route."""
+    real = [i for i, peer in enumerate(peers) if int(peer) >= 0]
+    if not real:
+        raise ValueError("no real routes in captured layer")
+    samples = set()
+    for expert in sorted(set(indices)):
+        rows = [i for i in real if indices[i] == expert]
+        if rows:
+            samples.update((rows[0], rows[-1]))
+    errors = pipeline_rows["error_squared"].sqrt()
+    norms = pipeline_rows["reference_squared"].sqrt()
+    relative = torch.where(norms > 0, errors / norms, errors)
+    worst = sorted(real, key=lambda i: (-float(relative[i]), i))[:8]
+    fixed = [i for i in real if rank == 0 and layer_id == 39 and indices[i] == 28
+             and int(peers[i]) == 1 and int(peer_slots[i]) == 397 * 6 + 1]
+    if len(fixed) > 1:
+        raise ValueError("previous worst route appears more than once")
+    samples.update(worst); samples.update(fixed)
+    return sorted(samples), {"top8_current_rank_layer": worst,
+                             "previous_worst_match_rows": fixed,
+                             "scope": "deterministic diagnostic selection, not a random sample"}
+
+
+def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens,
+                        actual_w13=None):
     import torch.distributed as dist
     from mok import _C
     from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant_dynamic
@@ -104,6 +147,14 @@ def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens):
 
     n = int(schedule.num_tokens.item())
     assert 0 < n <= state.capacity and n % 64 == 0
+    capture_required = os.environ.get("SGLANG_MOK_LIVE_AUDIT_W13", "0") == "1"
+    if capture_required != (actual_w13 is not None):
+        raise RuntimeError("live W13 capture flag and actual buffer disagree")
+    if actual_w13 is not None:
+        assert actual_w13.shape == (state.capacity, layer.w13_weight.shape[1])
+        assert actual_w13.dtype == torch.bfloat16 and actual_w13.device == output.device
+        assert bool(torch.isfinite(actual_w13[:n]).all())
+        assert bool(torch.isnan(actual_w13[n:]).all()), "inactive capture rows changed"
     indices = state.m_indices[:n].cpu().tolist()
     source, grouped, inverse = grouped_row_plan(indices, layer.num_local_experts)
     device = output.device
@@ -169,6 +220,23 @@ def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens):
         "w2_same_input": (state.routed_y[:n], unpad(dg_down_same_hidden)),
         "expert_pipeline": (state.routed_y[:n], unpad(dg_down_pipeline)),
     }
+    if actual_w13 is not None:
+        replay_hidden = torch.empty_like(state.hidden)
+        replay_scale = torch.empty_like(state.hidden_scale)
+        silu_and_mul_contig_post_quant_dynamic(
+            input=actual_w13, output=replay_hidden, output_scale=replay_scale,
+            active_tokens=schedule.num_tokens, quant_group_size=128, scale_ue8m0=False,
+            transposed=False, swiglu_limit=layer.moe_runner_config.swiglu_limit, swizzle=False,
+        )
+        pairs.update({
+            "w13_fused": (actual_w13[:n], unpad(dg_gate)),
+            "w13_fused_vs_primitive": (actual_w13[:n], w13[:n]),
+            "activation_from_actual_w13": (state.hidden[:n], replay_hidden[:n]),
+            "scale_from_actual_w13": (state.hidden_scale[:n], replay_scale[:n]),
+            "dequantized_hidden": (
+                state.hidden[:n].double() * state.hidden_scale[:n].double().repeat_interleave(128, -1),
+                hidden_original_order.double() * scale_original_order.double().repeat_interleave(128, -1)),
+        })
     # Deterministic first/last real route per active expert. Full-row statistics
     # cover padding too; saved raw samples only cover real source routes.
     peers = schedule.peer_rank[:n].cpu()
@@ -178,6 +246,13 @@ def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens):
         if rows:
             samples.extend(sorted({rows[0], rows[-1]}))
     assert samples, "no real routes in audited layer"
+    statistics, results = {}, {}
+    for name, (actual, reference) in pairs.items():
+        results[name], statistics[name] = comparison(actual, reference)
+    selection = None
+    if actual_w13 is not None:
+        samples, selection = capture_sample_rows(indices, peers, schedule.peer_token_idx[:n].cpu(),
+                                                  statistics["expert_pipeline"], rank, layer_id)
     sample_gpu = torch.tensor(samples, dtype=torch.long, device=device)
 
     def sample(tensor):
@@ -187,26 +262,31 @@ def audit_warprole_layer(layer, state, schedule, output, variant, input_tokens):
                  "group_source": torch.tensor(source), "group_inverse": torch.tensor(inverse),
                  "peer_rank": peers, "peer_token_idx": schedule.peer_token_idx[:n].cpu(),
                  "routed_x": sample(state.routed_x), "routed_x_scale": sample(state.routed_x_scale),
-                 "candidate_output": output.cpu(), "statistics": {}, "pairs": {}}
-    results = {}
+                 "candidate_output": output.cpu(), "statistics": statistics, "pairs": {}}
     for name, (actual, reference) in pairs.items():
-        results[name], snapshots["statistics"][name] = comparison(actual, reference)
         snapshots["pairs"][name] = {"actual": sample(actual), "reference": sample(reference)}
     assert torch.equal(output, original_output), "diagnostic changed candidate output"
     import deep_gemm
     receipt = {
-        "schema": 1, "rank": rank, "layer": layer_id, "variant": variant,
+        "schema": 2 if actual_w13 is not None else 1, "rank": rank, "layer": layer_id, "variant": variant,
         "input_tokens": input_tokens, "active_rows_including_padding": n,
         "real_routes": int((peers >= 0).sum()), "deepgemm_padded_rows": len(source),
         "sample_rows": samples, "metrics": results,
         "reference": "SGLang contiguous grouped DeepGEMM; same live weights/quantized inputs",
         "reference_alignment": 128, "recipe_a": None, "recipe_b": None,
-        "w13_scope": "component replay; fused kernel does not materialize gate/up",
+        "w13_scope": ("actual epilogue BF16 gate/up before clamp plus component replay"
+                      if actual_w13 is not None else "component replay; fused kernel does not materialize gate/up"),
+        "capture_selection": selection,
         "output_preserved": True, "verdict": "DIAGNOSTIC_ONLY_NOT_QUALITY_OR_PERFORMANCE_GO",
         "component_thresholds": {"exact_fraction_min": .999, "max_row_relative_l2_max": .001},
         "component_gates": {name: results[name]["exact_fraction"] >= .999
                             and results[name]["max_row_relative_l2"] <= .001
-                            for name in ("w13_component", "w2_same_input")},
+                            for name in (("w13_component", "w2_same_input", "w13_fused")
+                                         if actual_w13 is not None else ("w13_component", "w2_same_input"))},
+        "capture_exact_checks": ({name: results[name]["exact_fraction"] == 1.0
+                                  for name in ("w13_fused_vs_primitive", "activation_from_actual_w13",
+                                               "scale_from_actual_w13")}
+                                 if actual_w13 is not None else None),
         "torch": torch.__version__, "cuda": torch.version.cuda,
         "gpu_uuid": str(torch.cuda.get_device_properties(device).uuid),
         "deepgemm_version": deep_gemm.__version__,
