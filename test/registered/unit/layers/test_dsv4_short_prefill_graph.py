@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -90,7 +91,71 @@ def batch(tokens, extend=True, verify=False, tbo=False):
     )
 
 
+def replay_eligible(tokens, enabled, prefix=0, verify=False):
+    source = (
+        ROOT
+        / "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py"
+    )
+    tree = ast.parse(source.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "can_replay_locally"
+    )
+    namespace = {
+        "Optional": Optional,
+        "Backend": SimpleNamespace(BREAKABLE="breakable"),
+        "envs": SimpleNamespace(
+            SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM=SimpleNamespace(
+                get=lambda: enabled
+            )
+        ),
+        "_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR": 2,
+    }
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    runner = SimpleNamespace(
+        _is_full_backend=False,
+        prefill_backend_name="breakable",
+        has_mha_companion_layers=False,
+        max_num_tokens=256,
+        capture_num_tokens=[21, 32, 64, 128, 256],
+        _pad_to_bucket=lambda n, buckets: next(b for b in buckets if b >= n),
+        _uses_eager_prefill_tail=lambda: True,
+    )
+    return namespace["can_replay_locally"](
+        runner,
+        batch_size=1,
+        num_tokens=tokens,
+        input_embeds=None,
+        replace_embeds=None,
+        prefix_lens=[prefix],
+        is_target_verify=verify,
+        capture_hidden_mode=None,
+        return_logprob=True,
+    )
+
+
 class TestShortPrefillGraph(unittest.TestCase):
+    def test_experimental_replay_requires_captured_token_shape(self):
+        for prefix in (0, 4096):
+            for tokens in (21, 32, 64, 128, 256):
+                with self.subTest(prefix=prefix, tokens=tokens):
+                    self.assertTrue(replay_eligible(tokens, True, prefix))
+            for tokens in (20, 22, 33, 65, 129, 255, 257, 512):
+                with self.subTest(prefix=prefix, tokens=tokens):
+                    self.assertFalse(replay_eligible(tokens, True, prefix))
+        self.assertFalse(replay_eligible(32, True, verify=True))
+
+    def test_default_replay_retains_existing_padding_policy(self):
+        for tokens in (20, 22, 33, 65, 129, 255):
+            with self.subTest(tokens=tokens):
+                self.assertTrue(replay_eligible(tokens, False))
+        self.assertFalse(replay_eligible(257, False))
+        self.assertFalse(replay_eligible(32, False, verify=True))
+
     def test_graph_and_communication_ranges_are_disjoint(self):
         context = routing_context()
         self.assertTrue(context.allow_input_scattered)

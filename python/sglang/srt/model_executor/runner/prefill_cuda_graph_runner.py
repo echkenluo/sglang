@@ -1090,7 +1090,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
-        # No exact-shape check: load_batch bucket-pads; only reject
+        # The experimental DSV4 short-Graph/long-scatter route must preserve
+        # the eager token shape. Padding 21 to 32 changed low-confidence
+        # generation, while an exact 21-token capture matched eager. Other
+        # Graph users retain the existing bucket-padding policy.
+        if (
+            envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM.get()
+            and num_tokens not in self.capture_num_tokens
+        ):
+            return False
+        # load_batch bucket-pads the remaining eligible paths; reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
