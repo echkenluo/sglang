@@ -563,14 +563,11 @@ def _admit_workspace_geometry(**geometry) -> bool:
     cap explicitly restores the extension's unbounded behavior.
     """
     cap = envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.get()
-    if cap <= 0:
-        return True
-
     key = _workspace_geometry_key(**geometry)
     with _WORKSPACE_GEOMETRY_LOCK:
         if key in _WORKSPACE_GEOMETRIES:
             return True
-        if len(_WORKSPACE_GEOMETRIES) >= cap:
+        if cap > 0 and len(_WORKSPACE_GEOMETRIES) >= cap:
             return False
         _WORKSPACE_GEOMETRIES.add(key)
         logger.info(
@@ -581,7 +578,14 @@ def _admit_workspace_geometry(**geometry) -> bool:
             geometry["num_local_tokens"],
             geometry["schedule_capacity_factor"],
         )
-        return True
+    if envs.SGLANG_DSV4_SPARSE_PREFILL_OUTPUT_POOL.get():
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_output_pool import (
+            release_sparse_prefill_output_cache,
+        )
+
+        if release_sparse_prefill_output_cache(geometry["device"]):
+            logger.info("Released sparse prefill output cache before new MoK workspace")
+    return True
 
 
 class _PrefillGraphEntry:
