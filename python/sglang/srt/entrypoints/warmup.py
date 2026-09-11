@@ -191,9 +191,16 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     not necessarily warm the same metadata kernels. This option is restricted
     to standalone serving and does not guarantee the scheduler's batch shape.
     Each batch also takes one decode step to warm its KV allocation kernels.
+
+    SGLANG_PREFILL_WARMUP_FINISH_WITH_MAX repeats the largest single-sequence
+    input after all workspace creation, restoring large temporary blocks that
+    cold workspace cache reclamation may have released. It draws no new input.
     """
     sizes = _prefill_warmup_sizes(envs.SGLANG_PREFILL_WARMUP_SIZES.get())
     batches = _prefill_warmup_batches(envs.SGLANG_PREFILL_WARMUP_BATCHES.get())
+    finish_with_max = envs.SGLANG_PREFILL_WARMUP_FINISH_WITH_MAX.get()
+    if finish_with_max and disaggregation_mode != "null":
+        raise ValueError("Final maximum prefill warmup requires standalone serving")
     if batches and disaggregation_mode != "null":
         raise ValueError("Multi-sequence prefill warmup requires standalone serving")
     prepared_inputs = None
@@ -205,6 +212,8 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         }
         sizes = list(reversed(sizes))
     logger.info("Prefill startup warmup token counts: %s", sizes)
+    largest_size = max(sizes)
+    largest_input = None
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes"):
         generate_req_input = GenerateReqInput(
@@ -218,6 +227,8 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
                 "temperature": 0.0,
             },
         )
+        if finish_with_max and size == largest_size:
+            largest_input = list(generate_req_input.input_ids)
         if disaggregation_mode != "null":
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
@@ -241,6 +252,15 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
                 "temperature": 0.0,
                 "ignore_eos": True,
             },
+        )
+        async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+            pass
+
+    if finish_with_max:
+        logger.info("Final maximum-size prefill warmup: tokens=%d", largest_size)
+        generate_req_input = GenerateReqInput(
+            input_ids=largest_input,
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
         )
         async for _ in tokenizer_manager.generate_request(generate_req_input, None):
             pass

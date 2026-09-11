@@ -1023,6 +1023,7 @@ class Envs:
     # Run the same single-sequence sizes largest first so smaller requests can
     # reuse prepared MoK buffers. Does not change the multi-sequence sweep.
     SGLANG_PREFILL_WARMUP_LARGEST_FIRST = EnvBool(False)
+    SGLANG_PREFILL_WARMUP_FINISH_WITH_MAX = EnvBool(False)
     # Optional additional multi-sequence shapes, e.g. "2x4096,3x4096".
     # Each item is sequence count x tokens per sequence; standalone serving only.
     SGLANG_PREFILL_WARMUP_BATCHES = EnvStr("")
