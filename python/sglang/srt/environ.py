@@ -1174,6 +1174,8 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Isolate eager FlashMLA output blocks from MoE/attention temporaries.
+    SGLANG_DSV4_SPARSE_PREFILL_OUTPUT_POOL = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

@@ -39,6 +39,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.sparse_prefill_output_pool import (
+    SparsePrefillOutputPool,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -561,6 +564,10 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.sparse_prefill_output_pool = SparsePrefillOutputPool(
+            self.device,
+            enabled=_is_cuda and envs.SGLANG_DSV4_SPARSE_PREFILL_OUTPUT_POOL.get(),
+        )
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
@@ -1858,15 +1865,16 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
-        )
+        with self.sparse_prefill_output_pool.context():
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
         return o
 
     def expand_prefill_casually(
