@@ -1241,6 +1241,7 @@ class Envs:
     SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP = EnvInt(6)
     # Direct symmetric allocations cannot reclaim PyTorch's idle cache on OOM.
     SGLANG_OPT_MOK_TRIM_CACHE_ON_WORKSPACE_CREATE = EnvBool(False)
+    SGLANG_OPT_MOK_SHARED_SCRATCH = EnvBool(False)
     SGLANG_OPT_MOK_EXPLICIT_ROUTE_CAPACITY = EnvBool(False)
     SGLANG_OPT_MOK_WARPROLE_REUSE_MAX_RATIO = EnvInt(2)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)

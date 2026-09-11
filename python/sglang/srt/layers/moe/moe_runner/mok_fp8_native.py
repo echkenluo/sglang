@@ -510,6 +510,7 @@ def _workspace_geometry_key(
         num_local_experts,
         schedule_capacity_factor,
         schedule_capacity_rows,
+        envs.SGLANG_OPT_MOK_SHARED_SCRATCH.get(),
     )
 
 
@@ -563,7 +564,7 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
                     ep_size=ep_size,
                     expert_padding=_ROUTE_EXPERT_PADDING,
                 )
-            if ready[6:] == (factor, rows):
+            if ready[6:] == (factor, rows, key[8]):
                 candidates.append(tokens)
         if candidates:
             selected = min(candidates)
@@ -1084,6 +1085,20 @@ def maybe_run_mok_fp8_native(
             "workspace geometry cap reached; unseen geometry uses stock DeepEP"
         )
         return None
+    scratch_args = {}
+    if envs.SGLANG_OPT_MOK_SHARED_SCRATCH.get():
+        if not envs.SGLANG_OPT_MOK_WARPROLE.get():
+            raise ValueError("shared scratch is reserved for the warp-role path")
+        from mok.scratch import get_fp8_scratch_arena
+
+        physical_rows = (
+            capacity_rows if capacity_rows is not None
+            else padded_tokens * topk * capacity_factor
+        )
+        arena = get_fp8_scratch_arena(
+            group, device=hidden_states.device, capacity=physical_rows
+        )
+        scratch_args["scratch_arena"] = arena
     workspace = mok_functional.get_fp8_route_workspace(
         config,
         group,
@@ -1092,6 +1107,7 @@ def maybe_run_mok_fp8_native(
         hidden_size=hidden_size,
         topk=topk,
         num_local_experts=layer.num_local_experts,
+        **scratch_args,
     )
     with _WORKSPACE_GEOMETRY_LOCK:
         _READY_WORKSPACE_GEOMETRIES.add(
