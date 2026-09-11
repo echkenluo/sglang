@@ -64,5 +64,28 @@ the corrected FlashInfer cache, and five short-prefill Graph buckets.
 This is substantial repeatability improvement, not a complete fix. The model
 repeatability gate and original numerical gate remain failed. Hooks collected
 metadata, so this run provides no throughput result. Keep default off pending
-the cached-reuse investigation, quality checks and a separate performance
+the long-prefill investigation, quality checks and a separate performance
 comparison. The original service was restored with identical fixed outputs.
+
+
+R38 reanalysis found reported probabilities differed in all eight stable-arm
+long-input triplicate groups from R37, including cold requests. All sixteen
+short-input groups had identical reported probabilities. The sole warm-request
+token divergence does not establish cache reuse as the cause.
+
+R38 then repeated real checkpoint GEMMs during three cold 4817-token, one-output
+requests, using the same implementation and stable flag. On each of eight ranks,
+all 43 target layers, both GEMMs, and both prefill chunks were covered: 516 calls
+per rank, each repeated five times, 20640 comparisons overall. Every comparison
+was bitwise identical. GEMM1 used M4096/M728; GEMM2 used M24576/M4368. These are
+real E256 model weights, not the old E8 numeric fixture. Draft GEMMs were not
+covered by these one-output requests.
+
+Three ordinary and three instrumented requests all returned the same first
+token, but reported probabilities varied in both groups. Repetition adds GPU
+work and synchronization, so this is a bounded same-input GEMM diagnostic, not
+proof of global determinism or timing equivalence. No failure tensor was created.
+The original service was restored with health and fixed-output checks passing.
+No new engine implementation or performance result was produced. Preserve all
+community candidates; native FP4 remains unadmitted and default off. Next locate
+the first changed intermediate value in cold long prefill.
