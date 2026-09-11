@@ -273,6 +273,18 @@ def fused_marlin_moe(
     if global_num_experts == -1:
         global_num_experts = E
     if (
+        is_mxfp4_marlin
+        and expert_map is None
+        and global_num_experts == E
+        and envs.SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN.get()
+        and torch.cuda.get_device_capability(hidden_states.device) == (8, 9)
+    ):
+        from sglang.kernels.ops.moe.moe_align_stable import moe_align_block_size_stable
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size_stable(topk_ids, block_size_m, global_num_experts)
+        )
+    elif (
         M == 1
         and topk <= 32
         and expert_map is None
