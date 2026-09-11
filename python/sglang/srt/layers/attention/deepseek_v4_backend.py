@@ -512,6 +512,11 @@ class DeepseekV4AttnBackend(
         self._sm89_sparse_prefill = envs.SGLANG_DSV4_SM89_SPARSE_PREFILL.get()
         if self._sm89_sparse_prefill and not _is_sm89:
             raise ValueError("SGLANG_DSV4_SM89_SPARSE_PREFILL requires SM89 GPUs")
+        self._sm89_sparse_prefill_min_tokens = (
+            envs.SGLANG_DSV4_SM89_SPARSE_PREFILL_MIN_TOKENS.get()
+        )
+        if self._sm89_sparse_prefill_min_tokens < 0:
+            raise ValueError("SM89 sparse prefill minimum token count must be nonnegative")
         self._sm89_sparse_prefill_seen = set()
         self._sm89_flashinfer = None
         if envs.SGLANG_DSV4_SM89_FLASHINFER.get():
@@ -1728,7 +1733,13 @@ class DeepseekV4AttnBackend(
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
-                and (not _is_sm89 or self._sm89_sparse_prefill)
+                and (
+                    not _is_sm89
+                    or (
+                        self._sm89_sparse_prefill
+                        and q.shape[0] >= self._sm89_sparse_prefill_min_tokens
+                    )
+                )
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
