@@ -43,6 +43,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
+from sglang.srt.utils.mok_fault_progress import boundary as mok_fault_boundary
 from sglang.srt.utils.mok_path_audit import scope as mok_path_scope
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1172,6 +1173,7 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    @mok_fault_boundary("attention", minimum_rows=24576, tensor_argument="x")
     def forward(
         self,
         x: torch.Tensor,

@@ -104,6 +104,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.utils.mok_boundary_timing import boundary as mok_boundary
+from sglang.srt.utils.mok_fault_progress import boundary as mok_fault_boundary
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -1246,6 +1247,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    @mok_fault_boundary("moe", minimum_rows=6144)
     def forward_deepep(
         self,
         hidden_states: torch.Tensor,

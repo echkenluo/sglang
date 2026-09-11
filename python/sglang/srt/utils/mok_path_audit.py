@@ -284,6 +284,9 @@ def flush_if_enabled():
     payload = recorder.snapshot()
     device = torch.cuda.current_device()
     torch.cuda.synchronize(device)
+    from sglang.srt.utils.mok_fault_progress import poll_if_enabled
+
+    poll_if_enabled()
     rank = dist.get_rank() if dist.is_initialized() else 0
     payload.update(schema="mok-path-audit-v2", rank=rank, pid=os.getpid(),
                    session_id=_session_id, flush_index=_flush_index,
