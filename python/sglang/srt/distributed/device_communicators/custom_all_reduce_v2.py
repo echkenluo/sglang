@@ -170,7 +170,18 @@ class CustomAllReduceV2:
         # node-local VMM remap) does not — force eager pull inside graphs.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        # cudaMallocAsync allocations cannot be exported through the legacy
+        # cudaIpc input-registration path. The existing workspace-copy path
+        # remains capturable and keeps custom all-reduce inside CUDA graphs.
+        async_allocator = torch.cuda.get_allocator_backend() == "cudaMallocAsync"
+        self._is_graph_mode_supported = (
+            not tms_cudagraph and not is_multinode and not async_allocator
+        )
+        if async_allocator:
+            logger.info(
+                "Custom all-reduce uses symmetric workspace copies in CUDA "
+                "graphs with cudaMallocAsync (input IPC registration disabled)"
+            )
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
