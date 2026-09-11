@@ -52,6 +52,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -1635,6 +1636,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            if envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM.get():
+                # CPU metadata only; never synchronize a GPU tensor for this
+                # receipt. Emit once per prefix class after backend replay.
+                has_prefix = any(forward_batch.extend_prefix_lens_cpu or [])
+                logged = getattr(self, "_dsv4_short_graph_logged", set())
+                if has_prefix not in logged:
+                    logger.info(
+                        "DSV4 short prefill graph replayed: tokens=%s bucket=%s "
+                        "prefix=%s draft=%s",
+                        raw_num_tokens,
+                        static_num_tokens,
+                        int(has_prefix),
+                        int(self.model_runner.is_draft_worker),
+                    )
+                    logged.add(has_prefix)
+                    self._dsv4_short_graph_logged = logged
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
