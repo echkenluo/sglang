@@ -57,6 +57,35 @@ class TestCommunityDecode(unittest.TestCase):
         expected_lse = kwargs["attn_sink"][None, :, None].expand(6, 8, 1)
         torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
 
+    def test_padding_capacity_does_not_change_active_output(self):
+        with self.subTest(main_capacity=4096, extra_capacity=2048):
+            kwargs, scopes = self.case(6, 256, 64, 128)
+            kwargs["topk_length"].copy_(
+                torch.tensor([0, 1, 31, 32, 33, 127], device="cuda", dtype=torch.int32)
+            )
+            kwargs["extra_topk_length"].copy_(
+                torch.tensor([0, 1, 31, 32, 33, 511], device="cuda", dtype=torch.int32)
+            )
+            output, lse = self.invoke(kwargs)
+            self.check_reference(kwargs, scopes, output, lse)
+            padded = dict(kwargs)
+            for key, capacity in (
+                ("indices", 4096),
+                ("extra_indices_in_kvcache", 2048),
+            ):
+                indices = kwargs[key]
+                # Positive garbage beyond the active prefix must be ignored.
+                padding = torch.zeros(
+                    *indices.shape[:-1],
+                    capacity - indices.shape[-1],
+                    device=indices.device,
+                    dtype=indices.dtype,
+                )
+                padded[key] = torch.cat((indices, padding), dim=-1)
+            padded_output, padded_lse = self.invoke(padded)
+            torch.testing.assert_close(padded_output, output, atol=0, rtol=0)
+            torch.testing.assert_close(padded_lse, lse, atol=0, rtol=0)
+
     def test_graph_replay_and_changed_query(self):
         for tokens, extra in ((5, 2), (6, 64)):
             with self.subTest(tokens=tokens, extra_page=extra):

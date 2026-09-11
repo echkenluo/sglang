@@ -38,9 +38,23 @@ views, attention sink, and repeated Graph replay with changed queries.
 The output tolerance is atol=0.05, rtol=0.05, inherited from the existing
 FlashInfer fixture. These are component tests, not a model quality claim.
 
-Status: CPU dispatch checks pass. GPU numerical, Graph and full-model checks
-have not run for this branch; no service performance claim. Keep this
-candidate separate from the active M5/M6 MoE performance comparison. If the
-MoE configuration is adopted, its two-file configuration commit can be
-combined later and tested as a new explicit arm. The remote GPU source and
-running experiment are unchanged by this local branch.
+## Active-prefix loop candidate
+
+The original `160f6e88aa` integration passed the synthetic GPU/Graph checks.
+A same-input study on 32 real L20 attention calls found the community output
+closer to a dense FP32 reference than FlashInfer in every sample. Full-model
+continuation nevertheless differed, so model quality and service adoption
+remain unestablished. In four single-GPU hot-cache Graph cases, the unchanged
+community implementation took about 3-26 times the FlashInfer latency.
+
+This branch bounds each tile loop by the clamped per-query valid length,
+instead of scanning the whole padded index capacity. The existing masks,
+attention arithmetic, partial-output dtype, merge, sink and SM89 launch
+configuration stay unchanged. A new GPU regression compares the same active
+keys with small and large padded capacities, including zero lengths and tile
+boundaries, and requires identical output and LSE.
+
+The active-prefix change has not yet been GPU-validated or timed. It remains
+an independent opt-in candidate; the currently running remote comparison
+uses the original frozen kernel. CPU dispatch checks and static validation
+are separate from these pending GPU checks.

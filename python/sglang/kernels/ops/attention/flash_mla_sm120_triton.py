@@ -117,7 +117,7 @@ def _tiled_sparse_decode_kernel(
     valid_topk = topk
     if has_topk_len:
         valid_topk = tl.load(topk_len_ptr + bid).to(tl.int32)
-        valid_topk = tl.minimum(valid_topk, topk)
+        valid_topk = tl.maximum(0, tl.minimum(valid_topk, topk))
 
     # ---- Online softmax state (base-2 math for SM120 efficiency) ----
     m_i: tl.float32 = -1e30
@@ -130,7 +130,9 @@ def _tiled_sparse_decode_kernel(
     t_offs = tl.arange(0, BLOCK_T)  # [BLOCK_T], token offsets within tile
 
     # ---- Process tokens in tiles of BLOCK_T ----
-    for tile_start in range(0, topk, BLOCK_T):
+    # Padded index capacity can be much larger than the active prefix (notably
+    # C128 at short contexts). Trailing tiles contain no contributing keys.
+    for tile_start in range(0, valid_topk, BLOCK_T):
         t_idx = tile_start + t_offs  # [BLOCK_T], global token indices
         t_in_bounds = t_idx < topk  # bounds for index load
         t_valid = t_idx < valid_topk  # bounds for actual processing
