@@ -401,6 +401,24 @@ def _conservative_route_capacity_factor(
     ) * factor_alignment
 
 
+def _conservative_route_capacity_rows(
+    *, base_rows: int, num_local_experts: int, ep_size: int, expert_padding: int
+) -> int:
+    # Keep the same route-distribution bound, rounding physical rows to M256
+    # instead of rounding to an entire rank's T*topk route count.
+    _conservative_route_capacity_factor(
+        base_rows=base_rows,
+        num_local_experts=num_local_experts,
+        ep_size=ep_size,
+        expert_padding=expert_padding,
+    )
+    rows = max(
+        2 * base_rows,
+        ep_size * base_rows + num_local_experts * (expert_padding - 1),
+    )
+    return ((rows + 255) // 256) * 256
+
+
 def _route_padding_config(num_tokens: int, topk: int) -> tuple[int, int]:
     """Return the padded token count and route-gather chunk size."""
     if num_tokens <= 0 or topk <= 0:
@@ -478,6 +496,7 @@ def _workspace_geometry_key(
     topk: int,
     num_local_experts: int,
     schedule_capacity_factor: int,
+    schedule_capacity_rows: Optional[int] = None,
 ) -> tuple:
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
@@ -490,6 +509,7 @@ def _workspace_geometry_key(
         topk,
         num_local_experts,
         schedule_capacity_factor,
+        schedule_capacity_rows,
     )
 
 
@@ -531,7 +551,15 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
                 ep_size=ep_size,
                 expert_padding=_ROUTE_EXPERT_PADDING,
             )
-            if ready[6] == factor:
+            rows = None
+            if geometry.get("schedule_capacity_rows") is not None:
+                rows = _conservative_route_capacity_rows(
+                    base_rows=tokens * geometry["topk"],
+                    num_local_experts=geometry["num_local_experts"],
+                    ep_size=ep_size,
+                    expert_padding=_ROUTE_EXPERT_PADDING,
+                )
+            if ready[6:] == (factor, rows):
                 candidates.append(tokens)
         if candidates:
             selected = min(candidates)
@@ -602,11 +630,12 @@ def _admit_workspace_geometry(**geometry) -> bool:
         _WORKSPACE_GEOMETRIES.add(key)
         logger.info(
             "MoK workspace geometry admitted: count=%d cap=%d tokens=%d "
-            "capacity_factor=%d",
+            "capacity_factor=%d capacity_rows=%s",
             len(_WORKSPACE_GEOMETRIES),
             cap,
             geometry["num_local_tokens"],
             geometry["schedule_capacity_factor"],
+            geometry.get("schedule_capacity_rows"),
         )
     if trim:
         _trim_cache_before_workspace(geometry["device"])
@@ -990,6 +1019,16 @@ def maybe_run_mok_fp8_native(
         expert_padding=_ROUTE_EXPERT_PADDING,
     )
 
+    explicit_capacity = envs.SGLANG_OPT_MOK_EXPLICIT_ROUTE_CAPACITY.get()
+    capacity_rows = (
+        _conservative_route_capacity_rows(
+            base_rows=padded_tokens * topk,
+            num_local_experts=layer.num_local_experts,
+            ep_size=layer.moe_ep_size,
+            expert_padding=_ROUTE_EXPERT_PADDING,
+        )
+        if explicit_capacity else None
+    )
     selected_tokens = _select_workspace_tokens(
         group=group,
         device=hidden_states.device,
@@ -999,6 +1038,7 @@ def maybe_run_mok_fp8_native(
         num_local_experts=layer.num_local_experts,
         schedule_capacity_factor=capacity_factor,
         ep_size=layer.moe_ep_size,
+        schedule_capacity_rows=capacity_rows,
     )
     if selected_tokens != padded_tokens:
         padded_tokens = selected_tokens
@@ -1009,6 +1049,14 @@ def maybe_run_mok_fp8_native(
             expert_padding=_ROUTE_EXPERT_PADDING,
         )
 
+        if explicit_capacity:
+            capacity_rows = _conservative_route_capacity_rows(
+                base_rows=padded_tokens * topk,
+                num_local_experts=layer.num_local_experts,
+                ep_size=layer.moe_ep_size,
+                expert_padding=_ROUTE_EXPERT_PADDING,
+            )
+
     # The conservative multiplier accounts for the scheduler's per-expert
     # alignment under the worst valid route distribution.  Decode uses the
     # smallest legal chunk; 1024 bytes keeps larger route gathers compact and
@@ -1016,6 +1064,7 @@ def maybe_run_mok_fp8_native(
     config = mok_functional.MoKConfig(
         schedule_capacity_multiplier=capacity_factor / layer.moe_ep_size,
         all_gather_top_experts_chunk_bytes=route_chunk_bytes,
+        **({"schedule_capacity_rows": capacity_rows} if explicit_capacity else {}),
     )
     if not _admit_workspace_geometry(
         group=group,
@@ -1025,6 +1074,7 @@ def maybe_run_mok_fp8_native(
         topk=topk,
         num_local_experts=layer.num_local_experts,
         schedule_capacity_factor=capacity_factor,
+        schedule_capacity_rows=capacity_rows,
     ):
         _report_fallback(
             "workspace geometry cap reached; unseen geometry uses stock DeepEP"
@@ -1049,6 +1099,7 @@ def maybe_run_mok_fp8_native(
                 topk=topk,
                 num_local_experts=layer.num_local_experts,
                 schedule_capacity_factor=capacity_factor,
+                schedule_capacity_rows=capacity_rows,
             )
         )
     _register_trap_watchdog(workspace, mok_functional)
