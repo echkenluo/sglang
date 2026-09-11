@@ -1468,6 +1468,12 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
+            if self.alt_stream is not None and shared_output.is_cuda:
+                # The side stream owns this allocation, but the returned
+                # tensor is consumed (and eventually dropped) on the main
+                # stream. The producer event orders writes, not its later
+                # lifetime. Register the consumer before handing it back.
+                shared_output.record_stream(torch.cuda.current_stream())
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
             # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
