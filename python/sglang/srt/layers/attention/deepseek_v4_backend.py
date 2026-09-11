@@ -516,8 +516,14 @@ class DeepseekV4AttnBackend(
             envs.SGLANG_DSV4_SM89_SPARSE_PREFILL_MIN_TOKENS.get()
         )
         if self._sm89_sparse_prefill_min_tokens < 0:
-            raise ValueError("SM89 sparse prefill minimum token count must be nonnegative")
+            raise ValueError(
+                "SM89 sparse prefill minimum token count must be nonnegative"
+            )
         self._sm89_sparse_prefill_seen = set()
+        self._sm89_sparse_decode = envs.SGLANG_DSV4_SM89_SPARSE_DECODE.get()
+        if self._sm89_sparse_decode and not _is_sm89:
+            raise ValueError("SGLANG_DSV4_SM89_SPARSE_DECODE requires SM89 GPUs")
+        self._sm89_sparse_decode_seen = set()
         self._sm89_flashinfer = None
         if envs.SGLANG_DSV4_SM89_FLASHINFER.get():
             if not _is_sm89:
@@ -1755,7 +1761,37 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if self._sm89_sparse_decode and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
+                    flash_mla_sparse_decode_triton,
+                )
+
+                o = flash_mla_sparse_decode_triton(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+                if compress_ratio not in self._sm89_sparse_decode_seen:
+                    logger.info(
+                        "DSV4 SM89 community sparse decode invoked: ratio=%s "
+                        "queries=%s heads=%s BLOCK_T=32 warps=8 stages=2",
+                        compress_ratio,
+                        q.shape[0],
+                        q.shape[2],
+                    )
+                    self._sm89_sparse_decode_seen.add(compress_ratio)
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1786,7 +1822,9 @@ class DeepseekV4AttnBackend(
                 elif _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache as attention_fn
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache as attention_fn
+                    from sgl_kernel.flash_mla import (
+                        flash_mla_with_kvcache as attention_fn,
+                    )
 
                 o = attention_fn(
                     q=q,
@@ -1910,14 +1948,20 @@ class DeepseekV4AttnBackend(
             )
 
             o = sparse_prefill_bf16_sm89(
-                q_flat, kv, combined_indices, combined_lens, attn_sink,
+                q_flat,
+                kv,
+                combined_indices,
+                combined_lens,
+                attn_sink,
                 self.softmax_scale,
             )
             if compress_ratio not in self._sm89_sparse_prefill_seen:
                 logger.info(
                     "DSV4 SM89 community sparse prefill executed: ratio=%s "
                     "queries=%s heads=%s topk=%s",
-                    compress_ratio, q_flat.shape[0], q_flat.shape[1],
+                    compress_ratio,
+                    q_flat.shape[0],
+                    q_flat.shape[1],
                     combined_indices.shape[-1],
                 )
                 self._sm89_sparse_prefill_seen.add(compress_ratio)

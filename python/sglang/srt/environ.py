@@ -1311,6 +1311,8 @@ class Envs:
     SGLANG_DSV4_SM89_SPARSE_PREFILL = EnvBool(False)
     # Zero preserves the all-EXTEND experiment; set a floor for short-prompt fallback.
     SGLANG_DSV4_SM89_SPARSE_PREFILL_MIN_TOKENS = EnvInt(0)
+    # Opt-in community tiled Triton decode; ordinary prefill retains its route.
+    SGLANG_DSV4_SM89_SPARSE_DECODE = EnvBool(False)
     SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # Opt in to the F28-derived Ada wo_a kernel; requires FP8_WO_A_GEMM.

@@ -37,12 +37,25 @@ _TOKEN_DATA_STRIDE = 576  # bytes per token in data section
 _SCALE_STRIDE = 8  # bytes per token in scale section
 
 
-@triton.autotune(
-    configs=[
+def _get_sparse_decode_configs(device_capability=None):
+    if device_capability is None and torch.cuda.is_available():
+        device_capability = torch.cuda.get_device_capability()
+
+    if device_capability == (8, 9):
+        # xltzsoft/deepseek-v4-sm89 e20d29454d: offline RTX4090 choice.
+        # One candidate also avoids autotune's cache-flush allocation.
+        # L20 service correctness and benefit require a separate comparison.
+        return [triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2)]
+
+    return [
         triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2),
-    ],
+    ]
+
+
+@triton.autotune(
+    configs=_get_sparse_decode_configs(),
     key=["topk_rounded"],
 )
 @triton.jit
