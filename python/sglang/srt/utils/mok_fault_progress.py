@@ -139,3 +139,19 @@ def poll_if_enabled():
     """Called after the existing idle audit synchronization, never in a layer."""
     if DIRECTORY and _recorder is not None:
         _recorder.poll({"label": "idle_flush"})
+
+
+def record_warmup_input(size, input_ids):
+    """Save the CPU-generated reproduction inputs before their GPU request."""
+    if not DIRECTORY:
+        return
+    directory = Path(DIRECTORY)
+    directory.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(input_ids, separators=(",", ":")).encode()
+    payload = {"size": size, "input_ids": input_ids,
+               "input_sha256": hashlib.sha256(encoded).hexdigest(),
+               "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+               "pid": os.getpid()}
+    with (directory / f"warmup-input-{size}-pid{os.getpid()}.json").open("x") as stream:
+        json.dump(payload, stream, allow_nan=False)
+        stream.write("\n")

@@ -100,6 +100,15 @@ class TestProgress(unittest.TestCase):
         path = next(Path(self.tmp.name).glob('*.jsonl'))
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_warmup_input_is_cpu_only_and_exact(self):
+        self.mod.DIRECTORY = self.tmp.name
+        self.mod.record_warmup_input(3, [2, 4, 6])
+        path = next(Path(self.tmp.name).glob('warmup-input-*.json'))
+        row = json.loads(path.read_text())
+        self.assertEqual(row['input_ids'], [2, 4, 6])
+        self.assertEqual(row['sampling_params']['max_new_tokens'], 1)
+        self.assertFalse(self.cuda.events)
+
     def test_disabled_is_identity(self):
         def fn(owner, x):
             return x

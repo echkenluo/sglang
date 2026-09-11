@@ -8,6 +8,7 @@ import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.environ import envs
+from sglang.srt.utils.mok_fault_progress import record_warmup_input
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -194,8 +195,10 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     logger.info("Prefill startup warmup token counts: %s", sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes"):
+        input_ids = (np.random.randint(2**16, size=[size])).tolist()
+        record_warmup_input(size, input_ids)
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=input_ids,
             sampling_params={
                 "max_new_tokens": 1,
                 "temperature": 0.0,
