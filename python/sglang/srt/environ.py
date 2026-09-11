@@ -1020,6 +1020,9 @@ class Envs:
     # Optional token counts for --warmups=prefill_shapes. These forwards run
     # before the HTTP server accepts requests; unset keeps the default sweep.
     SGLANG_PREFILL_WARMUP_SIZES = EnvStr("")
+    # Optional additional multi-sequence shapes, e.g. "2x4096,3x4096".
+    # Each item is sequence count x tokens per sequence; standalone serving only.
+    SGLANG_PREFILL_WARMUP_BATCHES = EnvStr("")
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)

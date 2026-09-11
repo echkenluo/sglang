@@ -154,6 +154,24 @@ def _prefill_warmup_sizes(configured: str) -> List[int]:
     return sorted(sizes)
 
 
+def _prefill_warmup_batches(configured: str) -> list[tuple[int, int]]:
+    if not configured:
+        return []
+    try:
+        batches = []
+        for item in configured.split(","):
+            count, tokens = (int(value.strip()) for value in item.split("x"))
+            if count <= 0 or tokens <= 0:
+                raise ValueError
+            batches.append((count, tokens))
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_PREFILL_WARMUP_BATCHES must contain positive "
+            "sequence-count x tokens-per-sequence pairs, e.g. 2x4096,3x4096"
+        ) from exc
+    return list(dict.fromkeys(batches))
+
+
 @warmup("prefill_shapes")
 async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     """Warm prefill shapes before serving, including lazy communication buffers.
@@ -162,8 +180,16 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     retains the power-of-two and intermediate sweep through 32K. Actual local
     shapes still depend on TP/EP, chunking, and admission, so callers should
     inspect activation records before claiming shape coverage.
+
+    SGLANG_PREFILL_WARMUP_BATCHES optionally adds multi-sequence requests after
+    the single-sequence sweep (e.g. 2x4096,3x4096). Equal total token counts do
+    not necessarily warm the same metadata kernels. This option is restricted
+    to standalone serving and does not guarantee the scheduler's batch shape.
     """
     sizes = _prefill_warmup_sizes(envs.SGLANG_PREFILL_WARMUP_SIZES.get())
+    batches = _prefill_warmup_batches(envs.SGLANG_PREFILL_WARMUP_BATCHES.get())
+    if batches and disaggregation_mode != "null":
+        raise ValueError("Multi-sequence prefill warmup requires standalone serving")
     logger.info("Prefill startup warmup token counts: %s", sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes"):
@@ -180,5 +206,17 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
         # Complete the request and surface errors after its first yield before
         # advancing to another shape or marking server startup complete.
+        async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+            pass
+
+    if batches:
+        logger.info("Prefill startup warmup batches (sequences, tokens each): %s", batches)
+    for count, tokens in tqdm.tqdm(
+        batches, desc="Warmup prefill batches", disable=not batches
+    ):
+        generate_req_input = GenerateReqInput(
+            input_ids=np.random.randint(2**16, size=(count, tokens)).tolist(),
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        )
         async for _ in tokenizer_manager.generate_request(generate_req_input, None):
             pass
