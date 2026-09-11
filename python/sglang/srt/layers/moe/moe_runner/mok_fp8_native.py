@@ -519,6 +519,8 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
 
     The serialized TP/EP forward path observes the same shapes and allocation
     history on every rank. Selection is host-only and adds no collective.
+    Optional fixed power-of-two buckets take precedence over ready-workspace
+    reuse and make geometry selection independent of arrival history.
     Padding uses invalid expert IDs, so extra rows do not add expert work,
     but communication and scratch traffic grow: bound the capacity ratio
     with a configurable limit (2 by default).
@@ -527,11 +529,29 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
     requested = geometry["num_local_tokens"]
     if (
         requested < 256
-        or not envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE.get()
         or not envs.SGLANG_OPT_MOK_WARPROLE.get()
         or envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()
         or not get_is_extend_in_batch()
     ):
+        return requested
+    if envs.SGLANG_OPT_MOK_FIXED_WORKSPACE_BUCKETS.get():
+        # A fixed ceiling covers every intermediate request, even when the
+        # old max-ratio policy has a gap between its prepared geometries.
+        # For local T<=8192 this admits only 256/512/1024/2048/4096/8192.
+        # Normal largest-first warmup creates all six with one shared arena.
+        selected = 1 << (requested - 1).bit_length()
+        if selected != requested:
+            report_key = ("fixed", _workspace_geometry_key(**geometry), selected)
+            with _WORKSPACE_GEOMETRY_LOCK:
+                if report_key not in _REPORTED_WORKSPACE_REUSE:
+                    _REPORTED_WORKSPACE_REUSE.add(report_key)
+                    logger.info(
+                        "MoK fixed workspace bucket: requested_tokens=%d capacity_tokens=%d",
+                        requested,
+                        selected,
+                    )
+        return selected
+    if not envs.SGLANG_OPT_MOK_WARPROLE_REUSE_WORKSPACE.get():
         return requested
     max_ratio = envs.SGLANG_OPT_MOK_WARPROLE_REUSE_MAX_RATIO.get()
     if max_ratio < 1:
