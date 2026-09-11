@@ -1020,6 +1020,9 @@ class Envs:
     # Optional token counts for --warmups=prefill_shapes. These forwards run
     # before the HTTP server accepts requests; unset keeps the default sweep.
     SGLANG_PREFILL_WARMUP_SIZES = EnvStr("")
+    # Run the same single-sequence sizes largest first so smaller requests can
+    # reuse prepared MoK buffers. Does not change the multi-sequence sweep.
+    SGLANG_PREFILL_WARMUP_LARGEST_FIRST = EnvBool(False)
     # Optional additional multi-sequence shapes, e.g. "2x4096,3x4096".
     # Each item is sequence count x tokens per sequence; standalone serving only.
     SGLANG_PREFILL_WARMUP_BATCHES = EnvStr("")

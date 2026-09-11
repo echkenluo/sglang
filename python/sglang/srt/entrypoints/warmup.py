@@ -181,6 +181,11 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     shapes still depend on TP/EP, chunking, and admission, so callers should
     inspect activation records before claiming shape coverage.
 
+    SGLANG_PREFILL_WARMUP_LARGEST_FIRST reverses single-sequence execution to
+    allow smaller requests to reuse larger MoK workspaces. All configured
+    sizes still run; the selected workspace capacity may differ from the
+    request size. Inputs are drawn in ascending size order before reversal.
+
     SGLANG_PREFILL_WARMUP_BATCHES optionally adds multi-sequence requests after
     the single-sequence sweep (e.g. 2x4096,3x4096). Equal total token counts do
     not necessarily warm the same metadata kernels. This option is restricted
@@ -191,11 +196,23 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     batches = _prefill_warmup_batches(envs.SGLANG_PREFILL_WARMUP_BATCHES.get())
     if batches and disaggregation_mode != "null":
         raise ValueError("Multi-sequence prefill warmup requires standalone serving")
+    prepared_inputs = None
+    if envs.SGLANG_PREFILL_WARMUP_LARGEST_FIRST.get():
+        # Keep each size's random draw in its original order. Only this opt-in
+        # path holds the single-sequence input lists together during startup.
+        prepared_inputs = {
+            size: np.random.randint(2**16, size=[size]).tolist() for size in sizes
+        }
+        sizes = list(reversed(sizes))
     logger.info("Prefill startup warmup token counts: %s", sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes"):
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=(
+                prepared_inputs.pop(size)
+                if prepared_inputs is not None
+                else np.random.randint(2**16, size=[size]).tolist()
+            ),
             sampling_params={
                 "max_new_tokens": 1,
                 "temperature": 0.0,

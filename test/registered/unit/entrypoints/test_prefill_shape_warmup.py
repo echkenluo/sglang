@@ -1,4 +1,5 @@
 import unittest
+import numpy as np
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +15,36 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestPrefillShapeWarmup(unittest.IsolatedAsyncioTestCase):
+    async def test_largest_first_keeps_inputs_and_batch_sweep(self):
+        original_rng = np.random.get_state()
+        runs = []
+        try:
+            for largest_first in (False, True):
+                np.random.seed(20260911)
+                seen = []
+
+                async def generate(req, request):
+                    batched = isinstance(req.input_ids[0], list)
+                    key = (len(req.input_ids), len(req.input_ids[0])) if batched else (1, len(req.input_ids))
+                    seen.append((key, req.input_ids, req.sampling_params.copy()))
+                    yield {}
+
+                with (
+                    envs.SGLANG_PREFILL_WARMUP_SIZES.override("16,32,64"),
+                    envs.SGLANG_PREFILL_WARMUP_BATCHES.override("2x8,3x8"),
+                    envs.SGLANG_PREFILL_WARMUP_LARGEST_FIRST.override(largest_first),
+                    mock.patch("sglang.srt.entrypoints.warmup.tqdm.tqdm", side_effect=lambda items, **kwargs: items),
+                ):
+                    await prefill_shapes("null", SimpleNamespace(generate_request=generate))
+                runs.append((seen, np.random.randint(2**16)))
+            ascending, descending = runs
+            self.assertEqual([row[0] for row in descending[0]], [(1, 64), (1, 32), (1, 16), (2, 8), (3, 8)])
+            self.assertEqual(ascending[0][:3], list(reversed(descending[0][:3])))
+            self.assertEqual(ascending[0][3:], descending[0][3:])
+            self.assertEqual(ascending[1], descending[1])
+        finally:
+            np.random.set_state(original_rng)
+
     def test_batch_shape_configuration(self):
         self.assertEqual(_prefill_warmup_batches(""), [])
         self.assertEqual(
