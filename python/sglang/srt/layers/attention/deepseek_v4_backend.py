@@ -509,6 +509,10 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self._sm89_sparse_prefill = envs.SGLANG_DSV4_SM89_SPARSE_PREFILL.get()
+        if self._sm89_sparse_prefill and not _is_sm89:
+            raise ValueError("SGLANG_DSV4_SM89_SPARSE_PREFILL requires SM89 GPUs")
+        self._sm89_sparse_prefill_seen = set()
         self._sm89_flashinfer = None
         if envs.SGLANG_DSV4_SM89_FLASHINFER.get():
             if not _is_sm89:
@@ -1720,11 +1724,11 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # SM89 uses the opt-in community BF16 kernel over the same workspace.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
-                and not _is_sm89
+                and (not _is_sm89 or self._sm89_sparse_prefill)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1813,8 +1817,6 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
@@ -1890,6 +1892,27 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
         )
         kv = workspace
+
+        if self._sm89_sparse_prefill:
+            from sglang.kernels.ops.attention.dsv4.sparse_prefill_bf16_sm89 import (
+                sparse_prefill_bf16_sm89,
+            )
+
+            o = sparse_prefill_bf16_sm89(
+                q_flat, kv, combined_indices, combined_lens, attn_sink,
+                self.softmax_scale,
+            )
+            if compress_ratio not in self._sm89_sparse_prefill_seen:
+                logger.info(
+                    "DSV4 SM89 community sparse prefill executed: ratio=%s "
+                    "queries=%s heads=%s topk=%s",
+                    compress_ratio, q_flat.shape[0], q_flat.shape[1],
+                    combined_indices.shape[-1],
+                )
+                self._sm89_sparse_prefill_seen.add(compress_ratio)
+            return o
+
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

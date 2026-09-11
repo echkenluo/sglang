@@ -1302,6 +1302,8 @@ class Envs:
 
     # GEMM / kernel fusion
     SGLANG_DSV4_SM89_FLASHINFER = EnvBool(False)
+    # Community BF16 sparse prefill; leaves decode/verify backend unchanged.
+    SGLANG_DSV4_SM89_SPARSE_PREFILL = EnvBool(False)
     SGLANG_DSV4_SM89_FLASHINFER_NATIVE_HEADS = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # Opt in to the F28-derived Ada wo_a kernel; requires FP8_WO_A_GEMM.
