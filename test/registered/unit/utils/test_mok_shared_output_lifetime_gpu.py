@@ -78,7 +78,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("baseline", type=Path);p.add_argument("fixed", type=Path)
     args = p.parse_args()
-    result = {"baseline": run(args.baseline), "fixed": run(args.fixed)}
+    result = {"torch_version": torch.__version__, "baseline": run(args.baseline), "fixed": run(args.fixed)}
     print(json.dumps(result, indent=2), flush=True)
     assert result["baseline"]["allocation_state_while_consumer_pending"] == "inactive"
-    assert result["fixed"]["allocation_state_while_consumer_pending"] == "active_awaiting_free"
+    # Snapshot exporters use both names for blocks whose recorded consumer
+    # events are still pending. Preserve the actual spelling in the receipt.
+    assert result["fixed"]["allocation_state_while_consumer_pending"] in {
+        "active_awaiting_free", "active_pending_free"
+    }
