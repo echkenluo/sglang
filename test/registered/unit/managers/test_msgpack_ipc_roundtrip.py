@@ -12,6 +12,7 @@ import dataclasses
 import unittest
 
 import msgspec
+from pydantic import TypeAdapter, ValidationError
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
@@ -139,6 +140,33 @@ NARROWED_BACKUP_KEYS = ("name", "shape", "numel", "dtype", "element_size")
 
 
 class TestMsgpackIpcRoundtrip(CustomTestCase):
+    def test_dspark_budget_reset_survives_http_and_ipc(self):
+        adapter = TypeAdapter(SetInternalStateReq)
+        for budget in (0.4, 1.0, None):
+            with self.subTest(budget=budget):
+                payload = {"server_args": {"dspark_force_budget_frac": budget}}
+                request = adapter.validate_python(payload)
+                self.assertEqual(
+                    _double_hop(request).server_args, payload["server_args"]
+                )
+                from_json = adapter.validate_json(msgspec.json.encode(payload))
+                self.assertEqual(
+                    _double_hop(from_json).server_args, payload["server_args"]
+                )
+
+    def test_internal_state_null_is_limited_to_budget_reset(self):
+        adapter = TypeAdapter(SetInternalStateReq)
+        for key in ("max_running_requests", "pp_max_micro_batch_size", "unknown"):
+            with self.subTest(key=key):
+                with self.assertRaises(ValidationError):
+                    adapter.validate_python({"server_args": {key: None}})
+        for value in ({"nested": 1}, [1, 2], "not-a-number"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    adapter.validate_python(
+                        {"server_args": {"dspark_force_budget_frac": value}}
+                    )
+
     def test_registry_is_empty(self):
         # `getattr(..., ())` is deliberate: the acceptance criterion for Task 4 is
         # that the symbol is *deleted*, so this asserts its absence rather than
