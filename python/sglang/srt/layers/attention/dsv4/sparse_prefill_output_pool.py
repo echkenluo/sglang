@@ -16,7 +16,7 @@ class SparsePrefillOutputPool:
     """
 
     def __init__(self, device: torch.device, enabled: bool = False):
-        self.device = device
+        self.device = torch.device(device)
         self.enabled = enabled
         self._pool = None
 
@@ -27,6 +27,10 @@ class SparsePrefillOutputPool:
         if torch.cuda.is_current_stream_capturing():
             return nullcontext()
         if self._pool is None:
+            # Backends use torch.device("cuda"); use_mem_pool requires an
+            # explicit ordinal. Bind lazily to this worker's selected device.
+            if self.device.index is None:
+                self.device = torch.device("cuda", torch.cuda.current_device())
             with torch.cuda.device(self.device):
                 self._pool = torch.cuda.MemPool()
         return torch.cuda.use_mem_pool(self._pool, device=self.device)
