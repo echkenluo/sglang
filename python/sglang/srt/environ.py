@@ -1183,6 +1183,11 @@ class Envs:
     # padding; decode, target-verify, TBO, PP>1, and DSpark capture remain on
     # the stock full-token path.
     SGLANG_DSV4_TP_INPUT_SCATTERED = EnvBool(False)
+    # Experimental coexistence: only short aggregate-token prefill buckets
+    # may use Breakable Graph; larger eager batches retain TP scattering.
+    # Every configured capture bucket must be below the scattered threshold.
+    # This gate does not establish Graph replay correctness or performance.
+    SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM = EnvBool(False)
     # Diagnostic/numeric-preserving variant: retain the stock TP AllReduce
     # reduction order, then keep only this rank's token rows. This adds an
     # AllGather before each full-token consumer and is not assumed faster.

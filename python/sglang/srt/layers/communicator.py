@@ -53,6 +53,9 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
+from sglang.srt.layers.dsv4_short_prefill_graph import (
+    validate_short_prefill_graph_buckets,
+)
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -261,6 +264,22 @@ class AttentionInputs:
         return self.hidden_states_
 
 
+def _allow_dsv4_scattered_with_short_prefill_graph():
+    if not envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM.get():
+        return False
+    if not _is_cuda:
+        raise ValueError("DSV4 short prefill Graph with communication requires CUDA")
+    config = get_exec().graph.cuda_graph_config
+    if config is None:
+        raise ValueError("DSV4 short prefill Graph requires a published Graph config")
+    validate_short_prefill_graph_buckets(
+        config.prefill.backend,
+        config.prefill.bs,
+        envs.SGLANG_DSV4_TP_INPUT_SCATTERED_MIN_TOKENS.get(),
+    )
+    return True
+
+
 class AttnTpContext:
     def __init__(self):
         self.allow_input_scattered = False
@@ -276,7 +295,10 @@ class AttnTpContext:
                 not is_dsa
                 or (
                     envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
-                    and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                    and (
+                        check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                        or _allow_dsv4_scattered_with_short_prefill_graph()
+                    )
                 )
             )
             and get_parallel().tp_size > 1
