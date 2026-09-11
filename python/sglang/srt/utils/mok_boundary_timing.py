@@ -15,6 +15,9 @@ from pathlib import Path
 import time
 
 DIRECTORY = os.environ.get("SGLANG_MOK_BOUNDARY_TIMING_DIR", "")
+SYNC_DEBUG = os.environ.get("SGLANG_MOK_BOUNDARY_SYNC_DEBUG", "0") == "1"
+if SYNC_DEBUG and DIRECTORY:
+    raise ValueError("MoK synchronous failure diagnostics cannot be used as boundary timing")
 MIN_TOKENS = int(os.environ.get("SGLANG_MOK_BOUNDARY_TIMING_MIN_TOKENS", "256"))
 MAX_RECORDS = int(os.environ.get("SGLANG_MOK_BOUNDARY_TIMING_MAX_RECORDS", "4096"))
 _parent = contextvars.ContextVar("mok_boundary_parent", default=None)
@@ -100,6 +103,8 @@ class Recorder:
 def boundary(label):
     """Decorate (owner, hidden_states, ...) without wrapping when disabled."""
     def decorate(function):
+        if SYNC_DEBUG:
+            return _debug_boundary(label, function)
         if not DIRECTORY:
             return function
         owner_name = next(iter(inspect.signature(function).parameters))
@@ -130,6 +135,44 @@ def boundary(label):
 
         return measured
     return decorate
+
+
+def _debug_boundary(label, function):
+    """Localize asynchronous failures; never use these calls as performance data.
+
+    Synchronizing can hide a race. A successful diagnostic run is neither a
+    correctness pass for the ordinary path nor evidence of a performance fix.
+    Graph capture is skipped and no tensor values are copied to the host.
+    """
+    owner_name = next(iter(inspect.signature(function).parameters))
+
+    @functools.wraps(function)
+    def checked(*args, **kwargs):
+        owner = args[0] if args else kwargs[owner_name]
+        hidden = args[1] if len(args) > 1 else kwargs["hidden_states"]
+        if hidden.shape[0] < MIN_TOKENS:
+            return function(*args, **kwargs)
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return function(*args, **kwargs)
+        row = {"label": label, "layer_id": getattr(owner, "layer_id", None),
+               "rows": hidden.shape[0], "device": hidden.device.index,
+               "pid": os.getpid(), "performance_measurement": False}
+
+        def mark(phase):
+            print("MOK_SYNC_DEBUG|" + json.dumps({**row, "phase": phase}), flush=True)
+
+        mark("before_sync")
+        torch.cuda.synchronize(hidden.device)
+        mark("call_begin")
+        result = function(*args, **kwargs)
+        mark("after_sync_begin")
+        torch.cuda.synchronize(hidden.device)
+        mark("call_complete")
+        return result
+
+    return checked
 
 
 def flush_if_enabled():
