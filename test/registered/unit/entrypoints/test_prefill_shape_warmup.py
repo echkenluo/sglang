@@ -35,7 +35,9 @@ class TestPrefillShapeWarmup(unittest.IsolatedAsyncioTestCase):
             )
             shape = (len(rows), len(rows[0]))
             self.assertTrue(all(len(row) == shape[1] for row in rows))
-            self.assertEqual(req.sampling_params["max_new_tokens"], 1)
+            self.assertEqual(req.sampling_params["max_new_tokens"], 1 if shape[0] == 1 else 2)
+            if shape[0] > 1:
+                self.assertTrue(req.sampling_params["ignore_eos"])
             steps.append((shape, "start"))
             yield {}
             steps.append((shape, "complete"))

@@ -185,6 +185,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     the single-sequence sweep (e.g. 2x4096,3x4096). Equal total token counts do
     not necessarily warm the same metadata kernels. This option is restricted
     to standalone serving and does not guarantee the scheduler's batch shape.
+    Each batch also takes one decode step to warm its KV allocation kernels.
     """
     sizes = _prefill_warmup_sizes(envs.SGLANG_PREFILL_WARMUP_SIZES.get())
     batches = _prefill_warmup_batches(envs.SGLANG_PREFILL_WARMUP_BATCHES.get())
@@ -216,7 +217,13 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     ):
         generate_req_input = GenerateReqInput(
             input_ids=np.random.randint(2**16, size=(count, tokens)).tolist(),
-            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            # One token is produced by prefill. A second token exercises actual
+            # decode allocation, which graph capture alone need not execute.
+            sampling_params={
+                "max_new_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
         )
         async for _ in tokenizer_manager.generate_request(generate_req_input, None):
             pass
