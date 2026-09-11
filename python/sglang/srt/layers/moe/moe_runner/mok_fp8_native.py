@@ -111,6 +111,21 @@ _WORKSPACE_GEOMETRIES: set[tuple] = set()
 # eligible for reuse; an admitted shape alone is not an allocation receipt.
 _READY_WORKSPACE_GEOMETRIES: set[tuple] = set()
 _REPORTED_WORKSPACE_REUSE: set[tuple] = set()
+_WORKSPACE_MEMORY_POOLS: dict = {}
+
+
+def _workspace_pool_kwargs(device: torch.device) -> dict:
+    if not envs.SGLANG_OPT_MOK_SEPARATE_WORKSPACE_POOL.get():
+        return {}
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with _WORKSPACE_GEOMETRY_LOCK:
+        if index not in _WORKSPACE_MEMORY_POOLS:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("MoK workspace memory pool must be prepared before capture")
+            with torch.cuda.device(index):
+                _WORKSPACE_MEMORY_POOLS[index] = torch.cuda.MemPool()
+            logger.info("MoK persistent workspace memory pool created: device=%d", index)
+        return {"memory_pool": _WORKSPACE_MEMORY_POOLS[index]}
 
 
 def native_shape_contract_error(
@@ -510,6 +525,7 @@ def _workspace_geometry_key(
         num_local_experts,
         schedule_capacity_factor,
         schedule_capacity_rows,
+        envs.SGLANG_OPT_MOK_SEPARATE_WORKSPACE_POOL.get(),
     )
 
 
@@ -559,7 +575,7 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
                     ep_size=ep_size,
                     expert_padding=_ROUTE_EXPERT_PADDING,
                 )
-            if ready[6:] == (factor, rows):
+            if ready[6:] == (factor, rows, key[8]):
                 candidates.append(tokens)
         if candidates:
             selected = min(candidates)
@@ -712,6 +728,7 @@ def _run_native_core(
             get_tp_group().device_group,
             device=padded_hidden.device,
             capacity=workspace.schedule_capacity,
+            **_workspace_pool_kwargs(padded_hidden.device),
         )
     # Both paths own the workspace continuously from schedule through combine.
     # Release happens only after the caller-owned output copy.
@@ -1088,6 +1105,7 @@ def maybe_run_mok_fp8_native(
         hidden_size=hidden_size,
         topk=topk,
         num_local_experts=layer.num_local_experts,
+        **_workspace_pool_kwargs(hidden_states.device),
     )
     with _WORKSPACE_GEOMETRY_LOCK:
         _READY_WORKSPACE_GEOMETRIES.add(
