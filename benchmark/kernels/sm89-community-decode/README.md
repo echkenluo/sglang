@@ -54,7 +54,29 @@ configuration stay unchanged. A new GPU regression compares the same active
 keys with small and large padded capacities, including zero lengths and tile
 boundaries, and requires identical output and LSE.
 
-The active-prefix change has not yet been GPU-validated or timed. It remains
-an independent opt-in candidate; the currently running remote comparison
-uses the original frozen kernel. CPU dispatch checks and static validation
-are separate from these pending GPU checks.
+The active-prefix change has now executed all four GPU test methods and
+30 subtests successfully. The old result recorder's hardcoded 3/29 count
+rejected that window after the tests; this bookkeeping failure was retained
+and independently audited. The subsequent window reused the successful test
+execution and reproduced all 32 frozen real-input outputs and LSE exactly,
+for both the community implementation and FlashInfer.
+
+In the same four hot-cache Graph operator cases (microseconds per call):
+
+| Path | Original community | Active-prefix community | FlashInfer control |
+|---|---:|---:|---:|
+| Draft M5, SWA | 63.55 | 30.66 | 15.10 |
+| Target M6, SWA | 47.04 | 30.72 | 15.04 |
+| Target M6, C4 | 206.11 | 66.18 | 15.36 |
+| Target M6, C128 | 618.88 | 66.43 | 23.62 |
+
+Each community variant used its own three-round FlashInfer A/B/A control,
+30 samples per arm and 16 identical calls per Graph. All four cells passed
+the 5% within-window drift gate. The original/active-prefix contrast spans
+two windows; inputs, runtime and FlashInfer module hashes were unchanged.
+These are single-GPU hot-cache operator measurements, not model throughput.
+
+The loop improvement preserves the sampled outputs but remains 2.0-4.3x
+slower than FlashInfer here. Keep this branch as a disabled reference
+candidate; it is not adopted into the service performance combination.
+Full-model quality and a service speedup are not established.
