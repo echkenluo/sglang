@@ -519,7 +519,8 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
     The serialized TP/EP forward path observes the same shapes and allocation
     history on every rank. Selection is host-only and adds no collective.
     Padding uses invalid expert IDs, so extra rows do not add expert work,
-    but communication and scratch traffic grow: cap the capacity ratio at 2.
+    but communication and scratch traffic grow: bound the capacity ratio
+    with a configurable limit (2 by default).
     Graph capture retains its existing exact-shape contract.
     """
     requested = geometry["num_local_tokens"]
@@ -531,6 +532,9 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
         or not get_is_extend_in_batch()
     ):
         return requested
+    max_ratio = envs.SGLANG_OPT_MOK_WARPROLE_REUSE_MAX_RATIO.get()
+    if max_ratio < 1:
+        raise ValueError("MoK workspace reuse max ratio must be at least 1")
     key = _workspace_geometry_key(**geometry)
     selected = requested
     with _WORKSPACE_GEOMETRY_LOCK:
@@ -542,7 +546,7 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
             if (
                 ready[:2] != key[:2]
                 or ready[3:6] != key[3:6]
-                or not requested <= tokens <= 2 * requested
+                or not requested <= tokens <= max_ratio * requested
             ):
                 continue
             factor = _conservative_route_capacity_factor(

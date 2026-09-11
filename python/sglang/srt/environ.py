@@ -1242,6 +1242,7 @@ class Envs:
     # Direct symmetric allocations cannot reclaim PyTorch's idle cache on OOM.
     SGLANG_OPT_MOK_TRIM_CACHE_ON_WORKSPACE_CREATE = EnvBool(False)
     SGLANG_OPT_MOK_EXPLICIT_ROUTE_CAPACITY = EnvBool(False)
+    SGLANG_OPT_MOK_WARPROLE_REUSE_MAX_RATIO = EnvInt(2)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
     # Replace the split dispatch/W13/activation/W2/combine sequence with the
     # MoK warp-role megakernel, which runs all of it in one launch. Requires
