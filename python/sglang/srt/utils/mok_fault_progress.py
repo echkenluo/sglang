@@ -26,7 +26,7 @@ class Recorder:
         self.sequence = 0
         self.pending = []
         self.failed = False
-        self.fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         self.write("header", schema="mok-fault-progress-v1", rank=rank,
                    device=device, pid=os.getpid(),
                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
