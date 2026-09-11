@@ -1638,10 +1638,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             if envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM.get():
                 # CPU metadata only; never synchronize a GPU tensor for this
-                # receipt. Emit once per prefix class after backend replay.
+                # receipt. Emit once per bucket/prefix pair after backend replay
+                # so enabling larger capture sizes has its own execution proof.
                 has_prefix = any(forward_batch.extend_prefix_lens_cpu or [])
+                replay_key = (static_num_tokens, has_prefix)
                 logged = getattr(self, "_dsv4_short_graph_logged", set())
-                if has_prefix not in logged:
+                if replay_key not in logged:
                     logger.info(
                         "DSV4 short prefill graph replayed: tokens=%s bucket=%s "
                         "prefix=%s draft=%s",
@@ -1650,7 +1652,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         int(has_prefix),
                         int(self.model_runner.is_draft_worker),
                     )
-                    logged.add(has_prefix)
+                    logged.add(replay_key)
                     self._dsv4_short_graph_logged = logged
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
