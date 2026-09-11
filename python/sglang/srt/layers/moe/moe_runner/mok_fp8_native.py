@@ -1065,6 +1065,7 @@ def maybe_run_mok_fp8_native(
     # route-buffer chunk.  Retain M256 token padding for larger batches until
     # their route-chunk/capacity tradeoff is measured independently.
     padded_tokens, route_chunk_bytes = _route_padding_config(num_tokens, topk)
+    actual_padded_tokens = padded_tokens
 
     # SGLang's TP/EP model contract gives every rank the same padded shape,
     # and the MoK workspace validates that invariant when a shape is first
@@ -1177,6 +1178,22 @@ def maybe_run_mok_fp8_native(
         )
     _register_trap_watchdog(workspace, mok_functional)
 
+    if (
+        envs.SGLANG_OPT_MOK_WORKSPACE_TOKEN_VIEWS.get()
+        and envs.SGLANG_OPT_MOK_WARPROLE.get()
+        and envs.SGLANG_OPT_MOK_FIXED_WORKSPACE_BUCKETS.get()
+        and not envs.SGLANG_OPT_MOK_FP8_NATIVE_PREFILL_GRAPH.get()
+        and get_is_extend_in_batch()
+        and actual_padded_tokens >= 256
+        and actual_padded_tokens < padded_tokens
+    ):
+        from mok.warprole import get_warprole_token_view
+
+        workspace = get_warprole_token_view(
+            workspace, group, num_local_tokens=actual_padded_tokens
+        )
+        padded_tokens = actual_padded_tokens
+
     _report_active(layer, num_tokens, padded_tokens, topk, workspace, strict_contract)
     _note_path_hit(
         "mok",
@@ -1283,11 +1300,12 @@ def _report_warprole_active(layer, variant: str, capacity: int) -> None:
         _REPORTED_WARPROLE = True
         logger.info(
             "MoK warp-role megakernel active: layer=%s variant=%s capacity=%d "
-            "direct_input_quant=%s",
+            "direct_input_quant=%s token_views=%s",
             layer.layer_id,
             variant,
             capacity,
             envs.SGLANG_OPT_MOK_DIRECT_INPUT_QUANT.get(),
+            envs.SGLANG_OPT_MOK_WORKSPACE_TOKEN_VIEWS.get(),
         )
 
 

@@ -1246,6 +1246,8 @@ class Envs:
     SGLANG_OPT_MOK_DIRECT_INPUT_QUANT = EnvBool(False)
     # Deterministic eager-prefill geometries instead of allocation-history gaps.
     SGLANG_OPT_MOK_FIXED_WORKSPACE_BUCKETS = EnvBool(False)
+    # Keep bucket storage, but run only actual M256 tokens inside that storage.
+    SGLANG_OPT_MOK_WORKSPACE_TOKEN_VIEWS = EnvBool(False)
     SGLANG_OPT_MOK_EXPLICIT_ROUTE_CAPACITY = EnvBool(False)
     SGLANG_OPT_MOK_WARPROLE_REUSE_MAX_RATIO = EnvInt(2)
     SGLANG_MOE_PATH_HIT_COUNTERS = EnvBool(False)
