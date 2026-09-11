@@ -160,6 +160,35 @@ class TestProgress(unittest.TestCase):
             self.mod.poll_if_enabled()
         self.assertEqual(self.cuda.events[0].queries, queries)
 
+    def test_selected_sync_is_only_for_named_layer(self):
+        from unittest.mock import Mock
+        stream = SimpleNamespace(cuda_stream=17, synchronize=Mock())
+        self.cuda.current_stream = lambda device: stream
+        self.mod.SYNC_SCOPE = 'attention:3'
+        fn = self.arm(lambda owner, x: 'ok')
+        fn(SimpleNamespace(layer_id=2), Hidden())
+        stream.synchronize.assert_not_called()
+        fn(SimpleNamespace(layer_id=3), Hidden())
+        stream.synchronize.assert_called_once()
+        stream.synchronize.side_effect = RuntimeError('selected GPU failure')
+        with self.assertRaisesRegex(RuntimeError, 'selected GPU failure'):
+            fn(SimpleNamespace(layer_id=3), Hidden())
+        self.assertEqual(self.rows()[-1]['kind'], 'selected_sync_error')
+        self.assertTrue(self.mod._recorder.failed)
+
+    def test_replay_rejects_modified_tokens(self):
+        self.mod.DIRECTORY = self.tmp.name
+        self.mod.record_warmup_input(3, [2, 4, 6])
+        original = next(Path(self.tmp.name).glob('warmup-input-*.json'))
+        target = Path(self.tmp.name) / 'warmup-input-3.json'
+        target.write_bytes(original.read_bytes())
+        self.mod.REPLAY_DIRECTORY = self.tmp.name
+        self.assertEqual(self.mod.replay_warmup_input(3, [1, 1, 1]), [2, 4, 6])
+        row = json.loads(target.read_text());row['input_ids'][0] = 3
+        target.write_text(json.dumps(row))
+        with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+            self.mod.replay_warmup_input(3, [1, 1, 1])
+
 
 if __name__ == '__main__':
     unittest.main()

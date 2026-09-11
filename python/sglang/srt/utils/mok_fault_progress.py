@@ -14,6 +14,8 @@ from pathlib import Path
 import time
 
 DIRECTORY = os.environ.get("SGLANG_MOK_FAULT_PROGRESS_DIR", "")
+SYNC_SCOPE = os.environ.get("SGLANG_MOK_FAULT_SYNC_SCOPE", "")
+REPLAY_DIRECTORY = os.environ.get("SGLANG_MOK_FAULT_REPLAY_DIR", "")
 MAX_EVENTS = 1024
 _recorder = None
 
@@ -30,7 +32,7 @@ class Recorder:
         self.write("header", schema="mok-fault-progress-v1", rank=rank,
                    device=device, pid=os.getpid(),
                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                   event_queries_synchronize=False,
+                   event_queries_synchronize=False, selected_sync_scope=SYNC_SCOPE,
                    checkpoints_do_not_identify_faulting_kernel=True)
 
     def write(self, kind, **values):
@@ -127,6 +129,16 @@ def boundary(label, *, minimum_rows, tensor_argument="hidden_states"):
                                 exception_type=type(exc).__name__, error=str(exc))
                 raise
             _recorder.mark("after", scope, stream)
+            if SYNC_SCOPE == f"{label}:{scope['layer_id']}":
+                _recorder.write("selected_sync_begin", **scope)
+                try:
+                    stream.synchronize()
+                except BaseException as exc:
+                    _recorder.failed = True
+                    _recorder.write("selected_sync_error", **scope,
+                                    exception_type=type(exc).__name__, error=str(exc))
+                    raise
+                _recorder.write("selected_sync_complete", **scope)
             _recorder.write("host_return", **scope)
             _recorder.poll(scope)
             return result
@@ -155,3 +167,22 @@ def record_warmup_input(size, input_ids):
     with (directory / f"warmup-input-{size}-pid{os.getpid()}.json").open("x") as stream:
         json.dump(payload, stream, allow_nan=False)
         stream.write("\n")
+
+
+def replay_warmup_input(size, generated_ids):
+    """Replay a saved CPU request; leave the caller's RNG draw order unchanged."""
+    if not REPLAY_DIRECTORY:
+        return generated_ids
+    path = Path(REPLAY_DIRECTORY) / f"warmup-input-{size}.json"
+    row = json.loads(path.read_text())
+    ids = row["input_ids"]
+    if row["size"] != size or len(ids) != size:
+        raise ValueError("warmup replay length mismatch")
+    if not all(type(value) is int and 0 <= value < 2**16 for value in ids):
+        raise ValueError("warmup replay token outside original range")
+    encoded = json.dumps(ids, separators=(",", ":")).encode()
+    if hashlib.sha256(encoded).hexdigest() != row["input_sha256"]:
+        raise ValueError("warmup replay hash mismatch")
+    if row["sampling_params"] != {"max_new_tokens": 1, "temperature": 0.0}:
+        raise ValueError("warmup replay sampling mismatch")
+    return ids

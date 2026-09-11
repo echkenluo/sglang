@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Optional
 
+from sglang.srt.utils.mok_fault_progress import boundary as mok_fault_boundary
+
 import torch
 import torch.distributed as dist
 
@@ -605,6 +607,7 @@ _PREFILL_GRAPH_DISABLED = False
 
 
 @mok_path_scope("core")
+@mok_fault_boundary("native_core", minimum_rows=6144, tensor_argument="padded_hidden")
 def _run_native_core(
     layer,
     workspace,

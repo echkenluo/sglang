@@ -985,6 +985,7 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    @mok_fault_boundary("attention_prepare", minimum_rows=24576, tensor_argument="x")
     def _forward_prepare(
         self,
         x: torch.Tensor,
