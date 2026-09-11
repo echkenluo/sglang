@@ -31,8 +31,38 @@ R33 GPU validation completed on GPU18 L20 with source `85774114b6`:
   E8 M513 measured 4.480 versus native 4.672 us. These are packing costs,
   not complete MoE or service throughput. Long-prefill cost remains material.
 
-Keep the flag off. The E256 checks cover routing, not the full checkpoint's
+Keep the flag off. The R33 E256 checks cover routing, not the full checkpoint's
 MoE computation. No full-model quality, batch invariance, service gain or
 production readiness is established. Preserve original numeric failures and
 all community optimization candidates. GPU18 original service was restored
 with health and fixed-token checks passing.
+
+
+R35/R36 retained the original numeric failures and corrected a diagnostic
+FP64-to-BF16 double-rounding reference. Exact arithmetic traced all six remaining
+final-output outliers: five propagate from three GEMM1 rounding differences and
+one originates in GEMM2. Two intermediate differences agree with correctly
+rounded FP32 followed by BF16; two retain accumulation error. The stable-packing
+implementation does not change GEMM arithmetic.
+
+R37 completed a checkpoint diagnostic on GPU18, with the same tested source
+`85774114b6` in all arms. Stable/native/stable changed only the alignment flag;
+all arms used native FP4, static DSpark, communication, community long prefill,
+the corrected FlashInfer cache, and five short-prefill Graph buckets.
+
+- Stable A1: all 12 triplicate groups passed within-group, cold/cached and
+  before/after-mixed token equality.
+- Native B: 11 of 12 triplicate groups diverged; 4 of 6 before/after comparisons
+  and all 6 cold/cached comparisons differed.
+- Stable A2: 11 of 12 triplicate groups passed. The third cached long-prefix
+  request after mixed reuse differed at zero-based token 106. Its selected-token
+  logprobs already differed at token 0; the cause remains unproven.
+- Stable A1/A2 matched 35 of 36 corresponding requests. All arms confirmed
+  4608 cached tokens in repeated long-prefix requests, native E2M1 MoE, M5/M6,
+  and the intended alignment path on all eight target/draft Graph ranks.
+
+This is substantial repeatability improvement, not a complete fix. The model
+repeatability gate and original numerical gate remain failed. Hooks collected
+metadata, so this run provides no throughput result. Keep default off pending
+the cached-reuse investigation, quality checks and a separate performance
+comparison. The original service was restored with identical fixed outputs.
