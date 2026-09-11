@@ -1017,6 +1017,8 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # Runtime budget changes may only use capacity reserved at startup.
+        self._startup_max_prefill_tokens = self.max_prefill_tokens
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -4193,6 +4195,8 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret["effective_max_prefill_tokens"] = self.max_prefill_tokens
+        ret["startup_max_prefill_tokens"] = self._startup_max_prefill_tokens
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -4227,6 +4231,22 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
+    def _prefill_budget_update_error(self, value):
+        if type(value) is not int or not 0 < value <= self._startup_max_prefill_tokens:
+            return "prefill budget must be an integer within the startup budget"
+        if (
+            self.enable_overlap
+            or self.ps.pp_size != 1
+            or self.ps.dp_size != 1
+            or self.ps.attn_cp_size != 1
+            or not self.spec_algorithm.is_none()
+            or self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            return "prefill budget updates require standalone non-overlap DP1/PP1/CP1 serving without speculation"
+        if not self.is_fully_idle():
+            return "prefill budget can only change after all requests have drained"
+        return None
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
         args_allow_update = set(
@@ -4236,6 +4256,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "max_prefill_tokens",
             ]
         )
 
@@ -4243,6 +4264,12 @@ class Scheduler(
         for k, v in server_args_dict.items():
             if k not in args_allow_update:
                 logging.warning(f"Updating {k} is not supported.")
+                if_success = False
+                break
+            elif k == "max_prefill_tokens" and (
+                error := self._prefill_budget_update_error(v)
+            ):
+                logging.warning(f"Updating max_prefill_tokens is rejected: {error}.")
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
@@ -4278,6 +4305,15 @@ class Scheduler(
                     if_success = False
                     break
 
+        if "max_prefill_tokens" in server_args_dict:
+            # One rank may still have grammar/staging work while peers are idle.
+            # Reject on every TP rank before changing either config or scheduler.
+            ready = torch.tensor([int(if_success)], dtype=torch.int32, device="cpu")
+            torch.distributed.all_reduce(
+                ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group.cpu_group
+            )
+            if_success = bool(ready.item())
+
         if if_success:
             if (
                 not self.spec_algorithm.is_none()
@@ -4303,6 +4339,9 @@ class Scheduler(
                 self.draft_worker.clear_info_records()
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
+                if "max_prefill_tokens" in remaining:
+                    # PrefillAdder reads this cached value, not the config view.
+                    self.max_prefill_tokens = remaining["max_prefill_tokens"]
             logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
