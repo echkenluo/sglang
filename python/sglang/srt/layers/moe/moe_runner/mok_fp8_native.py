@@ -546,6 +546,32 @@ def _select_workspace_tokens(*, ep_size: int, **geometry) -> int:
     return selected
 
 
+def _trim_cache_before_workspace(device: torch.device) -> None:
+    """Release idle blocks before direct symmetric-memory allocation.
+
+    Drain all ranks before releasing memory, then hold them on a CPU barrier
+    until every release finishes. A GPU barrier here would let early ranks
+    spin in a collective while peers are still changing memory mappings.
+    This is a cold geometry path; cached workspaces never call it.
+    """
+    torch.cuda.synchronize(device)
+    cpu_group = get_tp_group().cpu_group
+    dist.barrier(group=cpu_group)
+    reserved_before = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+    reserved_after = torch.cuda.memory_reserved(device)
+    dist.barrier(group=cpu_group)
+    logger.info(
+        "MoK cache trimmed before new workspace: reserved_before=%d "
+        "reserved_after=%d allocated=%d",
+        reserved_before,
+        reserved_after,
+        allocated,
+    )
+
+
 def _admit_workspace_geometry(**geometry) -> bool:
     """Admit a bounded set of extension workspace geometries.
 
@@ -563,14 +589,15 @@ def _admit_workspace_geometry(**geometry) -> bool:
     cap explicitly restores the extension's unbounded behavior.
     """
     cap = envs.SGLANG_OPT_MOK_WORKSPACE_CACHE_CAP.get()
-    if cap <= 0:
+    trim = envs.SGLANG_OPT_MOK_TRIM_CACHE_ON_WORKSPACE_CREATE.get()
+    if cap <= 0 and not trim:
         return True
 
     key = _workspace_geometry_key(**geometry)
     with _WORKSPACE_GEOMETRY_LOCK:
         if key in _WORKSPACE_GEOMETRIES:
             return True
-        if len(_WORKSPACE_GEOMETRIES) >= cap:
+        if cap > 0 and len(_WORKSPACE_GEOMETRIES) >= cap:
             return False
         _WORKSPACE_GEOMETRIES.add(key)
         logger.info(
@@ -581,7 +608,9 @@ def _admit_workspace_geometry(**geometry) -> bool:
             geometry["num_local_tokens"],
             geometry["schedule_capacity_factor"],
         )
-        return True
+    if trim:
+        _trim_cache_before_workspace(geometry["device"])
+    return True
 
 
 class _PrefillGraphEntry:
