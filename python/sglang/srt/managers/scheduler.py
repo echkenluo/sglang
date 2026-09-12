@@ -5016,4 +5016,11 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                # The MoK daemon reads tensors through PyTorch. Join it while
+                # Python and CUDA are still live, before resource destruction.
+                mok_native = sys.modules.get(
+                    "sglang.srt.layers.moe.moe_runner.mok_fp8_native"
+                )
+                if mok_native is not None:
+                    mok_native.shutdown_trap_watchdog()
                 scheduler.release_host_resources()
