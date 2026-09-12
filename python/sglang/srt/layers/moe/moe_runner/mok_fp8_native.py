@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 
 _HIT_COUNTS: dict = {}
+# Diagnostic only: use the warp-role GEMM arithmetic in the unfused sequence.
+# Keep dispatch, activation/quantization and combine unchanged. Never enabled
+# by the serving optimization switches or used as a replacement quality gate.
+_DIAG_SPLIT_FMA = os.getenv("SGLANG_MOK_DIAG_SPLIT_FMA_GEMM", "0") == "1"
+_DIAG_SPLIT_FMA_LAYERS: set[int] = set()
 
 
 def _note_path_hit(path: str, *, mode: str, num_tokens: Optional[int]):
@@ -770,6 +775,8 @@ def _run_native_core(
 
     hidden_size = padded_hidden.shape[1]
     use_warprole = envs.SGLANG_OPT_MOK_WARPROLE.get()
+    if _DIAG_SPLIT_FMA and use_warprole:
+        raise ValueError("split FMA diagnostic requires warp-role disabled")
     direct_quant = use_warprole and envs.SGLANG_OPT_MOK_DIRECT_INPUT_QUANT.get()
     if not direct_quant:
         input_fp8, input_scale = sglang_per_token_group_quant_fp8(
@@ -873,7 +880,12 @@ def _run_native_core(
         dtype=torch.bfloat16,
         device=padded_hidden.device,
     )
-    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+    grouped_gemm = mok_functional.grouped_gemm_fp8_block_dynamic_out
+    if _DIAG_SPLIT_FMA:
+        from mok import _C
+
+        grouped_gemm = _C.fp8_block_warprole_gemm_c2s4_out
+    grouped_gemm(
         routed_x,
         layer.w13_weight,
         routed_x_scale,
@@ -910,7 +922,7 @@ def _run_native_core(
         dtype=torch.bfloat16,
         device=padded_hidden.device,
     )
-    mok_functional.grouped_gemm_fp8_block_dynamic_out(
+    grouped_gemm(
         down_input,
         layer.w2_weight,
         down_input_scale,
@@ -919,6 +931,12 @@ def _run_native_core(
         schedule.num_tokens,
         routed_y,
     )
+    if _DIAG_SPLIT_FMA and layer.layer_id not in _DIAG_SPLIT_FMA_LAYERS:
+        _DIAG_SPLIT_FMA_LAYERS.add(layer.layer_id)
+        logger.info(
+            "MOK_SPLIT_FMA_DIAGNOSTIC layer=%s W13_W2_enqueued=1 backend=c2s4",
+            layer.layer_id,
+        )
     # Combine path: the result lives in workspace.output, so the lease is
     # NOT released here -- the outer boundary releases it after the caller's
     # materializing copy (see _finish_native_output).
