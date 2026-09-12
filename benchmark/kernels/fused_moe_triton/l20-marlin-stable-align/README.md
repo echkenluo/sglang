@@ -2,6 +2,35 @@
 
 Branch: `codex/dsv4-sm89-marlin-stable-align-v0517`, based on `b26362f636`.
 
+Latest status (R40): native FP4 plus stable packing is enabled in the L20
+performance-comparison combination under the R39 F28-equivalent admission
+policy. Default remains off. Historical numeric failures below remain valid;
+the benchmark admission is not full-model quality or production approval.
+
+R39 compared native FP4, tuned FP8 experts and F28 with communication. R40
+then completed FP4 A1 / F28+communication / FP4 A2 across 20 fixed-length
+workloads, with 300 formal batches and 1740 formal requests. Eight cells passed
+the existing four-metric 5% anchor-drift gate; twelve were drift-invalid.
+Valid FP4-versus-F28 wall throughput changes include +22.68% for balanced c1,
++31.61%/+30.99% for prefill-heavy c4/c8, +2.26% for decode-heavy c1,
+and +16.01%/+3.44% for short decode c1/c16. Pure 4K/32K TTFT decreased
+13.51%/23.03%. Short decode c1 TTFT still increased 17.51% (about 6 ms).
+This does not establish stable parity across all workloads or repeatability
+of F28 across starts. Both engines used DSpark; there is no new no-DSpark arm.
+
+All three arms passed five short and five long known-answer probes and
+nonempty fixed-length boundary checks. FP4's fixed 64-token outputs matched
+within and across starts; F28's diverged. This limited admission does not
+override earlier element-wise failures. The original service was restored.
+Measured source is cdae64f126, implementation 85774114b6; this update changes
+documentation only. Preserve all community candidates and negative results.
+
+Evidence is in AILearning's
+`research/inference-research/optimization/sglang-e2e-optimization-20260611-13/`,
+report `02-experiment-reports/l20-sglang-community-sm89-integration-20260911.md`
+at `r40-matrix-results`, with the `fp4-matrix-r40-*` assets and raw archive.
+The following sections retain the original per-round conclusions.
+
 The paired R32 synthetic experiment found that E8/M513 native token order and
 FP4 output changed on every repeat in both SGLang and F28. Freezing either of
 two valid layouts removed repeat differences. This candidate recomputes stable
