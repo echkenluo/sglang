@@ -1789,6 +1789,24 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            total_swa = None
+            # The scheduler already owns these lengths on the CPU. Reuse them
+            # for allocation sizing instead of waiting on the GPU cumsum.
+            # Keep the device-derived fallback for padded/missing CPU metadata.
+            num_reqs = forward_batch.seq_lens.numel()
+            if (
+                extend_lens_cpu is not None
+                and seq_lens_cpu.device.type == "cpu"
+                and seq_lens_cpu.numel() == num_reqs
+                and len(extend_lens_cpu) == num_reqs
+            ):
+                total_swa = sum(
+                    min(seq_len, extend_len + SWA_WINDOW - 1)
+                    for seq_len, extend_len in zip(
+                        seq_lens_cpu.tolist(), extend_lens_cpu
+                    )
+                )
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1801,6 +1819,7 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
+                total_swa=total_swa,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
