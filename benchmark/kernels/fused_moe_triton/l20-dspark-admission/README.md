@@ -28,7 +28,34 @@ native FP4, stable packing, communication and static DSpark stack. Cases:
 uses three warmup and five formal batches with the frozen client contract.
 The four-metric 5% anchor-drift gate and R39/R40 admission policy remain.
 
-Status: candidate under measurement; no performance adoption yet.
+R42 completed: 60 formal batches / 735 requests, plus 36 warmup batches /
+441 requests. Three of four cells passed the existing four-metric 5%
+anchor-drift gate. Relative to pooled automatic-delay anchors:
+
+| Workload | Wall throughput | Request decode throughput | TTFT p95 | Status |
+|---|---:|---:|---:|---|
+| D-c1 | +0.12% | +0.05% | 44.5 -> 43.2 ms | Valid, essentially unchanged |
+| D-c16 | +0.01% | -0.94% | 178.9 -> 226.5 ms | Drift-invalid |
+| M-balanced-c16 | +2.50% | -3.36% | 9.75 -> 8.24 s | Valid |
+| M-decode-c16 | +10.56% | +4.52% | 12.05 -> 2.06 s | Valid |
+
+Keep this opt-in preset for the tested high-concurrency balanced and
+decode-heavy combination, retaining sparse decode graph buckets. It is
+not a universal throughput improvement: the balanced request-normalized
+decode metric decreased, and the short c16 cell remains drift-invalid.
+The global scheduler default is unchanged.
+
+The original service was restored with matching fixed-token output at
+2026-09-13 10:23:55 UTC. All three arms passed five short and five long
+known answers, eight boundary requests, and matching fixed 64-token
+outputs. Independent audit matched all 96 raw batch files to summaries.
+Logged decode samples with 14/15 running plus queued requests were
+16 / 0 / 20 for baseline / candidate / baseline (warmup and formal combined).
+Among formal heavy-decode requests, TTFT exceeded five seconds in 5/80,
+0/80 and 5/80 requests; this descriptive threshold is not an adoption gate.
+
+Archive SHA256:
+`0527db1180908ad5bb6e1e7bf1ce7565789e387d8b4b20fc9af0c2879504c7e6`.
 Measured engine source is still `cdae64f12610587f8e20d68a6fd11a2ff97235ef`.
 
 Evidence and drivers are in AILearning under
