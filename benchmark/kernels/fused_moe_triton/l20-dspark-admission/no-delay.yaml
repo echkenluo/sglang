@@ -1,0 +1,3 @@
+# Opt-in R42 candidate for L20 TP8 static DSpark, max-running-requests=16.
+# Values <= 1 disable the free-slot admission delay.
+min-free-slots-delay: 1
