@@ -1,0 +1,2 @@
+# Frozen R40 decode graph buckets, used as both R41 anchors.
+cuda-graph-bs-decode: [1, 2, 4, 8, 16]
