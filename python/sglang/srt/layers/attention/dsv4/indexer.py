@@ -721,6 +721,14 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.dsv4.f28_mqa import (
                 sglang_paged_mqa_logits as fn,
             )
+        elif envs.SGLANG_DSV4_SM89_COMMUNITY_INDEXER.get():
+            from sglang.srt.utils.common import is_sm89_supported
+
+            if not is_sm89_supported():
+                raise RuntimeError("Community paged indexer requires SM89")
+            from sglang.srt.layers.attention.dsv4.community_paged_mqa import (
+                fp8_paged_mqa_logits_triton_sm89 as fn,
+            )
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,

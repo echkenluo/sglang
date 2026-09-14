@@ -1236,6 +1236,8 @@ class Envs:
     # Does not establish batch invariance, numeric admission, or service gains.
     SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN = EnvBool(False)
     SGLANG_DSV4_SM89_F28_INDEXER = EnvBool(False)
+    # Opt-in community direct-page logits; remains independent of FP4 experts.
+    SGLANG_DSV4_SM89_COMMUNITY_INDEXER = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
