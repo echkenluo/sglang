@@ -13,6 +13,48 @@ import triton.language as tl
 
 
 @triton.jit
+def _histogram_counts(
+    IDS,
+    COUNTS,
+    N: tl.constexpr,
+    CHUNKS: tl.constexpr,
+    TILE: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    BINS: tl.constexpr,
+):
+    chunk = tl.program_id(0)
+    rows = chunk * TILE + tl.arange(0, TILE)
+    ids = tl.load(IDS + rows, rows < N, other=0).to(tl.int32)
+    counts = tl.histogram(ids, BINS, mask=rows < N)
+    experts = tl.arange(0, BINS)
+    tl.store(COUNTS + experts * CHUNKS + chunk, counts, experts < EXPERTS)
+
+
+@triton.jit
+def _single_chunk_histogram_prefix(
+    IDS,
+    TOTALS,
+    STARTS,
+    POST,
+    N: tl.constexpr,
+    TILE: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    BINS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.arange(0, TILE)
+    ids = tl.load(IDS + rows, rows < N, other=0).to(tl.int32)
+    counts = tl.histogram(ids, BINS, mask=rows < N)
+    experts = tl.arange(0, BINS)
+    counts = tl.where(experts < EXPERTS, counts, 0)
+    padded = tl.cdiv(counts, BLOCK) * BLOCK
+    prefix = tl.cumsum(padded, 0)
+    tl.store(TOTALS + experts, counts, experts < EXPERTS)
+    tl.store(STARTS + experts, prefix - padded, experts < EXPERTS)
+    tl.store(POST, tl.sum(padded, 0))
+
+
+@triton.jit
 def _counts(IDS, COUNTS, N: tl.constexpr, CHUNKS: tl.constexpr, TILE: tl.constexpr):
     expert = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -23,9 +65,7 @@ def _counts(IDS, COUNTS, N: tl.constexpr, CHUNKS: tl.constexpr, TILE: tl.constex
 
 
 @triton.jit
-def _chunk_prefix(
-    COUNTS, PREFIX, TOTALS, CHUNKS: tl.constexpr, WIDTH: tl.constexpr
-):
+def _chunk_prefix(COUNTS, PREFIX, TOTALS, CHUNKS: tl.constexpr, WIDTH: tl.constexpr):
     expert = tl.program_id(0)
     chunks = tl.arange(0, WIDTH)
     counts = tl.load(COUNTS + expert * CHUNKS + chunks, chunks < CHUNKS, other=0)
@@ -36,7 +76,12 @@ def _chunk_prefix(
 
 @triton.jit
 def _expert_prefix(
-    TOTALS, STARTS, POST, EXPERTS: tl.constexpr, BLOCK: tl.constexpr, WIDTH: tl.constexpr
+    TOTALS,
+    STARTS,
+    POST,
+    EXPERTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WIDTH: tl.constexpr,
 ):
     experts = tl.arange(0, WIDTH)
     counts = tl.load(TOTALS + experts, experts < EXPERTS, other=0)
@@ -83,7 +128,11 @@ def _scatter(
 
 
 def moe_align_block_size_stable(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    *,
+    use_histogram: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack valid [0, num_experts) IDs, ordered by expert then token/slot.
 
@@ -91,6 +140,8 @@ def moe_align_block_size_stable(
     topk_ids.numel(), matching Marlin. Unused capacity beyond the returned
     padded count must not be read. Shape-only host logic supports CUDA Graph
     replay with changing routes; every active scratch element is overwritten.
+    The opt-in histogram path preserves integer counts and stable ordering,
+    combining the counting and expert-prefix launches for a single chunk.
     """
     if not topk_ids.is_cuda or not topk_ids.is_contiguous():
         raise ValueError("stable alignment requires contiguous CUDA topk_ids")
@@ -110,19 +161,50 @@ def moe_align_block_size_stable(
     chunks = triton.cdiv(n, tile)
     counts = torch.empty((num_experts, chunks), **kwargs)
     starts = torch.empty((num_experts,), **kwargs)
-    _counts[(num_experts, chunks)](topk_ids, counts, n, chunks, tile)
     if chunks == 1:
         totals = counts.view(-1)
         prefix = counts  # Not read in the single-chunk scatter specialization.
+        if use_histogram:
+            _single_chunk_histogram_prefix[(1,)](
+                topk_ids,
+                totals,
+                starts,
+                post,
+                n,
+                tile,
+                num_experts,
+                triton.next_power_of_2(num_experts),
+                block_size,
+            )
+        else:
+            _counts[(num_experts, chunks)](topk_ids, counts, n, chunks, tile)
     else:
         totals = torch.empty((num_experts,), **kwargs)
         prefix = torch.empty_like(counts)
+        if use_histogram:
+            _histogram_counts[(chunks,)](
+                topk_ids,
+                counts,
+                n,
+                chunks,
+                tile,
+                num_experts,
+                triton.next_power_of_2(num_experts),
+            )
+        else:
+            _counts[(num_experts, chunks)](topk_ids, counts, n, chunks, tile)
         _chunk_prefix[(num_experts,)](
             counts, prefix, totals, chunks, triton.next_power_of_2(chunks)
         )
-    _expert_prefix[(1,)](
-        totals, starts, post, num_experts, block_size, triton.next_power_of_2(num_experts)
-    )
+    if not (use_histogram and chunks == 1):
+        _expert_prefix[(1,)](
+            totals,
+            starts,
+            post,
+            num_experts,
+            block_size,
+            triton.next_power_of_2(num_experts),
+        )
     _scatter[(num_experts, chunks)](
         topk_ids,
         prefix,

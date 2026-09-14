@@ -282,7 +282,12 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_stable import moe_align_block_size_stable
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size_stable(topk_ids, block_size_m, global_num_experts)
+            moe_align_block_size_stable(
+                topk_ids,
+                block_size_m,
+                global_num_experts,
+                use_histogram=envs.SGLANG_DSV4_SM89_MARLIN_HISTOGRAM_ALIGN.get(),
+            )
         )
     elif (
         M == 1

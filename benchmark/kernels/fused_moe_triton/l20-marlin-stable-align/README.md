@@ -1,5 +1,20 @@
 # L20 native MXFP4 stable expert packing
 
+## R46 histogram candidate (2026-09-14)
+
+Branch `codex/dsv4-sm89-histogram-align-v0517` adds the default-off
+`SGLANG_DSV4_SM89_MARLIN_HISTOGRAM_ALIGN=1` option inside stable packing.
+The single-chunk path combines counting and expert prefixes; larger inputs
+compute all expert counts with one histogram per chunk. Stable scatter,
+GEMM arithmetic, quantization, and the active-prefix contract stay the same.
+
+`benchmark_histogram_align.py --output result.json` requires exact CPU-oracle
+and original-stable-layout equality before bounded three-block ABA timing.
+It also checks changed routing and restoration under CUDA Graph. Timing
+uses the real Marlin block-selection rule and preserves invalid drift rows.
+GPU validation and service benefit are pending; enabling this option does
+not replace any historical model-quality gate.
+
 Branch: `codex/dsv4-sm89-marlin-stable-align-v0517`, based on `b26362f636`.
 
 The paired R32 synthetic experiment found that E8/M513 native token order and
