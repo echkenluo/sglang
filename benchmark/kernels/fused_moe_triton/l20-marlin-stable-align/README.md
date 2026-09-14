@@ -12,8 +12,25 @@ GEMM arithmetic, quantization, and the active-prefix contract stay the same.
 and original-stable-layout equality before bounded three-block ABA timing.
 It also checks changed routing and restoration under CUDA Graph. Timing
 uses the real Marlin block-selection rule and preserves invalid drift rows.
-GPU validation and service benefit are pending; enabling this option does
-not replace any historical model-quality gate.
+R46 completed on GPU18 with implementation `b6166e2262`: 48 correctness
+checks passed, and all 18 shape/distribution timing cells passed three ABA
+blocks. Packing cost fell 19.6-23.0% at M5/6/20/24, 6.5-7.5% at M80/96/128,
+16.6% at M513, and 30.6-30.7% at M4096. These are isolated packing costs.
+
+R47 then ran the same source with the flag 0/1/0 across three startups,
+60 formal batches and 330 requests. Short c1 wall throughput changed -0.20%
+and request-normalized decode -0.24%; 32K TTFT changed -0.12% (about 5 ms).
+Both c1 cells had exact paired output tokens. D-c4 and heavy-decode c16 failed
+the anchor drift gate and are retained as invalid. The candidate executed
+on all eight ranks in both single- and multiple-chunk diagnostic traces.
+Known-answer, boundary and restoration checks passed. No useful service gain
+was established: keep the histogram flag off and preserve this candidate.
+
+R45's baseline traces put stable packing at only 0.5-0.9% of summed CUDA
+kernel durations. This is diagnostic accounting, not an end-to-end speedup
+bound; it explains why isolated kernel percentages must not be promoted to
+service gains. Historical FP4 numeric failures remain separate and unchanged.
+The sections below retain the earlier stable-packing investigation history.
 
 Branch: `codex/dsv4-sm89-marlin-stable-align-v0517`, based on `b26362f636`.
 
