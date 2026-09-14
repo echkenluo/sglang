@@ -18,7 +18,10 @@ representative static DSpark verify sizes; 512/4096 exercise larger rows. These
 are synthetic shapes, not receipts of exact runtime frequency. References use
 FP32 without TF32; the predeclared check is atol=rtol=0.001 on seven sampled
 rows, plus finite valid outputs for all rows and exact Graph repeat checks.
-Empty/partial page boundaries are included. Top-k overlap is recorded separately.
+An extra boundary-only fixture includes empty/partial pages. All eight timed
+fixtures use full lengths for every query, avoiding sparse-boundary geometry in
+performance results. FP8 values are converted before reference gathers. Top-k
+overlap is recorded separately.
 Eager and Graph times include each public wrapper. No service speedup or full
 quality claim follows from this component screen.
 

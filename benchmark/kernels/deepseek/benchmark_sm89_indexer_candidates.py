@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.dsv4.f28_mqa import sglang_paged_mqa_logits
 SHAPES = [(m, s) for m in (6, 24, 96) for s in (512, 8192)] + [(512, 8192), (4096, 1024)]
 
 
-def fixture(m, s):
+def fixture(m, s, boundary_only=False):
     generator = torch.Generator(device="cuda").manual_seed(43100 + m + s)
     pages = max(32, s // 64 * 2)
     q = (torch.randn(m, 1, 64, 128, generator=generator, device="cuda") * .25).to(torch.float8_e4m3fn)
@@ -34,8 +34,9 @@ def fixture(m, s):
     table = torch.randint(pages, (m, s // 64), generator=generator, device="cuda", dtype=torch.int32)
     # Include partial pages and empty rows. Invalid pages are never read by valid lengths.
     lengths = torch.full((m,), s, device="cuda", dtype=torch.int32)
-    boundary = [0, 1, 63, 64, 65]
-    lengths[:min(m, len(boundary))] = torch.tensor(boundary[:m], device="cuda", dtype=torch.int32)
+    if boundary_only:
+        boundary = [0, 1, 63, 64, 65]
+        lengths[:min(m, len(boundary))] = torch.tensor(boundary[:m], device="cuda", dtype=torch.int32)
     valid_pages = torch.arange(s // 64, device="cuda")[None, :] * 64 < lengths[:, None]
     table.masked_fill_(~valid_pages, -1)
     return q, packed, weights, lengths, table, values, scales
@@ -53,16 +54,19 @@ def main():
     result = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
               "triton": triton.__version__, "atol": .001, "rtol": .001,
               "scope": "synthetic operator screen; no service adoption", "cases": []}
-    for m, s in SHAPES:
-        q, packed, weights, lengths, table, values, scales = fixture(m, s)
+    cases = [(6, 512, True)] + [(m, s, False) for m, s in SHAPES]
+    for m, s, boundary_only in cases:
+        q, packed, weights, lengths, table, values, scales = fixture(m, s, boundary_only)
         valid = torch.arange(s, device="cuda")[None, :] < lengths[:, None]
-        case = {"query_rows": m, "max_compressed_tokens": s, "backends": {}}
+        case = {"query_rows": m, "max_compressed_tokens": s,
+                "boundary_only": boundary_only, "backends": {}}
         samples = sorted(set(list(range(min(m, 6))) + [m - 1]))
         references = {}
+        float_values = values.float()
         for row in samples:
             n = int(lengths[row])
             ids = table[row, :triton.cdiv(n, 64)].long()
-            k = values[ids].float().reshape(-1, 128)[:n]
+            k = float_values[ids].reshape(-1, 128)[:n]
             scale = scales[ids].reshape(-1)[:n]
             refs = (torch.relu(k @ q[row, 0].float().T) * weights[row]).sum(-1) * scale
             references[row] = refs
@@ -98,7 +102,7 @@ def main():
                 torch.cuda.synchronize()
                 record["graph_repeat_exact_valid"] = bool(torch.equal(first[valid], captured[valid]))
                 outputs[name] = output
-                if record["correct"] and record["graph_repeat_exact_valid"]:
+                if record["correct"] and record["graph_repeat_exact_valid"] and not boundary_only:
                     record["graph_ms"] = float(triton.testing.do_bench(graph.replay, warmup=20, rep=100))
                     record["eager_ms"] = float(triton.testing.do_bench(call, warmup=20, rep=100))
             except Exception as exc:
