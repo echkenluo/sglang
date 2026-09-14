@@ -428,6 +428,33 @@ MarlinFuncPtr get_marlin_kernel(
 }
 
 template <typename scalar_t>
+bool should_use_sm89_linear_small_tile(
+    const host::ScalarType& q_type,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    int group_size,
+    bool has_act_order,
+    bool is_k_full,
+    bool has_zp,
+    bool is_zp_float,
+    int dev,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool requested) {
+  if (!requested || !std::is_same<scalar_t, nv_bfloat16>::value || prob_m != 6 || prob_n != 512 || prob_k != 4096 ||
+      q_type != host::kFE4M3fn || group_size != 128 || has_act_order || !is_k_full || has_zp || is_zp_float ||
+      use_atomic_add || !use_fp32_reduce) {
+    return false;
+  }
+  int major = 0;
+  int minor = 0;
+  host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+  host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
+  return major == 8 && minor == 9;
+}
+
+template <typename scalar_t>
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
     int prob_m,
@@ -442,14 +469,18 @@ exec_config_t determine_exec_config(
     bool has_zp,
     bool is_zp_float,
     int max_shared_mem,
-    int sms) {
+    int sms,
+    bool use_sm89_small_tile = false) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
                                                 : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
   for (int i = 0; i < thread_configs_size; i++) {
-    thread_config_t th_config = thread_configs[i];
+    // The exact-shape candidate promotes an existing configuration. Preserve
+    // the same validity/kernel checks and retain the original as fallback.
+    int config_index = use_sm89_small_tile && thread_m_blocks == 1 && i < 2 ? 1 - i : i;
+    thread_config_t th_config = thread_configs[config_index];
 
     if (!is_valid_config(
             th_config,
@@ -539,7 +570,9 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool use_sm89_small_tile) {
+  const bool original_has_act_order = has_act_order;
   if (has_zp) {
     host::RuntimeCheck(
         q_type == host::kU4 || q_type == host::kU8, "q_type must be u4 or u8 when has_zp = True. Got = ", q_type.str());
@@ -612,6 +645,20 @@ void marlin_mm(
   int max_shared_mem_new = max_shared_mem;
   int rest_m = prob_m;
   int max_thread_m_blocks = 4;
+  bool select_small_tile = should_use_sm89_linear_small_tile<scalar_t>(
+      q_type,
+      prob_m,
+      prob_n,
+      prob_k,
+      group_size,
+      original_has_act_order,
+      is_k_full,
+      has_zp,
+      is_zp_float,
+      dev,
+      use_atomic_add,
+      use_fp32_reduce,
+      use_sm89_small_tile);
   while (rest_m) {
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;
@@ -647,7 +694,8 @@ void marlin_mm(
           has_zp,
           is_zp_float,
           max_shared_mem,
-          sms);
+          sms,
+          select_small_tile);
       thread_tfg = exec_cfg.tb_cfg;
       if (thread_tfg.thread_k == -1 && max_thread_m_blocks > 1) {
         max_thread_m_blocks--;
@@ -802,7 +850,8 @@ void gptq_marlin_gemm(
     bool is_k_full,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool use_sm89_small_tile) {
   using namespace host;
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
@@ -997,5 +1046,79 @@ void gptq_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
-      is_zp_float);
+      is_zp_float,
+      use_sm89_small_tile);
+}
+
+template <typename scalar_t>
+int64_t marlin_linear_tile_config(
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b_scales,
+    int64_t b_q_type_id,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool use_sm89_small_tile) {
+  using namespace host;
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  auto M = SymbolicSize{"M"};
+  auto K = SymbolicSize{"K"};
+  auto N = SymbolicSize{"N"};
+  auto G = SymbolicSize{"G"};
+  auto lda = SymbolicSize{"lda"};
+  TensorMatcher({M, K}).with_strides({lda, 1}).with_dtype<scalar_t>().with_device(device).verify(a);
+  TensorMatcher({G, N}).with_device(device).verify(b_scales);
+  int m = M.unwrap();
+  int n = N.unwrap();
+  int k = K.unwrap();
+  int groups = G.unwrap();
+  RuntimeCheck(m > 0 && groups > 0 && k % groups == 0, "Invalid linear config query shape");
+  int group_size = groups > 1 ? k / groups : -1;
+  int dev = device.unwrap().device_id;
+  int sms = 0;
+  int max_shared_mem = 0;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  auto q_type = ScalarType::from_id(b_q_type_id);
+  bool small_tile = device::marlin::should_use_sm89_linear_small_tile<scalar_t>(
+      q_type,
+      m,
+      n,
+      k,
+      group_size,
+      false,
+      true,
+      false,
+      false,
+      dev,
+      use_atomic_add,
+      use_fp32_reduce,
+      use_sm89_small_tile);
+  int max_m_blocks = 4;
+  device::marlin::exec_config_t cfg;
+  while (true) {
+    int par_count = min(m / (max_m_blocks * 16), n <= 4096 ? 128 : 16);
+    int m_split = par_count > 0 ? par_count * (max_m_blocks * 16) : m;
+    cfg = device::marlin::determine_exec_config<scalar_t>(
+        q_type,
+        m_split,
+        n,
+        k,
+        min(host::div_ceil(m_split, 16), max_m_blocks),
+        m_split <= 8,
+        q_type.size_bits(),
+        group_size,
+        false,
+        true,
+        false,
+        false,
+        max_shared_mem,
+        sms,
+        small_tile);
+    if (cfg.tb_cfg.thread_k != -1) break;
+    RuntimeCheck(max_m_blocks > 1, "No supported linear tile configuration");
+    max_m_blocks--;
+  }
+  return (static_cast<int64_t>(cfg.blocks_per_sm) << 48) | (static_cast<int64_t>(cfg.tb_cfg.num_threads) << 32) |
+         (static_cast<int64_t>(cfg.tb_cfg.thread_n) << 16) | cfg.tb_cfg.thread_k;
 }

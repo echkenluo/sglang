@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -18,12 +19,40 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin import (
+        get_gptq_marlin_linear_tile_config,
+        gptq_marlin_gemm,
+    )
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
+
+_SM89_LINEAR_SMALL_TILE_ENV = "SGLANG_DSV4_SM89_MARLIN_LINEAR_SMALL_TILE"
+
+
+def set_marlin_linear_small_tile_enabled(enabled: bool) -> None:
+    """Set the process-local candidate flag; Graph replay keeps its captured tile."""
+    os.environ[_SM89_LINEAR_SMALL_TILE_ENV] = "1" if enabled else "0"
+
+
+def get_marlin_linear_tile_config(
+    input: torch.Tensor,
+    weight_scale: torch.Tensor,
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> dict[str, int]:
+    """Query the actual FP8 linear host selector outside Graph capture."""
+    a = input.reshape(-1, input.shape[-1])
+    size_n, size_k = weight_scale.shape[1], a.shape[1]
+    return get_gptq_marlin_linear_tile_config(
+        a,
+        weight_scale,
+        scalar_types.float8_e4m3fn,
+        should_use_atomic_add_reduce(a.shape[0], size_n, size_k, a.device, a.dtype),
+        use_fp32_reduce,
+        os.environ.get(_SM89_LINEAR_SMALL_TILE_ENV, "0") == "1",
+    )
 
 
 def fp8_fused_exponent_bias_into_scales(scales):
@@ -92,6 +121,14 @@ def apply_fp8_marlin_linear(
         size_k=size_k,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
+        use_sm89_small_tile=(
+            reshaped_x.size(0) == 6
+            and size_n == 512
+            and size_k == 4096
+            and input.dtype == torch.bfloat16
+            and use_fp32_reduce
+            and os.environ.get(_SM89_LINEAR_SMALL_TILE_ENV, "0") == "1"
+        ),
     )
 
     if bias is not None:

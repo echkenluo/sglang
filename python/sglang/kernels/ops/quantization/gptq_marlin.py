@@ -22,7 +22,10 @@ def _jit_gptq_marlin_module(dtype: torch.dtype) -> Module:
         "gptq_marlin",
         *args,
         cuda_files=["gemm/marlin/gptq_marlin.cuh"],
-        cuda_wrappers=[("gptq_marlin_gemm", f"gptq_marlin_gemm<{args}>")],
+        cuda_wrappers=[
+            ("gptq_marlin_gemm", f"gptq_marlin_gemm<{args}>"),
+            ("marlin_linear_tile_config", f"marlin_linear_tile_config<{args}>"),
+        ],
     )
 
 
@@ -51,6 +54,7 @@ def gptq_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    use_sm89_small_tile: bool = False,
 ) -> torch.Tensor:
     device = a.device
 
@@ -112,6 +116,37 @@ def gptq_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        use_sm89_small_tile,
     )
 
     return c
+
+
+def get_gptq_marlin_linear_tile_config(
+    a: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_q_type: ScalarType,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    use_sm89_small_tile: bool = False,
+) -> dict[str, int]:
+    """Query the actual host selector for an unpermuted, zero-point-free linear.
+
+    Call outside CUDA Graph capture. This reports the first M split selected
+    by the original split/fallback rules; it does not describe all launches
+    when the operation has more than one M split.
+    """
+    packed = _jit_gptq_marlin_module(a.dtype).marlin_linear_tile_config(
+        a,
+        b_scales,
+        b_q_type.id,
+        use_atomic_add,
+        use_fp32_reduce,
+        use_sm89_small_tile,
+    )
+    return {
+        "thread_k": packed & 0xFFFF,
+        "thread_n": (packed >> 16) & 0xFFFF,
+        "num_threads": (packed >> 32) & 0xFFFF,
+        "blocks_per_sm": (packed >> 48) & 0xFFFF,
+    }
