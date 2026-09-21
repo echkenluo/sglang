@@ -1232,6 +1232,10 @@ class Envs:
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_DSV4_SM89_MHC_BROADCAST = EnvBool(False)
     SGLANG_DSV4_SM89_MARLIN_CLAMP = EnvBool(False)
+    # On L20, cuBLAS picks a 5x slower BF16 kernel for 2-7 rows of the indexer
+    # weights_proj (4096 -> 64): 18.7 us vs 3.7 us at 8 rows. DSpark verify at
+    # batch size 1 runs exactly 6 rows. Pads those calls to 8 rows.
+    SGLANG_DSV4_SM89_PAD_SMALL_GEMM = EnvBool(False)
     # Experimental repeatable expert-token packing for native MXFP4 on L20.
     # Does not establish batch invariance, numeric admission, or service gains.
     SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN = EnvBool(False)

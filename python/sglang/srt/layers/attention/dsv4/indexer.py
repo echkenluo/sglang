@@ -45,6 +45,8 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
+_SM89_PAD_SMALL_GEMM = envs.SGLANG_DSV4_SM89_PAD_SMALL_GEMM.get()
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
@@ -961,7 +963,12 @@ class C4Indexer(nn.Module):
         )
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
-        out, _ = self.weights_proj(x)
+        rows = x.shape[0]
+        if 1 < rows < 8 and x.dim() == 2 and _SM89_PAD_SMALL_GEMM:
+            out, _ = self.weights_proj(F.pad(x, (0, 0, 0, 8 - rows)))
+            out = out[:rows]
+        else:
+            out, _ = self.weights_proj(x)
         if not skip_scale:
             out = out * self.weight_scale
         return out
