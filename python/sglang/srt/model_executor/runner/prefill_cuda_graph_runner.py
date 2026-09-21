@@ -40,7 +40,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -636,6 +636,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             yield
 
+    def _scattered_layout_for_capture(self, forward_batch: ForwardBatch):
+        """Pick the TP-scattered token layout for a body capture.
+
+        The outer ``*ForCausalLM.forward`` chooses the layout per forward from
+        the row count (``AttnTpContext.maybe_input_scattered``). A body capture
+        skips that wrapper, so without this the transformer stack always
+        records the replicated layout and its BF16 all-reduce. With
+        SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED the capture batch, which has
+        exactly the bucket's rows, makes the same choice an eager forward of
+        that size would. The draft worker never enters the scattered layout.
+        """
+        if (
+            not envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED.get()
+            or self.model_runner.is_draft_worker
+        ):
+            return nullcontext()
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
+        return get_attn_tp_context().maybe_input_scattered(forward_batch)
+
     @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run forward inside the prefill set_tc_piecewise_forward_context.
@@ -668,12 +688,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                return self.layer_model.forward(
-                    forward_batch.input_ids,
-                    positions,
-                    forward_batch,
-                    forward_batch.input_embeds,
-                )
+                with self._scattered_layout_for_capture(forward_batch):
+                    return self.layer_model.forward(
+                        forward_batch.input_ids,
+                        positions,
+                        forward_batch,
+                        forward_batch.input_embeds,
+                    )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,

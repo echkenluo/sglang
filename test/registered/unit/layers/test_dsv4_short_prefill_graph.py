@@ -147,7 +147,67 @@ def replay_eligible(tokens, enabled, prefix=0, verify=False, pad=False):
     )
 
 
+def capture_layout_calls(enabled, draft):
+    """Run the production capture-layout helper and report which batches it
+    asked the attention-TP context to lay out."""
+    import types
+    from contextlib import nullcontext
+
+    source = (
+        ROOT
+        / "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py"
+    )
+    method = next(
+        node
+        for node in ast.walk(ast.parse(source.read_text()))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_scattered_layout_for_capture"
+    )
+    calls = []
+    communicator = types.ModuleType("sglang.srt.layers.communicator")
+    communicator.get_attn_tp_context = lambda: SimpleNamespace(
+        maybe_input_scattered=lambda batch: calls.append(batch) or "scattered"
+    )
+    namespace = {
+        "ForwardBatch": object,
+        "nullcontext": nullcontext,
+        "envs": SimpleNamespace(
+            SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED=SimpleNamespace(
+                get=lambda: enabled
+            )
+        ),
+    }
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    runner = SimpleNamespace(model_runner=SimpleNamespace(is_draft_worker=draft))
+    saved = sys.modules.get(communicator.__name__)
+    sys.modules[communicator.__name__] = communicator
+    try:
+        result = namespace["_scattered_layout_for_capture"](runner, "capture-batch")
+    finally:
+        if saved is None:
+            del sys.modules[communicator.__name__]
+        else:
+            sys.modules[communicator.__name__] = saved
+    return result, calls
+
+
 class TestShortPrefillGraph(unittest.TestCase):
+    def test_body_capture_chooses_the_layout_like_the_outer_forward(self):
+        # A body capture skips *ForCausalLM.forward, which is where the layout
+        # is chosen. Without this hook a bucket above the threshold silently
+        # records the replicated layout and its BF16 all-reduce.
+        result, calls = capture_layout_calls(enabled=True, draft=False)
+        self.assertEqual((result, calls), ("scattered", ["capture-batch"]))
+        # Off by default, and the draft worker never runs the scattered layout.
+        for enabled, draft in ((False, False), (True, True)):
+            with self.subTest(enabled=enabled, draft=draft):
+                result, calls = capture_layout_calls(enabled, draft)
+                self.assertEqual(calls, [])
+                self.assertNotEqual(result, "scattered")
+
     def test_experimental_replay_requires_captured_token_shape(self):
         for prefix in (0, 4096):
             for tokens in (21, 32, 64, 128, 256):
