@@ -405,10 +405,12 @@ def _dsv4_tp_fp8_a2a_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     packed[:, :hidden] = x_q.view(torch.uint8)
     packed[:, hidden:] = x_s.view(torch.uint8).view(rows, scale_bytes)
     received = torch.empty_like(packed)
-    # raw eager collective on the coordinator's device group: the
-    # GroupCoordinator has no all_to_all_single wrapper, and this path is
-    # prefill-only/eager by the scattered admission (CR-5 note)
-    torch.distributed.all_to_all_single(received, packed, group=tp_group.device_group)
+    # The coordinator wrapper runs the same torch.distributed exchange in
+    # eager mode and switches to pynccl while a CUDA Graph is being captured,
+    # which SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED needs. pynccl splits the
+    # flattened buffer, so pass 1-D views: rows divide by the TP size, hence
+    # equal byte chunks are exactly the per-rank row shards.
+    tp_group.all_to_all_single(received.view(-1), packed.view(-1))
     shard = rows // world
     q_full = received.view(torch.float8_e4m3fn)[:, :hidden]
     s_full = (

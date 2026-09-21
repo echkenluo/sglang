@@ -1201,6 +1201,7 @@ class Envs:
     # This gate does not establish Graph replay correctness or performance.
     SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM = EnvBool(False)
     SGLANG_DSV4_SHORT_PREFILL_GRAPH_PAD = EnvBool(False)
+    SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED = EnvBool(False)
     # Diagnostic/numeric-preserving variant: retain the stock TP AllReduce
     # reduction order, then keep only this rank's token rows. This adds an
     # AllGather before each full-token consumer and is not assumed faster.

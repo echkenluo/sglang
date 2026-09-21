@@ -276,6 +276,8 @@ def _allow_dsv4_scattered_with_short_prefill_graph():
         config.prefill.backend,
         config.prefill.bs,
         envs.SGLANG_DSV4_TP_INPUT_SCATTERED_MIN_TOKENS.get(),
+        allow_scattered_buckets=envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED.get(),
+        tp_size=get_parallel().tp_size,
     )
     return True
 

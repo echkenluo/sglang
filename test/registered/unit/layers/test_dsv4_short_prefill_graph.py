@@ -32,7 +32,14 @@ validate = load_file(
 ).validate_short_prefill_graph_buckets
 
 
-def routing_context(backend="breakable", buckets=(32,), enabled=True, tp=8, dp=False):
+def routing_context(
+    backend="breakable",
+    buckets=(32,),
+    enabled=True,
+    tp=8,
+    dp=False,
+    scattered_buckets=False,
+):
     source = ROOT / "python/sglang/srt/layers/communicator.py"
     tree = ast.parse(source.read_text())
     names = {"_allow_dsv4_scattered_with_short_prefill_graph", "AttnTpContext"}
@@ -42,6 +49,7 @@ def routing_context(backend="breakable", buckets=(32,), enabled=True, tp=8, dp=F
     flags = {
         "SGLANG_DSV4_TP_INPUT_SCATTERED": True,
         "SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM": enabled,
+        "SGLANG_DSV4_SHORT_PREFILL_GRAPH_SCATTERED": scattered_buckets,
         "SGLANG_DSV4_TP_INPUT_SCATTERED_MIN_TOKENS": 512,
         "SGLANG_DSV4_TP_SCATTER_TBO": False,
     }
@@ -91,7 +99,7 @@ def batch(tokens, extend=True, verify=False, tbo=False):
     )
 
 
-def replay_eligible(tokens, enabled, prefix=0, verify=False):
+def replay_eligible(tokens, enabled, prefix=0, verify=False, pad=False):
     source = (
         ROOT
         / "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py"
@@ -108,7 +116,8 @@ def replay_eligible(tokens, enabled, prefix=0, verify=False):
         "envs": SimpleNamespace(
             SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM=SimpleNamespace(
                 get=lambda: enabled
-            )
+            ),
+            SGLANG_DSV4_SHORT_PREFILL_GRAPH_PAD=SimpleNamespace(get=lambda: pad),
         ),
         "_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR": 2,
     }
@@ -149,6 +158,15 @@ class TestShortPrefillGraph(unittest.TestCase):
                     self.assertFalse(replay_eligible(tokens, True, prefix))
         self.assertFalse(replay_eligible(32, True, verify=True))
 
+    def test_padding_switch_restores_bucket_padding_on_the_short_graph_route(self):
+        # Natural agent prefills almost never hit a bucket exactly; with the
+        # switch they must replay the next bucket instead of running eagerly.
+        for tokens in (20, 22, 33, 65, 129, 255):
+            with self.subTest(tokens=tokens):
+                self.assertTrue(replay_eligible(tokens, True, pad=True))
+        self.assertFalse(replay_eligible(257, True, pad=True))
+        self.assertFalse(replay_eligible(32, True, verify=True, pad=True))
+
     def test_default_replay_retains_existing_padding_policy(self):
         for tokens in (20, 22, 33, 65, 129, 255):
             with self.subTest(tokens=tokens):
@@ -165,6 +183,21 @@ class TestShortPrefillGraph(unittest.TestCase):
         for tokens in (512, 513, 4096, 32768):
             with self.subTest(tokens=tokens):
                 self.assertTrue(context.use_input_scattered(batch(tokens)))
+
+    def test_scattered_buckets_need_the_switch_and_even_rows(self):
+        # A bucket at or above the threshold is captured in the scattered
+        # layout, because the model picks the layout from the row count.
+        context = routing_context(buckets=(21, 32, 512, 1024), scattered_buckets=True)
+        self.assertTrue(context.allow_input_scattered)
+        self.assertFalse(context.use_input_scattered(batch(32)))
+        self.assertTrue(context.use_input_scattered(batch(512)))
+        # The Graph route skips the eager row padding, so a scattered bucket
+        # that does not divide by the TP size has no valid row shards.
+        with self.assertRaises(ValueError):
+            routing_context(buckets=(32, 1001), scattered_buckets=True)
+        with self.assertRaises(ValueError):
+            validate("breakable", [32, 512], 512, allow_scattered_buckets=True, tp_size=0)
+        validate("breakable", [21, 511, 512], 512, allow_scattered_buckets=True, tp_size=8)
 
     def test_default_gate_preserves_old_behavior(self):
         self.assertFalse(routing_context(enabled=False).allow_input_scattered)
