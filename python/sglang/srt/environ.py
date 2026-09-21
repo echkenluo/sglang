@@ -335,6 +335,12 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    # Sample the DSpark draft at temperature * scale. Rejection sampling stays
+    # exact for any proposal distribution as long as the acceptance test uses the
+    # same one, which it does (both read DraftBlockResult.temperatures). A draft
+    # model is usually flatter than its target, so a scale below 1 can raise the
+    # acceptance length of sampled requests. Greedy requests are unaffected.
+    SGLANG_DSPARK_DRAFT_TEMPERATURE_SCALE = EnvFloat(1.0)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
