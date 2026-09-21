@@ -48,6 +48,8 @@ _L20_POLICY: Dict[Tuple[int, int], Tuple[int, int]] = {
 }
 
 _extra_bytes = 0
+_logged_shapes = set()
+_logged_gib = [0]
 
 
 def enabled_backends() -> Tuple[str, ...]:
@@ -107,15 +109,19 @@ def prepare_layer(layer: torch.nn.Module, weight_block_size) -> None:
         _extra_bytes += weight.numel() + scale_inv.numel() * 4
 
     layer.sm89_dense_thresholds = thresholds
-    logger.info(
-        "SM89 dense GEMM dispatch: K=%d N=%d thresholds=%s backends=%s, "
-        "extra weight memory so far %.2f GiB",
-        key[0],
-        key[1],
-        thresholds,
-        ",".join(backends),
-        _extra_bytes / 2**30,
-    )
+    # One line per shape, then one line per GiB, instead of one per layer.
+    if key not in _logged_shapes or _extra_bytes // 2**30 > _logged_gib[0]:
+        _logged_shapes.add(key)
+        _logged_gib[0] = _extra_bytes // 2**30
+        logger.info(
+            "SM89 dense GEMM dispatch: K=%d N=%d thresholds=%s backends=%s, "
+            "extra weight memory so far %.2f GiB",
+            key[0],
+            key[1],
+            thresholds,
+            ",".join(backends),
+            _extra_bytes / 2**30,
+        )
 
 
 def apply(
