@@ -1,26 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Row-count based backend choice for block-FP8 dense linears on SM89 (L20).
+"""Backend choice for block-FP8 dense linears on SM89 (L20).
 
 With SGLANG_FORCE_FP8_MARLIN=1 every block-FP8 dense linear runs the Marlin
-W8A16 kernel. On L20 that kernel is the best choice only for very few rows.
+W8A16 kernel. On L20 that kernel is only competitive below about 16 rows.
 Between 24 and 128 rows it is 2x to 13x slower than a BF16 cuBLAS GEMM on the
 dequantized weight (it needs two launches at 96 rows and its blocked GEMM is
 compute-inefficient), and above a few hundred rows the Triton W8A8 block-FP8
 kernel is 1.5x to 2x faster than both.
 
+With the tuned launch configs in kernels/ops/quantization/configs
+(device_name=NVIDIA_L20, block_shape=[128, 128]) the Triton W8A8 kernel,
+activation quantization included, is the fastest or within 1 us of the fastest
+backend from 1 to 4096 rows on all five shapes (43 distinct weight copies per
+backend, bench-l20-dense-gemm-backends.py --layers 43, 2026-09-21; wqkv_a at 6
+rows: Triton 11.5 us, Marlin 13.3 us, BF16 23.5 us; at 96 rows: 14.9, 63.4 and
+23.9 us). The built-in policy therefore sends every row count to Triton. Such
+a layer skips the Marlin repack and runs on the loaded FP8 weight, so it needs
+no extra weight copy; the earlier mixed policy cost 14% of the KV capacity.
+W8A8 with 128-wide activation groups is also the numeric format the
+checkpoint was trained in, Marlin W8A16 is the deviation.
+
+The untuned Triton default (BLOCK_SIZE_M=64) is 2x to 3x slower below 128
+rows, so the policy is only valid together with the tuned config files.
+
 `choose_backend` picks one backend per call from the row count. Row counts are
-static inside a CUDA graph, so the choice costs nothing at replay time.
-
-Memory: a layer whose policy never uses Marlin (marlin_max_rows == 0, Triton
-enabled, no bias) skips the Marlin repack and runs the Triton kernel on the
-loaded FP8 weight, so it needs no extra copy at all. A layer that keeps Marlin
-for small row counts pays one extra FP8 copy for Triton, and a BF16 copy only
-if its policy has a BF16 range.
-
-The thresholds come from single-GPU microbenchmarks on L20
-(bench-l20-dense-gemm-backends.py, 2026-09-21) and can be overridden per shape
-with SGLANG_SM89_FP8_LINEAR_POLICY. Shapes that are not in the table keep the
-plain Marlin path and use no extra memory.
+static inside a CUDA graph, so the choice costs nothing at replay time. Mixed
+policies stay available through SGLANG_SM89_FP8_LINEAR_POLICY: a layer that
+keeps Marlin for small row counts pays one extra FP8 copy for Triton, and a
+BF16 copy only if its policy has a BF16 range. Shapes that are not in the
+table keep the plain Marlin path and use no extra memory.
 """
 
 import logging
@@ -42,14 +50,13 @@ TRITON = "triton"
 # rows <= marlin_max_rows           : Marlin W8A16
 # marlin_max_rows < rows <= bf16_max: BF16 cuBLAS on the dequantized weight
 # rows > bf16_max_rows              : Triton W8A8 block FP8
-# DeepSeek-V4-Flash at TP8. Decode and DSpark verify never exceed 96 rows, so
-# they never reach the W8A8 kernel and keep weight-only numerics.
+# DeepSeek-V4-Flash at TP8. (0, 0) is Marlin-free: Triton at every row count.
 _L20_POLICY: Dict[Tuple[int, int], Tuple[int, int]] = {
-    (4096, 1536): (16, 512),  # attention wqkv_a (fused wq_a + wkv)
-    (1024, 4096): (16, 128),  # attention wq_b, wo_b
-    (1024, 8192): (16, 128),  # indexer wq_b
-    (4096, 512): (0, 1024),  # shared expert gate_up
-    (256, 4096): (1, 256),  # shared expert down
+    (4096, 1536): (0, 0),  # attention wqkv_a (fused wq_a + wkv)
+    (1024, 4096): (0, 0),  # attention wq_b, wo_b
+    (1024, 8192): (0, 0),  # indexer wq_b
+    (4096, 512): (0, 0),  # shared expert gate_up
+    (256, 4096): (0, 0),  # shared expert down
 }
 
 _extra_bytes = 0

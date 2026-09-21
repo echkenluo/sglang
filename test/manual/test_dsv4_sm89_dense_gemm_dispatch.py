@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Row-count dispatch of block-FP8 dense linears on L20 (SM89).
+"""Backend dispatch of block-FP8 dense linears on L20 (SM89).
 
-Why this matters: DSpark verify runs 6, 24, 48 or 96 rows per step. Marlin is
-2x to 13x slower than BF16 cuBLAS between 24 and 128 rows, so those rows must
-leave Marlin, while decode must never reach the W8A8 kernel (its activation
-quantization would change decode numerics for no measurable gain).
+Why this matters: DSpark verify runs 6, 24, 48 or 96 rows per step, and Marlin
+is 2x to 13x slower than the alternatives between 24 and 128 rows. With tuned
+launch configs the Triton W8A8 kernel wins at every row count, so the built-in
+policy is Marlin-free. That only holds if (a) no shape silently keeps a Marlin
+or BF16 range, which would bring back the extra weight copies and cost KV
+capacity, and (b) the tuned config files exist and are numerically valid.
 """
 
+import json
 import os
 import unittest
 from unittest import mock
@@ -18,24 +21,56 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 SHAPES = tuple(dispatch._L20_POLICY)  # (k, n)
 DECODE_ROWS = (1, 2, 4, 6, 8, 12, 16, 24, 48, 96)
+# The policy in use before the Triton launch configs were tuned. It still has
+# to work through the override, because it is the comparison arm.
+MIXED_POLICY = (
+    "4096:1536:16:512;1024:4096:16:128;1024:8192:16:128;4096:512:0:1024;256:4096:1:256"
+)
+CONFIG_DIR = os.path.join(
+    os.path.dirname(dispatch.__file__), "..", "..", "..", "kernels", "ops",
+    "quantization", "configs",
+)
 
 
 class TestPolicy(unittest.TestCase):
-    def test_decode_rows_never_use_w8a8(self):
+    def test_builtin_policy_is_marlin_free(self):
+        # Marlin-free is what keeps the weight memory at zero extra bytes; one
+        # shape with a Marlin or BF16 range brings the copies back.
         for thresholds in dispatch._L20_POLICY.values():
-            for rows in DECODE_ROWS:
-                self.assertNotEqual(
-                    dispatch.choose_backend(rows, *thresholds, True, True),
+            for rows in DECODE_ROWS + (512, 4096):
+                self.assertEqual(
+                    dispatch.choose_backend(rows, *thresholds, False, True),
                     dispatch.TRITON,
                 )
 
-    def test_mid_rows_leave_marlin(self):
-        for thresholds in dispatch._L20_POLICY.values():
+    def test_every_policy_shape_has_valid_tuned_configs(self):
+        # The untuned Triton default is 2x to 3x slower at decode row counts,
+        # so the Marlin-free policy needs a tuned file per shape. BLOCK_SIZE_K
+        # must divide the 128-wide scale group: the kernel steps the scale
+        # pointer once per group, and a wider tile reads one scale for two groups.
+        for k, n in SHAPES:
+            name = (
+                f"N={n},K={k},device_name=NVIDIA_L20,dtype=fp8_w8a8,"
+                "block_shape=[128, 128].json"
+            )
+            with open(os.path.join(CONFIG_DIR, name)) as f:
+                configs = json.load(f)
+            self.assertTrue(set(map(str, DECODE_ROWS)) <= set(configs), name)
+            for rows, config in configs.items():
+                self.assertEqual(128 % config["BLOCK_SIZE_K"], 0, (name, rows))
+
+    def test_mixed_override_keeps_three_ranges(self):
+        with mock.patch.dict(os.environ, {"SGLANG_SM89_FP8_LINEAR_POLICY": MIXED_POLICY}):
+            table = dispatch.policy_table()
+        for thresholds in table.values():
             for rows in (24, 48, 96):
                 self.assertEqual(
                     dispatch.choose_backend(rows, *thresholds, True, True),
                     dispatch.BF16,
                 )
+            self.assertEqual(
+                dispatch.choose_backend(4096, *thresholds, True, True), dispatch.TRITON
+            )
 
     def test_missing_copies_fall_back(self):
         # Without a BF16 copy the mid rows go to Triton, not back to the slow
@@ -55,6 +90,7 @@ class TestPolicyOverride(unittest.TestCase):
         self.assertEqual(table[(4096, 1536)], (0, 0))
         self.assertEqual(table[(1024, 4096)], (8, 64))
         self.assertEqual(table[(4096, 512)], dispatch._L20_POLICY[(4096, 512)])
+        self.assertEqual(set(table), set(dispatch._L20_POLICY))
 
     def test_malformed_override_is_rejected(self):
         with mock.patch.dict(os.environ, {"SGLANG_SM89_FP8_LINEAR_POLICY": "4096:1536:0"}):
@@ -97,9 +133,11 @@ class TestDispatchOnGpu(unittest.TestCase):
 
     def test_every_backend_matches_the_dequantized_reference(self):
         torch.manual_seed(20260921)
-        with mock.patch.dict(
-            os.environ, {"SGLANG_SM89_FP8_LINEAR_DISPATCH": "bf16,triton"}
-        ):
+        env = {
+            "SGLANG_SM89_FP8_LINEAR_DISPATCH": "bf16,triton",
+            "SGLANG_SM89_FP8_LINEAR_POLICY": MIXED_POLICY,
+        }
+        with mock.patch.dict(os.environ, env):
             for k, n in SHAPES:
                 layer, dense = _make_layer(n, k)
                 method = self._method()
@@ -110,7 +148,7 @@ class TestDispatchOnGpu(unittest.TestCase):
                 )
 
                 prepare_fp8_layer_for_marlin(layer, False)
-                thresholds = dispatch._L20_POLICY[(k, n)]
+                thresholds = dispatch.policy_table()[(k, n)]
                 seen = set()
                 for rows in (1, 6, 24, 96, 300, 2048):
                     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
