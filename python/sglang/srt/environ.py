@@ -1236,6 +1236,7 @@ class Envs:
     # linears may use instead of Marlin depending on the row count. Empty keeps
     # the plain Marlin path. See layers/quantization/sm89_dense_gemm_dispatch.py.
     SGLANG_SM89_FP8_LINEAR_DISPATCH = EnvStr("")
+    SGLANG_SM89_FP8_LINEAR_POLICY = EnvStr("")
     # Experimental repeatable expert-token packing for native MXFP4 on L20.
     # Does not establish batch invariance, numeric admission, or service gains.
     SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN = EnvBool(False)

@@ -8,14 +8,19 @@ dequantized weight (it needs two launches at 96 rows and its blocked GEMM is
 compute-inefficient), and above a few hundred rows the Triton W8A8 block-FP8
 kernel is 1.5x to 2x faster than both.
 
-This module keeps the Marlin weight and adds up to two more copies per layer:
-a BF16 dequantized weight and the original block-FP8 weight. `choose_backend`
-picks one per call from the row count. Row counts are static inside a CUDA
-graph, so the choice costs nothing at replay time.
+`choose_backend` picks one backend per call from the row count. Row counts are
+static inside a CUDA graph, so the choice costs nothing at replay time.
 
-The thresholds come from a single-GPU microbenchmark on L20
-(bench-l20-dense-gemm-backends.py, 2026-09-21). Shapes that are not in the
-table keep the plain Marlin path and use no extra memory.
+Memory: a layer whose policy never uses Marlin (marlin_max_rows == 0, Triton
+enabled, no bias) skips the Marlin repack and runs the Triton kernel on the
+loaded FP8 weight, so it needs no extra copy at all. A layer that keeps Marlin
+for small row counts pays one extra FP8 copy for Triton, and a BF16 copy only
+if its policy has a BF16 range.
+
+The thresholds come from single-GPU microbenchmarks on L20
+(bench-l20-dense-gemm-backends.py, 2026-09-21) and can be overridden per shape
+with SGLANG_SM89_FP8_LINEAR_POLICY. Shapes that are not in the table keep the
+plain Marlin path and use no extra memory.
 """
 
 import logging
@@ -63,39 +68,66 @@ def enabled_backends() -> Tuple[str, ...]:
     return names
 
 
+def policy_table() -> Dict[Tuple[int, int], Tuple[int, int]]:
+    """Built-in table plus SGLANG_SM89_FP8_LINEAR_POLICY overrides.
+
+    Override syntax: "K:N:marlin_max_rows:bf16_max_rows" entries joined by ";",
+    for example "4096:1536:0:0;4096:512:0:0".
+    """
+    table = dict(_L20_POLICY)
+    raw = envs.SGLANG_SM89_FP8_LINEAR_POLICY.get() or ""
+    for entry in (part.strip() for part in raw.split(";")):
+        if not entry:
+            continue
+        fields = entry.split(":")
+        if len(fields) != 4 or not all(f.strip().isdigit() for f in fields):
+            raise ValueError(
+                "SGLANG_SM89_FP8_LINEAR_POLICY entries are "
+                f"'K:N:marlin_max_rows:bf16_max_rows', got {entry!r}"
+            )
+        k, n, marlin_max_rows, bf16_max_rows = (int(f) for f in fields)
+        table[(k, n)] = (marlin_max_rows, bf16_max_rows)
+    return table
+
+
 def choose_backend(
     rows: int, marlin_max_rows: int, bf16_max_rows: int, has_bf16: bool, has_triton: bool
 ) -> str:
     if rows <= marlin_max_rows:
         return MARLIN
-    if rows <= bf16_max_rows:
-        return BF16 if has_bf16 else MARLIN
+    if rows <= bf16_max_rows and has_bf16:
+        return BF16
     if has_triton:
         return TRITON
     # Without the Triton copy BF16 is still at least as fast as Marlin here.
     return BF16 if has_bf16 else MARLIN
 
 
-def prepare_layer(layer: torch.nn.Module, weight_block_size) -> None:
-    """Attach the extra weight copies. Call before the Marlin repack consumes
-    `layer.weight` and `layer.weight_scale_inv`."""
+def prepare_layer(layer: torch.nn.Module, weight_block_size) -> bool:
+    """Attach what the policy needs. Call before the Marlin repack consumes
+    `layer.weight` and `layer.weight_scale_inv`.
+
+    Returns True when the layer never uses Marlin; the caller must then skip
+    the Marlin repack and leave `layer.weight` as loaded."""
     global _extra_bytes
 
     backends = enabled_backends()
     if not backends:
-        return
+        return False
     if getattr(layer, "bias", None) is not None:
-        return
+        return False
     key = (layer.input_size_per_partition, layer.output_size_per_partition)
-    thresholds = _L20_POLICY.get(key)
+    thresholds = policy_table().get(key)
     if thresholds is None:
-        return
+        return False
+    marlin_max_rows, bf16_max_rows = thresholds
 
     weight = layer.weight.data
     scale_inv = layer.weight_scale_inv.data.to(torch.float32)
     assert weight.shape == (key[1], key[0]), (weight.shape, key)
+    no_marlin = marlin_max_rows <= 0 and TRITON in backends
 
-    if BF16 in backends:
+    if BF16 in backends and bf16_max_rows > marlin_max_rows:
         from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
         layer.sm89_bf16_weight = block_quant_dequant(
@@ -103,25 +135,31 @@ def prepare_layer(layer: torch.nn.Module, weight_block_size) -> None:
         ).contiguous()
         _extra_bytes += layer.sm89_bf16_weight.numel() * 2
     if TRITON in backends:
-        layer.sm89_fp8_weight = weight.clone()
-        layer.sm89_fp8_scale_inv = scale_inv.clone()
+        # The Marlin repack replaces layer.weight, so a layer that keeps Marlin
+        # needs its own FP8 copy; a Marlin-free layer uses the loaded weight.
+        layer.sm89_fp8_weight = weight if no_marlin else weight.clone()
+        layer.sm89_fp8_scale_inv = scale_inv if no_marlin else scale_inv.clone()
         layer.sm89_fp8_block_size = list(weight_block_size)
-        _extra_bytes += weight.numel() + scale_inv.numel() * 4
+        if not no_marlin:
+            _extra_bytes += weight.numel() + scale_inv.numel() * 4
 
     layer.sm89_dense_thresholds = thresholds
+    layer.sm89_no_marlin = no_marlin
     # One line per shape, then one line per GiB, instead of one per layer.
     if key not in _logged_shapes or _extra_bytes // 2**30 > _logged_gib[0]:
         _logged_shapes.add(key)
         _logged_gib[0] = _extra_bytes // 2**30
         logger.info(
-            "SM89 dense GEMM dispatch: K=%d N=%d thresholds=%s backends=%s, "
-            "extra weight memory so far %.2f GiB",
+            "SM89 dense GEMM dispatch: K=%d N=%d thresholds=%s backends=%s "
+            "marlin=%s, extra weight memory so far %.2f GiB",
             key[0],
             key[1],
             thresholds,
             ",".join(backends),
+            "no" if no_marlin else "yes",
             _extra_bytes / 2**30,
         )
+    return no_marlin
 
 
 def apply(
@@ -129,9 +167,15 @@ def apply(
 ) -> Optional[torch.Tensor]:
     """Return the output, or None when the caller should run Marlin."""
     thresholds = getattr(layer, "sm89_dense_thresholds", None)
-    if thresholds is None or bias is not None:
+    if thresholds is None:
+        return None
+    if bias is not None:
+        assert not layer.sm89_no_marlin, "Marlin-free SM89 dense layers carry no bias"
         return None
     rows = x.numel() // x.shape[-1]
+    if rows == 0 and layer.sm89_no_marlin:
+        # A Marlin-free layer has no Marlin weight to fall back to.
+        return x.new_empty((*x.shape[:-1], layer.sm89_fp8_weight.shape[0]))
     backend = choose_backend(
         rows,
         thresholds[0],

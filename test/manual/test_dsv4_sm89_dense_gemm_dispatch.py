@@ -38,10 +38,32 @@ class TestPolicy(unittest.TestCase):
                 )
 
     def test_missing_copies_fall_back(self):
-        self.assertEqual(dispatch.choose_backend(96, 16, 128, False, True), dispatch.MARLIN)
+        # Without a BF16 copy the mid rows go to Triton, not back to the slow
+        # Marlin range; this is what lets a deployment drop the BF16 copy.
+        self.assertEqual(dispatch.choose_backend(96, 16, 128, False, True), dispatch.TRITON)
         self.assertEqual(dispatch.choose_backend(4096, 16, 128, False, True), dispatch.TRITON)
         self.assertEqual(dispatch.choose_backend(4096, 16, 128, True, False), dispatch.BF16)
         self.assertEqual(dispatch.choose_backend(4096, 16, 128, False, False), dispatch.MARLIN)
+
+
+class TestPolicyOverride(unittest.TestCase):
+    def test_override_replaces_single_shapes_only(self):
+        with mock.patch.dict(
+            os.environ, {"SGLANG_SM89_FP8_LINEAR_POLICY": "4096:1536:0:0; 1024:4096:8:64"}
+        ):
+            table = dispatch.policy_table()
+        self.assertEqual(table[(4096, 1536)], (0, 0))
+        self.assertEqual(table[(1024, 4096)], (8, 64))
+        self.assertEqual(table[(4096, 512)], dispatch._L20_POLICY[(4096, 512)])
+
+    def test_malformed_override_is_rejected(self):
+        with mock.patch.dict(os.environ, {"SGLANG_SM89_FP8_LINEAR_POLICY": "4096:1536:0"}):
+            with self.assertRaises(ValueError):
+                dispatch.policy_table()
+
+    def test_marlin_free_policy_sends_every_row_count_to_triton(self):
+        for rows in (1, 6, 24, 96, 4096):
+            self.assertEqual(dispatch.choose_backend(rows, 0, 0, False, True), dispatch.TRITON)
 
 
 def _make_layer(n, k):
@@ -105,10 +127,36 @@ class TestDispatchOnGpu(unittest.TestCase):
                 self.assertIn(dispatch.BF16, seen)
                 self.assertIn(dispatch.TRITON, seen)
 
+    def test_marlin_free_layer_uses_loaded_weight_and_no_copy(self):
+        # The point of the Marlin-free mode is zero extra weight memory: the
+        # Triton kernel must run on the tensor the loader produced.
+        torch.manual_seed(20260921)
+        env = {
+            "SGLANG_SM89_FP8_LINEAR_DISPATCH": "triton",
+            "SGLANG_SM89_FP8_LINEAR_POLICY": "4096:1536:0:0",
+        }
+        with mock.patch.dict(os.environ, env):
+            layer, dense = _make_layer(1536, 4096)
+            loaded = layer.weight.data_ptr()
+            method = self._method()
+            self.assertTrue(dispatch.prepare_layer(layer, [128, 128]))
+            self.assertEqual(layer.sm89_fp8_weight.data_ptr(), loaded)
+            self.assertFalse(hasattr(layer, "sm89_bf16_weight"))
+            for rows in (1, 6, 24, 96, 2048):
+                x = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)
+                out = method.apply(layer, x, None)
+                ref = x.float() @ dense.T
+                rel = ((out.float() - ref).norm() / ref.norm()).item()
+                print(f"marlin-free rows={rows} rel_l2={rel:.3e}")
+                self.assertLess(rel, 0.03, rows)
+            # Zero-row calls must not fall through to the absent Marlin weight.
+            empty = method.apply(layer, x[:0], None)
+            self.assertEqual(tuple(empty.shape), (0, 1536))
+
     def test_disabled_by_default_adds_no_weights(self):
         with mock.patch.dict(os.environ, {"SGLANG_SM89_FP8_LINEAR_DISPATCH": ""}):
             layer, _ = _make_layer(4096, 1024)
-            dispatch.prepare_layer(layer, [128, 128])
+            self.assertFalse(dispatch.prepare_layer(layer, [128, 128]))
             self.assertFalse(hasattr(layer, "sm89_dense_thresholds"))
             self.assertFalse(hasattr(layer, "sm89_bf16_weight"))
 
