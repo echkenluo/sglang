@@ -10,6 +10,12 @@ prefills up to 1609 tokens repeat bit-identically, 2672 tokens differ at 2650 of
 What matters and is checked here: the ordered build selects the same set as torch.topk, its output is
 ascending, the page transform matches the raw positions, rows that fit into k are untouched, and
 repeated calls return identical tensors. The last check is the one that fails on the stock build.
+
+Order is not the only thing the stock kernel leaves to timing. When several scores tie exactly at the
+threshold, its last radix round lets the threads race for the remaining slots, so the selected set
+changes too. Real indexer scores are sums of FP8 products and do tie: with the first ordered build an
+8xL20 service still gave 4 different results in 12 repeats of a 2673-token prefill. The ordered build
+therefore takes the lowest tied positions, which is checked on scores with few distinct values.
 """
 
 from __future__ import annotations
@@ -101,6 +107,60 @@ def test_rows_that_fit_into_k_match_the_stock_build():
     assert ordered_out[fits].equal(stock_out[fits]) and ordered_raw[fits].equal(stock_raw[fits])
     # the rows that need a selection hold the same set in both builds
     assert ordered_raw.sort(dim=1).values.equal(stock_raw.sort(dim=1).values)
+
+
+def _tied_inputs(batch: int, max_seq: int, levels: int, seed: int):
+    scores, seq_lens, page_table = _inputs(batch, max_seq, seed)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    # few distinct values: nearly every row has more scores equal to the k-th one than free slots
+    scores = torch.randint(0, levels, scores.shape, generator=gen, device="cuda").float() / 8
+    return scores, seq_lens, page_table
+
+
+@pytest.mark.parametrize("batch,max_seq,levels", [(64, 2048, 7), (256, 6000, 50), (8, 40000, 300)])
+@torch.inference_mode()
+def test_exact_ties_at_the_threshold_take_the_lowest_positions(batch: int, max_seq: int, levels: int):
+    scores, seq_lens, page_table = _tied_inputs(batch, max_seq, levels, seed=batch + levels)
+    _, raw = _run(True, scores, seq_lens, page_table)
+    raw_cpu, scores_cpu, lens = raw.cpu(), scores.cpu(), seq_lens.cpu().tolist()
+    ambiguous = 0
+    for row, length in enumerate(lens):
+        if length <= K:
+            continue
+        # a stable descending sort keeps equal scores in ascending position: the first k entries are
+        # the only selection that does not depend on which GPU thread came first
+        order = torch.sort(scores_cpu[row, :length], descending=True, stable=True).indices[:K]
+        kth = scores_cpu[row, order[-1]]
+        ambiguous += int((scores_cpu[row, :length] == kth).sum() > (scores_cpu[row, order] == kth).sum())
+        assert raw_cpu[row].tolist() == sorted(order.tolist()), f"row {row} (length {length})"
+    assert ambiguous > 0, "the inputs do not exercise a tie at the threshold"
+
+
+@torch.inference_mode()
+def test_tied_scores_repeat_bit_identically():
+    scores, seq_lens, page_table = _tied_inputs(256, 6000, 50, seed=11)
+    first_out, first_raw = _run(True, scores, seq_lens, page_table)
+    for _ in range(50):
+        out, raw = _run(True, scores, seq_lens, page_table)
+        assert out.equal(first_out) and raw.equal(first_raw)
+
+
+@torch.inference_mode()
+def test_scores_crowded_into_one_coarse_bin():
+    """40000 scores within 10 percent of each other share one bin of the first, 8-bit pass.
+
+    The kernel keeps at most 8192 candidates of the threshold bin in shared memory and drops the rest
+    in arrival order. A C4 context above 32768 tokens can exceed that when the scores are close
+    together; the selection is then neither exact nor reproducible."""
+    torch.manual_seed(5)
+    batch, length = 4, 40000
+    scores = 1.0 + 0.1 * torch.rand(batch, length, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    num_pages = (length + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").repeat(batch, 1)
+    _, raw = _run(True, scores, seq_lens, page_table)
+    ref = torch.topk(scores, K, dim=1, sorted=False).indices.sort(dim=1).values.to(torch.int32)
+    assert raw.equal(ref)
 
 
 if __name__ == "__main__":

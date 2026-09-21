@@ -206,10 +206,19 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
           output[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
+#ifdef SGL_TOPK_ORDERED
+            // All four bytes are equal here, so these scores tie exactly at the threshold and
+            // there are more of them than free slots. The stock build lets the threads race for
+            // the slots, which makes the selected set itself depend on timing. Collect the tied
+            // positions instead; the lowest ones are taken after the barrier below.
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            s_input_idx[r_idx ^ 1][pos] = idx;  // pos < num_input <= SMEM_INPUT_SIZE
+#else
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
               output[kTopK - pos] = idx;
             }
+#endif
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (pos < SMEM_INPUT_SIZE) {
@@ -223,6 +232,27 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
         }
       }
       __syncthreads();
+#ifdef SGL_TOPK_ORDERED
+      if (round == 3) {
+        // Exact ties at the threshold: take the lowest positions. A tied position's rank among
+        // the tied ones is unique, so rank < need picks exactly `need` of them and gives each
+        // its own slot. The branch is uniform across the block (round and remain_topk are),
+        // so every thread reaches the barrier.
+        const uint32_t num_tied = s_num_input[r_idx ^ 1];
+        const uint32_t need = static_cast<uint32_t>(s_last_remain);
+        for (uint32_t i = tx; i < num_tied; i += BLOCK_SIZE) {
+          const auto mine = s_input_idx[r_idx ^ 1][i];
+          uint32_t rank = 0;
+          for (uint32_t j = 0; j < num_tied; ++j) {
+            rank += static_cast<uint32_t>(s_input_idx[r_idx ^ 1][j] < mine);
+          }
+          if (rank < need) {
+            output[kTopK - need + rank] = mine;
+          }
+        }
+        __syncthreads();
+      }
+#endif
     }
   }
 }
