@@ -104,6 +104,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_dsv4_prefill_only_tbo,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -227,8 +228,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             model_runner.server_args.enable_dp_attention or self.require_gathered_buffer
         )
+        # Prefill-only TBO never overlaps a decode / target-verify forward, so
+        # this runner must behave exactly as without --enable-two-batch-overlap:
+        # stock bucket list, no can_run_tbo gate, no per-replay child split.
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
+            and not is_dsv4_prefill_only_tbo(model_runner.server_args)
         )
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
@@ -982,7 +987,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            # Skipped under prefill-only TBO: the captured decode/verify graph
+            # is non-TBO, so it needs no split index and no child batches.
+            if self.enable_two_batch_overlap:
+                self.tbo_plugin.capture_one_batch_size(
+                    forward_batch, num_tokens=num_tokens
+                )
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)

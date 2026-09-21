@@ -3629,9 +3629,41 @@ def require_mlp_sync(server_args: ServerArgs):
     return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
 
 
+def is_dsv4_prefill_only_tbo(server_args: ServerArgs) -> bool:
+    """Whether TBO is the DSV4 TP-scattered chunk pipeline (prefill-only TBO).
+
+    That pipeline overlaps micro-batches of a prefill chunk only: the DSV4
+    model gates TBO on an exact EXTEND forward (``_can_run_tbo`` in
+    models/deepseek_v4.py), so decode / target-verify / draft never run
+    overlapped. Everything the TBO plumbing adds for the sake of *graph
+    captured* TBO decode -- the even cuda-graph batch-size alignment, the
+    can_run_tbo graph-eligibility gate, the TboAttnBackend per-replay child
+    metadata rebuild, the forced CPU seq_lens mirror -- is pure overhead here,
+    so callers use this predicate to keep the non-prefill paths identical to a
+    run without --enable-two-batch-overlap.
+
+    The term list mirrors the admission rule in
+    ServerArgs._check_two_batch_overlap: with no EP a2a backend and no DP
+    attention, TBO is legal only as this pipeline, and both DSV4 envs must be
+    set for it to start at all.
+    """
+    return (
+        server_args.enable_two_batch_overlap
+        and envs.SGLANG_DSV4_TP_INPUT_SCATTERED.get()
+        and envs.SGLANG_DSV4_TP_SCATTER_TBO.get()
+        and not server_args.enable_dp_attention
+        and server_args.moe_a2a_backend == "none"
+    )
+
+
 def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
     alignment = 1
-    if server_args.enable_two_batch_overlap:
+    # Even-bs alignment exists so a captured TBO decode graph can split its
+    # rows in half. Prefill-only TBO captures no such graph, and the alignment
+    # would drop the bs=1 bucket and pad single-request decode onto bs=2.
+    if server_args.enable_two_batch_overlap and not is_dsv4_prefill_only_tbo(
+        server_args
+    ):
         alignment *= 2
     if require_gathered_buffer(server_args):
         alignment *= get_parallel().attn_tp_size

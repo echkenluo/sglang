@@ -32,8 +32,16 @@ def decide_needs_cpu_seq_lens(
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils import is_dsv4_prefill_only_tbo
 
-    if server_args.enable_two_batch_overlap:
+    # Prefill-only TBO splits EXTEND batches only, and their seq_lens_cpu comes
+    # from ScheduleBatch.prepare_for_extend, not from this relay (a fresh
+    # prefill batch carries no spec_info.future_indices, so resolve_seq_lens_cpu
+    # returns early for it). Forcing the mirror there would only add a blocking
+    # D2H to every spec decode step.
+    if server_args.enable_two_batch_overlap and not is_dsv4_prefill_only_tbo(
+        server_args
+    ):
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)

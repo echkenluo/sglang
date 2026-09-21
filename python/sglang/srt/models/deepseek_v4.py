@@ -2464,6 +2464,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
         )
+        # DSpark aux capture under TBO: the layer output is complete here (TBO
+        # layers are non-fused), so keep its mHC mean on the child batch. Rows
+        # stay TP-scattered; _forward_layers_tbo gathers and merges them.
+        dspark_aux = getattr(state.forward_batch, "_dsv4_dspark_aux", None)
+        if dspark_aux is not None and self.layer_id in dspark_aux:
+            dspark_aux[self.layer_id] = hidden_states.mean(dim=1)
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -2879,7 +2885,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -2970,6 +2976,18 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
+        # DSpark aux capture: each child records the captured layers' outputs
+        # in op_mhc_postprocess; they are gathered and merged below.
+        capture_layers = sorted(
+            i
+            for i in (self.dspark_layers_to_capture or [])
+            if self.start_layer <= i < self.end_layer
+        )
+        for inp in inputs_arr:
+            inp["forward_batch"]._dsv4_dspark_aux = (
+                dict.fromkeys(capture_layers) if capture_layers else None
+            )
+
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,
@@ -2983,10 +3001,34 @@ class DeepseekV4Model(nn.Module):
                     real_rows=out["forward_batch"]._dsv4_sc_real_rows,
                 )
 
+        original_len = hidden_states.shape[0]
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        for layer_id in capture_layers:
+            aux_outputs = []
+            for out in outputs_arr:
+                child_fb = out["forward_batch"]
+                aux = child_fb._dsv4_dspark_aux[layer_id]
+                if sc_tbo:
+                    # Same site as the eager path: gather after the mHC mean,
+                    # BF16 on the wire, per-child real rows.
+                    aux = _dsv4_tp_all_gather_rows(
+                        aux, site="dspark_aux", real_rows=child_fb._dsv4_sc_real_rows
+                    )
+                    _DSV4_TP_SCATTER_STATS["dspark_aux_ag"] += 1
+                aux_outputs.append(
+                    dict(hidden_states=aux, residual=None, forward_batch=child_fb)
+                )
+            merged, _ = _model_forward_tbo_merge_outputs(
+                aux_outputs[0], aux_outputs[1], original_len
+            )
+            dspark_aux_hidden_states.append(merged)
+        for out in outputs_arr:
+            out["forward_batch"]._dsv4_dspark_aux = None
+
         hidden_states, _ = _model_forward_tbo_merge_outputs(
-            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+            outputs_arr[0], outputs_arr[1], original_len
         )
-        return hidden_states
+        return hidden_states, dspark_aux_hidden_states
 
     def forward(
         self,
@@ -3004,8 +3046,7 @@ class DeepseekV4Model(nn.Module):
                 and self.hc_mult == 4
                 and self.pp_group.world_size == 1
                 and not dsa_use_prefill_cp(forward_batch)
-                and (self.dspark_layers_to_capture is not None
-                     or not self._can_run_tbo(forward_batch))
+                and not self._can_run_tbo(forward_batch)
             )
             if not use_broadcast:
                 hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
@@ -3046,10 +3087,7 @@ class DeepseekV4Model(nn.Module):
             # Chunk pipeline: the TBO child split must happen on FULL rows
             # (design B2), so _forward_layers_tbo owns the per-child entry
             # reduce-scatter and exit gather for this forward.
-            sc_tbo_forward = (
-                self._can_run_tbo(forward_batch)
-                and self.dspark_layers_to_capture is None
-            )
+            sc_tbo_forward = self._can_run_tbo(forward_batch)
             if sc_tbo_forward:
                 _dsv4_tp_scatter_log_once(
                     "model_input_tbo",
@@ -3091,13 +3129,12 @@ class DeepseekV4Model(nn.Module):
                 "of them: DSpark static-verify is CP-off for v1."
             )
         dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
-            hidden_states = self._forward_layers_tbo(
+        if self._can_run_tbo(forward_batch):
+            # Two-batch-overlap prefill (EP / mori / TP chunk pipeline).
+            # Cross-layer mHC fusion is disabled here (each layer
+            # self-contained), so no trailing hc_post. DSpark aux hidden states
+            # are recorded per child inside the layer ops and merged there.
+            hidden_states, dspark_aux_hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
