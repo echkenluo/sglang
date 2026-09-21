@@ -1095,8 +1095,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # the eager token shape. Padding 21 to 32 changed low-confidence
         # generation, while an exact 21-token capture matched eager. Other
         # Graph users retain the existing bucket-padding policy.
+        # SGLANG_DSV4_SHORT_PREFILL_GRAPH_PAD re-enables bucket padding on this
+        # route: natural agent prefills (a few hundred new tokens of arbitrary
+        # length) are CPU launch bound in eager mode and almost never hit a
+        # bucket exactly. The cause of the 21-to-32 divergence was never
+        # established (a different GEMM shape alone can flip low-confidence
+        # greedy tokens), so this stays opt-in until padded replays are shown
+        # to keep prompt state intact.
         if (
             envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_WITH_COMM.get()
+            and not envs.SGLANG_DSV4_SHORT_PREFILL_GRAPH_PAD.get()
             and num_tokens not in self.capture_num_tokens
         ):
             return False
