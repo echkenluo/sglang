@@ -11,21 +11,31 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 
 from .utils import make_name
 
 
 @cache_once
-def _jit_topk_v1_module(topk: int):
+def _jit_topk_v1_module(topk: int, ordered: bool = False):
     args = make_cpp_args(is_arch_support_pdl())
     assert topk in (512, 1024), "Only support topk=512 or 1024"
+    # The ordered build returns the selected entries by ascending position instead of in the
+    # order the GPU threads happened to finish, which makes the result reproducible.
     return load_jit(
-        make_name(f"topk_v1_{topk}"),
+        make_name(f"topk_v1_{topk}_ordered" if ordered else f"topk_v1_{topk}"),
         *args,
         cuda_files=["deepseek_v4/topk_v1.cuh"],
         cuda_wrappers=[("topk_transform", f"TopKKernel<{args}>::transform")],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"]
+        + (["-DSGL_TOPK_ORDERED=1"] if ordered else []),
     )
+
+
+@cache_once
+def _topk_v1_ordered() -> bool:
+    # Read once: this sits on the per-layer path of every forward.
+    return envs.SGLANG_DSV4_TOPK_ORDERED.get()
 
 
 @cache_once
@@ -55,7 +65,7 @@ def topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
-        module = _jit_topk_v1_module(out_page_indices.shape[1])
+        module = _jit_topk_v1_module(out_page_indices.shape[1], _topk_v1_ordered())
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )

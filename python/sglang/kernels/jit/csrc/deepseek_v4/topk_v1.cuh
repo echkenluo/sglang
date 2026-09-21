@@ -206,10 +206,19 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
           output[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
+#ifdef SGL_TOPK_ORDERED
+            // All four bytes are equal here, so these scores tie exactly at the threshold and
+            // there are more of them than free slots. The stock build lets the threads race for
+            // the slots, which makes the selected set itself depend on timing. Collect the tied
+            // positions instead; the lowest ones are taken after the barrier below.
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            s_input_idx[r_idx ^ 1][pos] = idx;  // pos < num_input <= SMEM_INPUT_SIZE
+#else
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
               output[kTopK - pos] = idx;
             }
+#endif
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (pos < SMEM_INPUT_SIZE) {
@@ -223,6 +232,27 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
         }
       }
       __syncthreads();
+#ifdef SGL_TOPK_ORDERED
+      if (round == 3) {
+        // Exact ties at the threshold: take the lowest positions. A tied position's rank among
+        // the tied ones is unique, so rank < need picks exactly `need` of them and gives each
+        // its own slot. The branch is uniform across the block (round and remain_topk are),
+        // so every thread reaches the barrier.
+        const uint32_t num_tied = s_num_input[r_idx ^ 1];
+        const uint32_t need = static_cast<uint32_t>(s_last_remain);
+        for (uint32_t i = tx; i < num_tied; i += BLOCK_SIZE) {
+          const auto mine = s_input_idx[r_idx ^ 1][i];
+          uint32_t rank = 0;
+          for (uint32_t j = 0; j < num_tied; ++j) {
+            rank += static_cast<uint32_t>(s_input_idx[r_idx ^ 1][j] < mine);
+          }
+          if (rank < need) {
+            output[kTopK - need + rank] = mine;
+          }
+        }
+        __syncthreads();
+      }
+#endif
     }
   }
 }
@@ -252,10 +282,28 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
     static_assert(kTopK <= kTopKBlockSize);
     const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
+#ifdef SGL_TOPK_ORDERED
+      // radix_topk hands out its output slots with an atomic counter, so the same selected set
+      // comes back in a different order from run to run, and the sparse attention that consumes
+      // these indices then accumulates in a different order: results stop being reproducible
+      // once a row has more than kTopK entries. Every path of radix_topk ends on a thread
+      // barrier, so all kTopK slots are final here. The selected positions are distinct, hence
+      // the number of smaller ones is a unique output slot and the placement has no write race.
+      const int32_t mine = s_topk_indices[tx];
+      uint32_t slot = 0;
+      for (uint32_t j = 0; j < kTopK; ++j) {
+        slot += static_cast<uint32_t>(s_topk_indices[j] < mine);
+      }
+      indices_ptr[slot] = page_to_indices(page_ptr, mine, page_bits);
+      if (raw_indices_ptr != nullptr) {
+        raw_indices_ptr[slot] = mine;
+      }
+#else
       indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
       }
+#endif
     }
   }
 
