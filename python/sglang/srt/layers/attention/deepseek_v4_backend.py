@@ -70,7 +70,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_dsv4_prefill_only_tbo, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -592,6 +592,17 @@ class DeepseekV4AttnBackend(
             not _is_cuda
             or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
             or self.online_c128_mtp.enabled()
+        )
+
+        # DSV4 runs TBO only in eager prefill, so the TboAttnBackend children
+        # have no role in the captured decode / target-verify graphs. Tell the
+        # wrapper to skip them in the *_graph paths, otherwise every decode
+        # replay rebuilds this backend's compressor / indexer metadata once per
+        # child on top of the primary. The HIP radix backend sets the same
+        # switch; here it is scoped to prefill-only TBO so the DP / EP TBO
+        # deployments keep their current behaviour.
+        self.tbo_supports_cuda_graph = not is_dsv4_prefill_only_tbo(
+            model_runner.server_args
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()

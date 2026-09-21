@@ -118,6 +118,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_dsv4_prefill_only_tbo,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -1302,7 +1303,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            # Prefill-only TBO splits nothing below
+            # SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS, so the short-prefill graph
+            # is always non-TBO. Skipping also avoids the plugin's split-index
+            # assert, which needs extend_lens the capture batch does not carry.
+            if not is_dsv4_prefill_only_tbo(self.model_runner.server_args):
+                self.tbo_plugin.capture_one_batch_size(
+                    forward_batch, num_tokens=num_tokens
+                )
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:

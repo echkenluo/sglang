@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
+    is_dsv4_prefill_only_tbo,
 )
 
 if TYPE_CHECKING:
@@ -74,8 +75,12 @@ def get_batch_sizes_to_capture(
     mul_base = get_cuda_graph_batch_size_alignment(server_args)
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
+    # Prefill-only TBO never splits a captured decode/verify batch, so it keeps
+    # the stock per-token-row width and the stock bucket list.
     alignment_width = captured_req_width
-    if server_args.enable_two_batch_overlap:
+    if server_args.enable_two_batch_overlap and not is_dsv4_prefill_only_tbo(
+        server_args
+    ):
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out

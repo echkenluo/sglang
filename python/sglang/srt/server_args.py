@@ -73,6 +73,7 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_dsv4_prefill_only_tbo,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
@@ -4494,10 +4495,14 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # TBO capture is unsupported.
+            # TBO capture is unsupported. Prefill-only TBO is exempt: it splits
+            # forwards of >= SGLANG_DSV4_TP_SCATTER_TBO_MIN_TOKENS tokens only,
+            # which never land in the short-prefill graph buckets, and it leaves
+            # the captured batch without tbo_children.
             (
                 "two-batch overlap",
-                lambda: self.enable_two_batch_overlap,
+                lambda: self.enable_two_batch_overlap
+                and not is_dsv4_prefill_only_tbo(self),
             ),
             (
                 "unvalidated a2a backend",
