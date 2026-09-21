@@ -29,6 +29,11 @@ class TestMarlinClamp(unittest.TestCase):
             sm89_swiglu_clamp(out, x, 10.0)
             swiglu_limit_func(ref, x, 10.0)
             torch.testing.assert_close(out, ref, atol=0.001, rtol=0.01)
+            # The switch is enabled in serving because the fused kernel keeps
+            # every rounding boundary of the reference path: over the whole
+            # finite BF16 range the outputs must be equal, not just close
+            # (+0.0 and -0.0 compare equal here).
+            self.assertTrue(torch.equal(out, ref))
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             for _ in range(3):
