@@ -110,7 +110,7 @@ def sample_draft_block(
     else:
         temperatures = (
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
-        )
+        ) * envs.SGLANG_DSPARK_DRAFT_TEMPERATURE_SCALE.get()
 
     if not any_sampling:
 

@@ -88,6 +88,9 @@ class DsparkDraftSampler:
             min=1e-5,
             out=self.temperatures[:bs],
         )
+        draft_temperature_scale = envs.SGLANG_DSPARK_DRAFT_TEMPERATURE_SCALE.get()
+        if draft_temperature_scale != 1.0:
+            self.temperatures[:bs].mul_(draft_temperature_scale)
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
