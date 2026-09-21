@@ -1232,6 +1232,10 @@ class Envs:
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_DSV4_SM89_MHC_BROADCAST = EnvBool(False)
     SGLANG_DSV4_SM89_MARLIN_CLAMP = EnvBool(False)
+    # Comma list of extra backends ("bf16", "triton") that block-FP8 dense
+    # linears may use instead of Marlin depending on the row count. Empty keeps
+    # the plain Marlin path. See layers/quantization/sm89_dense_gemm_dispatch.py.
+    SGLANG_SM89_FP8_LINEAR_DISPATCH = EnvStr("")
     # Experimental repeatable expert-token packing for native MXFP4 on L20.
     # Does not establish batch invariance, numeric admission, or service gains.
     SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN = EnvBool(False)

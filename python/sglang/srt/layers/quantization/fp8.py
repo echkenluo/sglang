@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization import sm89_dense_gemm_dispatch
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -931,6 +932,11 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
+                if not self.use_mxfp8:
+                    # Must run before the Marlin repack consumes the FP8 weight.
+                    sm89_dense_gemm_dispatch.prepare_layer(
+                        layer, self.quant_config.weight_block_size
+                    )
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
@@ -942,6 +948,10 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
+            if not isinstance(x, tuple):
+                output = sm89_dense_gemm_dispatch.apply(layer, x, bias)
+                if output is not None:
+                    return output
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
