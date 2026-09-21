@@ -3061,11 +3061,9 @@ class Scheduler(
             ret is not None
             and not self.require_mlp_sync
             and self.prefill_only_tbo
-            # DFLASH / DSPARK pin aux hidden-state capture on the target model,
-            # and the DSV4 forward falls back to the per-layer eager loop
-            # whenever it captures, so a split index would build child batches
-            # that nothing consumes.
-            and not self.spec_algorithm.is_dflash_family()
+            # Speculative decoding is fine here: the target prefill is an exact
+            # EXTEND, DSpark aux hidden states are captured inside the TBO
+            # layer ops, and the draft worker never prepares TBO children.
             # Exact EXTEND only: the DSV4 scattered op strategy raises on MIXED
             # and every other extend-like mode (CR-8 major). TARGET_VERIFY and
             # DRAFT_EXTEND_V2 are excluded by the same equality test.
