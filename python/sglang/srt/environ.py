@@ -1236,6 +1236,10 @@ class Envs:
     # linears may use instead of Marlin depending on the row count. Empty keeps
     # the plain Marlin path. See layers/quantization/sm89_dense_gemm_dispatch.py.
     SGLANG_SM89_FP8_LINEAR_DISPATCH = EnvStr("")
+    # On L20, cuBLAS picks a 5x slower BF16 kernel for 2-7 rows of the indexer
+    # weights_proj (4096 -> 64): 18.7 us vs 3.7 us at 8 rows. DSpark verify at
+    # batch size 1 runs exactly 6 rows. Pads those calls to 8 rows.
+    SGLANG_DSV4_SM89_PAD_SMALL_GEMM = EnvBool(False)
     # Experimental repeatable expert-token packing for native MXFP4 on L20.
     # Does not establish batch invariance, numeric admission, or service gains.
     SGLANG_DSV4_SM89_MARLIN_STABLE_ALIGN = EnvBool(False)
