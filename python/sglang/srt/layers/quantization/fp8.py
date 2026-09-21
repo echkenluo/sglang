@@ -930,14 +930,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
         if self.use_marlin:
+            marlin_free = False
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
                 if not self.use_mxfp8:
                     # Must run before the Marlin repack consumes the FP8 weight.
-                    sm89_dense_gemm_dispatch.prepare_layer(
+                    marlin_free = sm89_dense_gemm_dispatch.prepare_layer(
                         layer, self.quant_config.weight_block_size
                     )
-            prepare_fp8_layer_for_marlin(layer, not self.block_quant)
+            if not marlin_free:
+                prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
 
@@ -952,6 +954,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 output = sm89_dense_gemm_dispatch.apply(layer, x, bias)
                 if output is not None:
                     return output
+            assert not getattr(layer, "sm89_no_marlin", False), (
+                "SM89 Marlin-free dense layer reached the Marlin path "
+                "(pre-quantized input or bias)"
+            )
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
