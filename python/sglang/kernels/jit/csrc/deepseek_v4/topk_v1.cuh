@@ -252,10 +252,28 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
     static_assert(kTopK <= kTopKBlockSize);
     const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
+#ifdef SGL_TOPK_ORDERED
+      // radix_topk hands out its output slots with an atomic counter, so the same selected set
+      // comes back in a different order from run to run, and the sparse attention that consumes
+      // these indices then accumulates in a different order: results stop being reproducible
+      // once a row has more than kTopK entries. Every path of radix_topk ends on a thread
+      // barrier, so all kTopK slots are final here. The selected positions are distinct, hence
+      // the number of smaller ones is a unique output slot and the placement has no write race.
+      const int32_t mine = s_topk_indices[tx];
+      uint32_t slot = 0;
+      for (uint32_t j = 0; j < kTopK; ++j) {
+        slot += static_cast<uint32_t>(s_topk_indices[j] < mine);
+      }
+      indices_ptr[slot] = page_to_indices(page_ptr, mine, page_bits);
+      if (raw_indices_ptr != nullptr) {
+        raw_indices_ptr[slot] = mine;
+      }
+#else
       indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
       }
+#endif
     }
   }
 

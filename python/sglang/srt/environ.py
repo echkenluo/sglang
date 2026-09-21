@@ -1273,6 +1273,10 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    # Return the entries selected by the v1 C4 top-k kernel by ascending position. The stock kernel
+    # returns them in the order its GPU threads finish, so a context above 4 * index_topk tokens
+    # gives different logits from run to run at temperature 0.
+    SGLANG_DSV4_TOPK_ORDERED = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache
