@@ -49,6 +49,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
+from sglang.srt.entrypoints.openai.segment_token_cache import (
+    DSV4_SEGMENT_MARKERS,
+    build_segment_token_cache,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -277,6 +281,31 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        # Agent trajectories re-send the whole conversation on every turn, so
+        # the rendered prompt shares all but its last turn with the previous
+        # request. Cache the tokenization of each inter-special-token segment
+        # and re-tokenize only what is new.
+        self._segment_token_cache = None
+        if (
+            self.chat_encoding_spec == "dsv4"
+            and envs.SGLANG_DSV4_SEGMENT_TOKEN_CACHE.get()
+        ):
+            self._segment_token_cache = build_segment_token_cache(
+                self.tokenizer_manager.tokenizer,
+                DSV4_SEGMENT_MARKERS,
+                envs.SGLANG_DSV4_SEGMENT_TOKEN_CACHE_MB.get() * 1024 * 1024,
+            )
+
+    def _encode_prompt_string(self, text: str) -> List[int]:
+        """Tokenize a fully rendered prompt string.
+
+        Identical to ``tokenizer.encode(text)``; the segment cache only skips
+        re-tokenizing text this process has already tokenized.
+        """
+        if self._segment_token_cache is None:
+            return self.tokenizer_manager.tokenizer.encode(text)
+        return self._segment_token_cache.encode(text)
 
     def _handle_last_assistant_message(
         self,
@@ -1236,7 +1265,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_prompt_string(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
