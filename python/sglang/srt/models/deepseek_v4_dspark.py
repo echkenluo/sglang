@@ -299,6 +299,7 @@ class DSparkV4MarkovHead(nn.Module):
         )
         self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        self._step_gather_fp16 = envs.SGLANG_DSPARK_STEP_LOGITS_GATHER_FP16.get()
         markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
         self.markov_w2 = nn.Linear(
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
@@ -384,7 +385,19 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
+        if shard.tp_size > 1 and self._step_gather_fp16:
+            # One vocab-wide all-gather per draft position is bandwidth bound on
+            # PCIe from a few requests up (16 requests: 8 MB in FP32, about 0.5 ms,
+            # five times per draft step). FP16 halves the bytes. Draft logits are
+            # far inside the FP16 range, and sampling and verification both read
+            # the gathered tensor, so q stays the distribution the draft tokens
+            # were drawn from and speculative sampling stays exact.
+            full = (
+                get_parallel()
+                .attn_tp_group.all_gather(step_local.to(torch.float16), dim=-1)
+                .to(step_local.dtype)
+            )
+        elif shard.tp_size > 1:
             full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
         else:
             full = step_local
