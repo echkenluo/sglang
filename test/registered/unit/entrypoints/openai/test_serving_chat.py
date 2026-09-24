@@ -1092,6 +1092,81 @@ class ServingChatTestCase(unittest.TestCase):
 
                 self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv4_reasoning_effort_maps_to_0731_levels(self):
+        """OpenAI effort levels reach the V4 encoder as the 0731 release levels.
+
+        Unset/low/medium must keep rendering the default "low" prompt so that
+        traffic which never asked for more deliberation is unchanged; only
+        explicit high/xhigh/max add the 0731 prefixes.
+        """
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv4"
+
+        expected = {
+            None: None,
+            "none": None,
+            "minimal": "low",
+            "low": "low",
+            "medium": "low",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max",
+        }
+        for effort, level in expected.items():
+            with self.subTest(effort=effort):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=effort,
+                )
+                with patch.object(
+                    encoding_dsv4,
+                    "encode_messages",
+                    wraps=encoding_dsv4.encode_messages,
+                ) as encode:
+                    self.chat._process_messages(req, is_multimodal=False)
+                self.assertEqual(encode.call_args.kwargs["reasoning_effort"], level)
+
+    def test_dsv4_reasoning_effort_prefixes_match_0731_release(self):
+        """Thinking prompts start with the 0731 effort prefix for the level.
+
+        The checkpoint was trained on these exact strings. Before the 0731 port,
+        SGLang's "max" rendered what 0731 calls "high", and 0731 "max" was
+        unreachable.
+        """
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [{"role": "user", "content": "hi"}]
+        bos = encoding_dsv4.bos_token
+        low = encoding_dsv4.encode_messages(messages, thinking_mode="thinking")
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages, thinking_mode="thinking", reasoning_effort="low"
+            ),
+            low,
+        )
+        for level, head in (
+            ("high", "Reasoning Effort: Absolute maximum"),
+            ("max", "Reasoning Effort: Beyond maximum"),
+        ):
+            with self.subTest(level=level):
+                prefix = encoding_dsv4.REASONING_EFFORT_PROMPTS[level]
+                self.assertTrue(prefix.startswith(head))
+                out = encoding_dsv4.encode_messages(
+                    messages, thinking_mode="thinking", reasoning_effort=level
+                )
+                self.assertEqual(out, bos + prefix + low[len(bos) :])
+                # Chat mode never carries an effort prefix.
+                self.assertEqual(
+                    encoding_dsv4.encode_messages(
+                        messages, thinking_mode="chat", reasoning_effort=level
+                    ),
+                    encoding_dsv4.encode_messages(messages, thinking_mode="chat"),
+                )
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
