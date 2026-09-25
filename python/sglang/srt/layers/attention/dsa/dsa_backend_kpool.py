@@ -71,6 +71,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
+        if self.device_sm_major < 9:
+            return False  # no DeepGEMM schedule kernel; SM8x uses Triton logits
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
         return True

@@ -441,6 +441,9 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        # DeepGEMM's paged-MQA schedule has no kernel below SM90; the SM8x
+        # indexer (Triton paged logits) does not read it.
+        self.deep_gemm_paged_schedule = is_cuda() and self.device_sm_major >= 9
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
@@ -735,6 +738,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if not self.deep_gemm_paged_schedule:
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -1098,9 +1103,10 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if self.deep_gemm_paged_schedule:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1482,9 +1488,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if self.deep_gemm_paged_schedule:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
