@@ -6,10 +6,17 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_hip
 
 
+def _is_sm8x() -> bool:
+    import torch
+
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+
+
 class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TRITON = "triton"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -19,6 +26,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_triton(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TRITON
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -30,6 +40,9 @@ class DSAPagedMQALogitsBackend(Enum):
                 )
             return DSAPagedMQALogitsBackend.AITER
 
+        if value == "triton" or (value == "auto" and _is_sm8x()):
+            # F28's Triton kernels (f28_mqa.py): DeepGEMM has no SM8x kernels.
+            return DSAPagedMQALogitsBackend.TRITON
         if value == "auto" or value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":

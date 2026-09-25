@@ -137,7 +137,13 @@ class IndexerKPool(MultiPlatformOp):
             self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
-            self.sm_count = deep_gemm.get_num_sms()
+            if self.paged_mqa_logits_backend.is_triton():
+                # DeepGEMM is not usable on SM8x; only the SM count is needed.
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(
@@ -835,7 +841,15 @@ class IndexerKPool(MultiPlatformOp):
         *,
         clean_logits: bool,
     ) -> torch.Tensor:
-        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        """Ragged MQA logits: DeepGEMM on CUDA SM90+, F28's Triton kernel on
+        SM8x, AITER's Triton kernel on ROCm."""
+        if not is_hip() and torch.cuda.get_device_capability(q_fp8.device)[0] == 8:
+            from sglang.srt.layers.attention.dsa.f28_mqa import fp8_mqa_logits_triton
+
+            # Writes -inf outside [starts, ends), i.e. always clean.
+            return fp8_mqa_logits_triton(
+                q_fp8, (k_fp8, k_scale.reshape(-1)), weights, starts, ends
+            )
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -931,8 +945,10 @@ class IndexerKPool(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         use_aiter_paged_mqa = self.paged_mqa_logits_backend.is_aiter()
+        use_triton_paged_mqa = self.paged_mqa_logits_backend.is_triton()
         use_tilelang_paged_mqa = (
             not use_aiter_paged_mqa
+            and not use_triton_paged_mqa
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
 
@@ -943,7 +959,9 @@ class IndexerKPool(MultiPlatformOp):
                 seqlens_32,
                 blocksize,
                 build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
+                    use_aiter_paged_mqa
+                    or use_tilelang_paged_mqa
+                    or use_triton_paged_mqa
                 ),
             )
         )
@@ -968,6 +986,19 @@ class IndexerKPool(MultiPlatformOp):
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+            )
+        elif use_triton_paged_mqa:
+            from sglang.srt.layers.attention.dsa.f28_mqa import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            logits = fp8_paged_mqa_logits_triton(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8.view(torch.uint8),
+                weights,
+                pool_context_lens,
+                pool_block_tables,
+                pool_max_seq_len,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (

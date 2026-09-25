@@ -1428,7 +1428,13 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        extra = {}
+        if tail_dim == 0 and torch.cuda.get_device_capability(q.device)[0] == 8:
+            # Two pipeline stages need 160 KB of shared memory; SM8x has ~100 KB.
+            extra["num_stages"] = 1
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **extra
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
